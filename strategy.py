@@ -491,7 +491,7 @@ plot_pca_clusters_3d(pc_df, cluster_labels, kmeans_model)
 all_tickers = [etf for etfs in sector_lists.values() for etf in etfs]
 
 plot_pca_r2_over_time(returns, sector_lists, window_size=63, etfs_to_plot=all_tickers)
- #hi
+ #hi f
 
 spy_data = yf.download('SPY', period='5y', auto_adjust=True)['Close']
 spy_returns = spy_data.pct_change().reindex(returns.index).dropna()
