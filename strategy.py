@@ -379,29 +379,6 @@ def compute_and_print_r2_pc1_market(pc_df, market_returns):
     print(f"R² between PC1 and market returns over full period: {r2:.4f}")
     return r2
 
-def plot_rolling_r2_pc1_market(pc_df, market_returns, window=63):
-    pc1 = pc_df['PC1'].loc[market_returns.index]
-    r2_values = []
-    dates = pc1.index[window-1:]
-
-    for i in range(window, len(pc1)+1):
-        y = pc1.iloc[i-window:i]
-        X = sm.add_constant(market_returns.iloc[i-window:i])
-        model = sm.OLS(y, X).fit()
-        r2_values.append(model.rsquared)
-
-    plt.figure(figsize=(14,6))
-    plt.plot(dates, r2_values, color='tab:green')
-    plt.title(f'Rolling R² of PC1 vs Market Returns (window={window} days)')
-    plt.xlabel('Date')
-    plt.ylabel('R²')
-    plt.ylim(0,1)
-    plt.grid(True)
-    plt.gca().xaxis.set_major_locator(mdates.MonthLocator(interval=1))
-    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    plt.show()
 
 
 def plot_explained_variance(pca):
@@ -439,6 +416,58 @@ def get_dates_by_cluster(pc_df, cluster_labels):
     return cluster_dates
 
 
+def plot_rolling_r2_pc1_sp500(pc_df, sp500_returns, window=63):
+    """
+    Plot rolling R² between PC1 and S&P 500 returns over time.
+
+    Parameters:
+    - pc_df: DataFrame containing PCA scores (dates as index)
+    - sp500_returns: Series of S&P 500 returns (must align with pc_df dates)
+    - window: rolling window size in days (default 63 days ~ 3 months)
+    """
+    # Align the data
+    common_dates = pc_df.index.intersection(sp500_returns.index)
+    pc1 = pc_df['PC1'].loc[common_dates]
+    sp_ret = sp500_returns.loc[common_dates]
+
+    # Calculate rolling R²
+    r2_values = []
+    dates = []
+
+    for i in range(window, len(pc1) + 1):
+        y = pc1.iloc[i - window:i]
+        X = sm.add_constant(sp_ret.iloc[i - window:i])
+        model = sm.OLS(y, X).fit()
+        r2_values.append(model.rsquared)
+        dates.append(pc1.index[i - 1])  # Use end date of window
+
+    # Plot
+    plt.figure(figsize=(14, 6))
+    plt.plot(dates, r2_values, color='tab:blue', linewidth=2)
+    plt.title(f'Rolling R² Between PC1 and S&P 500 Returns ({window}-day window)')
+    plt.xlabel('Date')
+    plt.ylabel('R²')
+    plt.ylim(0, 1)
+    plt.grid(True)
+
+    # Format x-axis
+    ax = plt.gca()
+    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+    plt.xticks(rotation=45)
+
+    # Add horizontal line at mean R²
+    mean_r2 = np.mean(r2_values)
+    plt.axhline(mean_r2, color='red', linestyle='--',
+                label=f'Mean R² = {mean_r2:.2f}')
+    plt.legend()
+
+    plt.tight_layout()
+    plt.show()
+
+    return dates, r2_values
+
+
 plot_explained_variance(pca)
 plot_all_pcs_over_time(pc_df)
 
@@ -448,9 +477,9 @@ plot_all_pcs_over_time(pc_df)
 # -----------------------------
 
 # 1. Cluster PCA scores
-cluster_labels, kmeans_model = cluster_pca_scores(pc_df, n_clusters=3)
+cluster_labels, kmeans_model = cluster_pca_scores(pc_df, n_clusters=4)
 cluster_dates = get_dates_by_cluster(pc_df, cluster_labels)
-day = cluster_dates[2][3]
+
 # 2. Plot clusters in 2D and 3D
 plot_pca_clusters(pc_df, cluster_labels, kmeans_model)
 # plot_pca_clusters_3d(pc_df, cluster_labels, kmeans_model)
@@ -463,6 +492,7 @@ r2_dict = compute_rolling_r2(returns, pc_df, sector_lists, window=63)
 
 # 5. Generate buy signals example for a date
 print()
+day = cluster_dates[2][-1]
 print(f"The day is: {day}")
 print()
 try:
@@ -470,6 +500,7 @@ try:
     day = cluster_dates[2][-1]
 
     buy_signals, sector_scores = generate_cluster_based_signals(
+
         current_date=day,
         pc_df=pc_df,
         cluster_labels=cluster_labels,
@@ -509,7 +540,8 @@ plot_clusters_vs_returns(
 r2_full = compute_and_print_r2_pc1_market(pc_df, spy_returns)
 
 # 3. Plot rolling R²
-plot_rolling_r2_pc1_market(pc_df, spy_returns, window=63)
+plot_rolling_r2_pc1_sp500(pc_df, spy_returns, window=63)
+
 
 
 
