@@ -42,7 +42,7 @@ returns = data.pct_change().dropna()
 # -----------------------------
 # 3. Train/Test Split (No data leakage)
 # -----------------------------
-split_date = returns.index[int(len(returns) * 0.6)]
+split_date = returns.index[int(len(returns) * 0.8)]
 print(f"Split date: {split_date}")
 
 train_returns = returns.loc[:split_date]
@@ -65,6 +65,7 @@ Y_train = pca.fit_transform(train_returns_std)
 V = pca.components_.T
 Y_test = pca.transform(test_returns_std)
 
+
 # -----------------------------
 # 5. Deterministic sign alignment
 # -----------------------------
@@ -82,6 +83,7 @@ def align_pca_signs(V, Y_train, Y_test=None):
                 Y_test_aligned[:, i] *= -1
 
     return V_aligned, Y_train_aligned, Y_test_aligned
+
 
 V_aligned, Y_train_aligned, Y_test_aligned = align_pca_signs(V, Y_train, Y_test)
 
@@ -102,10 +104,12 @@ print("Train PC scaled stats (should be ~0 mean, ~1 std):")
 print(f"Mean: {train_pc_scaled.mean().round(3)}")
 print(f"Std: {train_pc_scaled.std().round(3)}")
 
+
 # -----------------------------
 # 7. Save preprocessing artifacts
 # -----------------------------
-def save_preprocessing_artifacts(train_mean, train_std, pca, V_aligned, train_pc_mean, train_pc_std, save_dir="pca_artifacts"):
+def save_preprocessing_artifacts(train_mean, train_std, pca, V_aligned, train_pc_mean, train_pc_std,
+                                 save_dir="pca_artifacts"):
     os.makedirs(save_dir, exist_ok=True)
     artifacts = {
         'train_etf_mean': train_mean,
@@ -125,7 +129,9 @@ def save_preprocessing_artifacts(train_mean, train_std, pca, V_aligned, train_pc
     print(f"Preprocessing artifacts saved to: {artifact_path}")
     return artifacts
 
+
 artifacts = save_preprocessing_artifacts(train_mean, train_std, pca, V_aligned, train_pc_mean, train_pc_std)
+
 
 # -----------------------------
 # 8. Function to load and apply preprocessing
@@ -153,6 +159,7 @@ def load_and_transform_new_data(new_returns, artifact_path="pca_artifacts/pca_pr
     pc_scaled = (pc_df - train_pc_mean) / train_pc_std
     return pc_scaled, artifacts
 
+
 test_pc_inference, _ = load_and_transform_new_data(test_returns)
 print(f"\nInference test - Max difference: {np.max(np.abs(test_pc_scaled.values - test_pc_inference.values)):.6f}")
 
@@ -175,6 +182,7 @@ print(f"Off-diagonal max: {np.max(np.abs(train_corr.values - np.eye(len(train_co
 print("\nTest PC correlations (should be near-diagonal):")
 test_corr = test_pc_df.corr()
 print(f"Off-diagonal max: {np.max(np.abs(test_corr.values - np.eye(len(test_corr)))):.3f}")
+
 
 # -----------------------------
 # 10. Rolling PCA analysis
@@ -228,7 +236,9 @@ def analyze_pca_stability_over_time(returns, sector_lists, window_size=63, etfs_
         plt.tight_layout()
         plt.show()
 
+
 analyze_pca_stability_over_time(returns, sector_lists)
+
 
 # -----------------------------
 # 11. Forecasting setup
@@ -246,12 +256,14 @@ def setup_forecasting_model(train_pc_scaled, lookback=5):
     print(f"Forecasting dataset shape: X={X.shape}, y={y.shape}")
     return X, y
 
+
 X_forecast, y_forecast = setup_forecasting_model(train_pc_scaled)
 
 # -----------------------------
 # 12. PCA Visualization Plots
 # -----------------------------
 full_pc_df = pd.concat([train_pc_df, test_pc_df])
+
 
 def plot_all_pcs_over_time(pc_df):
     plt.figure(figsize=(14, 7))
@@ -267,6 +279,7 @@ def plot_all_pcs_over_time(pc_df):
     plt.xticks(rotation=45)
     plt.tight_layout()
     plt.show()
+
 
 def compute_rolling_r2_for_etf(returns, pc_df, etf, window=63):
     r2_dict = {}
@@ -284,6 +297,7 @@ def compute_rolling_r2_for_etf(returns, pc_df, etf, window=63):
         r2_series = [np.nan] * (window - 1) + r2_series
         r2_dict[pc] = r2_series
     return pd.DataFrame(r2_dict, index=pc_df.index)
+
 
 def plot_etf_r2_over_time(returns, pc_df, sector_lists, window=63):
     ticker_to_sector = {ticker: sector for sector, tickers in sector_lists.items() for ticker in tickers}
@@ -307,6 +321,7 @@ def plot_etf_r2_over_time(returns, pc_df, sector_lists, window=63):
         plt.tight_layout()
         plt.show()
 
+
 def plot_eigenvalues_bar(pca):
     eigenvalues = pca.explained_variance_
     pc_names = [f'PC{i + 1}' for i in range(len(eigenvalues))]
@@ -322,6 +337,7 @@ def plot_eigenvalues_bar(pca):
     plt.tight_layout()
     plt.show()
 
+
 print("\n" + "=" * 60)
 print("GENERATING THE 3 REQUESTED PCA PLOTS")
 print("=" * 60)
@@ -335,6 +351,7 @@ plot_eigenvalues_bar(pca)
 print("\n" + "=" * 60)
 print("ALL 3 REQUESTED PLOTS GENERATED SUCCESSFULLY!")
 print("=" * 60)
+
 
 # -----------------------------
 # Enhanced Sector Momentum Trading System
@@ -387,8 +404,11 @@ def calculate_sector_correlations_and_lags(returns, sector_lists, window=63, max
         'sector_to_ticker': sector_to_ticker
     }
 
-def calculate_sector_momentum_rankings(returns, sector_lists, lookbacks):
+# Modified: calculate_sector_momentum_rankings to support vol-adjusted momentum
+def calculate_sector_momentum_rankings(returns, sector_lists, lookbacks, enable_vol_adjusted_momentum=False, vol_window=20):
     print(f"Calculating sector momentum rankings for lookbacks: {lookbacks}")
+    if enable_vol_adjusted_momentum:
+        print("  Using volatility-adjusted momentum scores")
     sector_to_ticker = {sector: tickers[0] for sector, tickers in sector_lists.items()}
     momentum_data = {}
 
@@ -402,6 +422,9 @@ def calculate_sector_momentum_rankings(returns, sector_lists, lookbacks):
                 if ticker in returns.columns:
                     period_returns = returns[ticker].iloc[i - lookback:i + 1]
                     momentum = (1 + period_returns).prod() - 1
+                    if enable_vol_adjusted_momentum:
+                        vol = returns[ticker].iloc[i - vol_window:i].std()
+                        momentum = momentum / vol if vol > 0 else momentum  # Sharpe-like adjustment
                     sector_momentum[sector] = momentum
             sorted_sectors = sorted(sector_momentum.items(), key=lambda x: x[1], reverse=True)
             rankings = {sector: rank + 1 for rank, (sector, _) in enumerate(sorted_sectors)}
@@ -427,6 +450,7 @@ def calculate_sector_momentum_rankings(returns, sector_lists, lookbacks):
         'scores': score_dfs,
         'raw_data': momentum_data
     }
+
 
 def identify_early_strength_sectors(momentum_rankings, corr_data, early_strength_threshold=3, min_lead_correlation=0.3):
     print("Identifying sectors with early strength...")
@@ -455,14 +479,15 @@ def identify_early_strength_sectors(momentum_rankings, corr_data, early_strength
                 short_rank = short_rankings.loc[date, sector]
                 medium_rank = medium_rankings.loc[date, sector]
                 is_early_strength = (
-                    short_rank <= early_strength_threshold and
-                    short_rank < medium_rank and
-                    sector in leading_sectors
+                        short_rank <= early_strength_threshold and
+                        short_rank < medium_rank and
+                        sector in leading_sectors
                 )
                 if is_early_strength:
                     early_strength_signals.loc[date, sector] = 1
 
     return early_strength_signals
+
 
 def generate_multi_timeframe_consensus_signals(momentum_rankings, consensus_threshold=2):
     print("Generating multi-timeframe consensus signals...")
@@ -476,7 +501,7 @@ def generate_multi_timeframe_consensus_signals(momentum_rankings, consensus_thre
 
     consensus_signals = pd.DataFrame(0, index=common_dates, columns=common_sectors)
     signal_strength = pd.DataFrame(0, index=common_dates, columns=common_sectors)
-    top_threshold = 3
+    top_threshold = 1
 
     for date in common_dates:
         for sector in common_sectors:
@@ -489,6 +514,7 @@ def generate_multi_timeframe_consensus_signals(momentum_rankings, consensus_thre
                 consensus_signals.loc[date, sector] = 1
 
     return consensus_signals, signal_strength
+
 
 def weighted_multi_timeframe_signals(momentum_rankings, weights, signal_threshold=0.75):
     print("Generating weighted multi-timeframe signals...")
@@ -516,6 +542,7 @@ def weighted_multi_timeframe_signals(momentum_rankings, weights, signal_threshol
 
     return weighted_signals, weighted_scores
 
+
 def avoid_late_movers(momentum_rankings, early_strength_signals, late_mover_penalty_days=2):
     print("Identifying late movers to avoid...")
     rankings_short = momentum_rankings['rankings'][min(momentum_rankings['rankings'].keys())]
@@ -538,6 +565,7 @@ def avoid_late_movers(momentum_rankings, early_strength_signals, late_mover_pena
 
     return late_mover_filter
 
+
 def calculate_market_volatility_filter(pc_scaled, window=20, volatility_threshold=3.0):
     print("Calculating market volatility filter...")
     pc1_volatility = pc_scaled['PC1'].rolling(window=window).std()
@@ -545,6 +573,7 @@ def calculate_market_volatility_filter(pc_scaled, window=20, volatility_threshol
     volatility_filter = pd.DataFrame(1, index=pc_scaled.index, columns=['filter'])
     volatility_filter.loc[pc1_volatility > vol_threshold, 'filter'] = 0
     return volatility_filter.squeeze()
+
 
 def require_signal_confirmation(signals_df, confirmation_days=0):
     print(f"Requiring {confirmation_days} days of signal confirmation...")
@@ -556,7 +585,240 @@ def require_signal_confirmation(signals_df, confirmation_days=0):
                 confirmed_signals.iloc[i][col] = 1
     return confirmed_signals
 
-def comprehensive_sector_strategy(returns, sector_lists, test_start_date, lookbacks=[5, 14, 60]):
+
+# -----------------------------
+# NEW: PC-based Sell Signal Generation
+# -----------------------------
+def calculate_rolling_r2_matrix(returns, pc_df, window=20):
+    """
+    Calculate rolling R² between each ETF and each PC
+    """
+    print(f"Calculating rolling R² matrix with {window}-day window...")
+
+    # Align data
+    common_dates = returns.index.intersection(pc_df.index)
+    returns_aligned = returns.loc[common_dates]
+    pc_aligned = pc_df.loc[common_dates]
+
+    # Initialize results
+    r2_results = {}
+
+    for etf in returns_aligned.columns:
+        r2_results[etf] = {}
+        for pc in pc_aligned.columns:
+            r2_series = []
+
+            # Calculate rolling R² for this ETF-PC pair
+            for i in range(window, len(common_dates) + 1):
+                start_idx = i - window
+                end_idx = i
+
+                y = returns_aligned[etf].iloc[start_idx:end_idx]
+                x = pc_aligned[pc].iloc[start_idx:end_idx]
+
+                # Add constant term and fit OLS
+                X = sm.add_constant(x)
+                try:
+                    model = sm.OLS(y, X).fit()
+                    r2_series.append(model.rsquared)
+                except:
+                    r2_series.append(np.nan)
+
+            # Pad with NaN for initial window
+            r2_series = [np.nan] * (window - 1) + r2_series
+            r2_results[etf][pc] = r2_series
+
+    # Convert to nested DataFrames for easy access
+    r2_dfs = {}
+    for etf in r2_results.keys():
+        r2_dfs[etf] = pd.DataFrame(r2_results[etf], index=common_dates)
+
+    return r2_dfs
+
+# Modified: generate_pc_based_sell_signals to include momentum decay, trailing stop, and time-based exit
+def generate_pc_based_sell_signals(buy_signals, r2_dfs, weighted_scores=None,
+                                   high_r2_threshold=0.1,
+                                   pc1_min_r2_threshold=0.25,
+                                   lookback_days=5,
+                                   enable_momentum_decay=False,
+                                   momentum_decay_threshold=0.8,
+                                   enable_trailing_stop=False,
+                                   trailing_stop_pct=0.07,
+                                   enable_time_exit=False,
+                                   max_hold_days=90,
+                                   prices_df=None,
+                                   ticker_to_sector=None):
+    """
+    Generate sell signals based on PC correlations, with optional momentum decay, trailing stop, and time-based exits
+    """
+    print(f"Generating PC-based sell signals...")
+    print(f"  High R² threshold: {high_r2_threshold}")
+    print(f"  PC1 minimum R² threshold: {pc1_min_r2_threshold}")
+    print(f"  Lookback days: {lookback_days}")
+    if enable_momentum_decay:
+        print(f"  Enabling momentum decay exit with threshold: {momentum_decay_threshold}")
+    if enable_trailing_stop:
+        print(f"  Enabling trailing stop at {trailing_stop_pct * 100}%")
+    if enable_time_exit:
+        print(f"  Enabling time-based exit after {max_hold_days} days")
+
+    # Initialize sell signals DataFrame
+    sell_signals = pd.DataFrame(0, index=buy_signals.index, columns=buy_signals.columns)
+
+    # Track positions (when we bought each ETF) and additional tracking for trailing
+    positions = {etf: [] for etf in buy_signals.columns}  # List of buy dates for each ETF
+    peak_prices = {etf: {} for etf in buy_signals.columns}  # Dict of buy_date: peak_price
+
+    # Process each date
+    for i, date in enumerate(buy_signals.index):
+        # Process buy signals first - add to positions
+        for etf in buy_signals.columns:
+            if buy_signals.loc[date, etf] == 1:
+                buy_price = prices_df.loc[date, etf]
+                positions[etf].append(date)
+                peak_prices[etf][date] = buy_price  # Initial peak is buy price
+
+        # Check sell conditions for existing positions
+        for etf in buy_signals.columns:
+            if len(positions[etf]) > 0 and etf in r2_dfs:  # We have positions in this ETF
+                r2_df = r2_dfs[etf]
+
+                if date not in r2_df.index:
+                    continue
+
+                # Get current R² values
+                current_r2_values = r2_df.loc[date]
+
+                if current_r2_values.isna().all():
+                    continue
+
+                # Condition 1: Check if PC1 R² is below minimum threshold
+                pc1_r2 = current_r2_values.get('PC1', 0)
+                pc1_sell_signal = pc1_r2 < pc1_min_r2_threshold
+
+                # Condition 2: Check if highest correlated PC has dropped below threshold
+                high_r2_sell_signal = False
+
+                # Look back to find the PC that had highest correlation during holding period
+                for pos_date in positions[etf]:
+                    # Get lookback window from position date
+                    pos_idx = r2_df.index.get_loc(pos_date) if pos_date in r2_df.index else None
+                    if pos_idx is None:
+                        continue
+
+                    # Define lookback window for determining highest correlated PC
+                    lookback_start = max(0, pos_idx - lookback_days)
+                    lookback_end = min(len(r2_df), pos_idx + lookback_days + 1)
+
+                    # Get average R² during lookback period around position entry
+                    if lookback_end > lookback_start:
+                        lookback_r2 = r2_df.iloc[lookback_start:lookback_end].mean()
+                        if not lookback_r2.isna().all():
+                            highest_r2_pc = lookback_r2.idxmax()
+                            highest_r2_value = lookback_r2.max()
+
+                            # Check if this PC's current R² has dropped below threshold
+                            current_highest_pc_r2 = current_r2_values.get(highest_r2_pc, 0)
+
+                            # Sell if the highest correlated PC has dropped below threshold
+                            if (highest_r2_value > high_r2_threshold and
+                                    current_highest_pc_r2 < high_r2_threshold):
+                                high_r2_sell_signal = True
+                                break
+
+                # NEW: Momentum decay condition
+                momentum_decay_sell = False
+                if enable_momentum_decay and weighted_scores is not None:
+                    sector = ticker_to_sector.get(etf, None) if ticker_to_sector else None
+                    if sector and date in weighted_scores.index and sector in weighted_scores.columns:
+                        current_score = weighted_scores.loc[date, sector]
+                        for pos_date in positions[etf]:
+                            if pos_date in weighted_scores.index:
+                                entry_score = weighted_scores.loc[pos_date, sector]
+                                if current_score < momentum_decay_threshold * entry_score:
+                                    momentum_decay_sell = True
+                                    break
+
+                # NEW: Trailing stop condition
+                trailing_sell = False
+                if enable_trailing_stop and prices_df is not None:
+                    current_price = prices_df.loc[date, etf]
+                    for pos_date in list(positions[etf]):  # Copy to avoid modification issues
+                        peak = peak_prices[etf].get(pos_date, current_price)
+                        peak = max(peak, current_price)  # Update peak
+                        peak_prices[etf][pos_date] = peak
+                        if (current_price / peak) - 1 < -trailing_stop_pct:
+                            trailing_sell = True
+                            break
+
+                # NEW: Time-based exit
+                time_sell = False
+                if enable_time_exit:
+                    for pos_date in positions[etf]:
+                        days_held = (date - pos_date).days
+                        if days_held > max_hold_days:
+                            time_sell = True
+                            break
+
+                # Generate sell signal if any condition is met
+                if pc1_sell_signal or high_r2_sell_signal or momentum_decay_sell or trailing_sell or time_sell:
+                    sell_signals.loc[date, etf] = 1
+                    # Remove all positions for this ETF (sell all)
+                    positions[etf] = []
+                    peak_prices[etf] = {}
+
+                    # Optional: Log reason (commented for now)
+                    # reasons = []
+                    # if pc1_sell_signal: reasons.append("PC1 R² low")
+                    # if high_r2_sell_signal: reasons.append("High R² drop")
+                    # if momentum_decay_sell: reasons.append("Momentum decay")
+                    # if trailing_sell: reasons.append("Trailing stop")
+                    # if time_sell: reasons.append("Time exit")
+
+    # Summary statistics
+    total_sell_signals = sell_signals.sum().sum()
+    etf_sell_counts = sell_signals.sum()
+    print(f"  Total PC-based sell signals generated: {total_sell_signals}")
+    print(f"  Sell signals by ETF:")
+    for etf in etf_sell_counts[etf_sell_counts > 0].index:
+        print(f"    {etf}: {etf_sell_counts[etf]} signals")
+
+    return sell_signals
+# Modified: comprehensive_sector_strategy to include all new parameters and logic
+def comprehensive_sector_strategy(returns, sector_lists, test_start_date, lookbacks=[5, 14, 60],
+                                  # PC-based sell signal parameters (existing)
+                                  enable_pc_sell_signals=True,
+                                  high_r2_threshold=0.1,
+                                  pc1_min_r2_threshold=0.25,
+                                  r2_window=20,
+                                  pc_lookback_days=5,
+                                  # NEW: Momentum decay
+                                  enable_momentum_decay=True,
+                                  momentum_decay_threshold=0.8,
+                                  # NEW: Trailing stop
+                                  enable_trailing_stop=True,
+                                  trailing_stop_pct=0.07,
+                                  # NEW: Time-based exit
+                                  enable_time_exit=True,
+                                  max_hold_days=90,
+                                  # NEW: Regime filter
+                                  enable_regime_filter=True,
+                                  bull_threshold=0.5,
+                                  bear_threshold=-0.5,
+                                  # NEW: Vol-adjusted momentum
+                                  enable_vol_adjusted_momentum=True,
+                                  vol_adjust_window=20,
+                                  # NEW: Shorts in bear (requires inverse ETFs; set to False by default)
+                                  enable_shorts_in_bear=False,
+                                  # NEW: Risk parity (applied in performance calc)
+                                  enable_risk_parity=True,
+                                  target_risk=0.01,
+                                  # NEW: KMeans regimes
+                                  enable_kmeans_regimes=False,
+                                  n_clusters=3,
+                                  # NEW: VIX filter
+                                  enable_vix_filter=True,
+                                  vix_threshold=30):
     print("\n" + "=" * 80)
     print("IMPLEMENTING COMPREHENSIVE SECTOR MOMENTUM STRATEGY")
     print("=" * 80)
@@ -564,41 +826,84 @@ def comprehensive_sector_strategy(returns, sector_lists, test_start_date, lookba
     train_returns = returns.loc[:test_start_date]
     test_returns = returns.loc[test_start_date:]
 
-    print("1/6: Calculating sector correlations and lead-lag relationships...")
+    print("1/8: Calculating sector correlations and lead-lag relationships...")
     corr_data = calculate_sector_correlations_and_lags(train_returns, sector_lists)
 
-    print("2/6: Calculating momentum rankings for multiple timeframes...")
-    momentum_rankings_train = calculate_sector_momentum_rankings(train_returns, sector_lists, lookbacks)
-    momentum_rankings_test = calculate_sector_momentum_rankings(test_returns, sector_lists, lookbacks)
+    print("2/8: Calculating momentum rankings for multiple timeframes...")
+    momentum_rankings_train = calculate_sector_momentum_rankings(train_returns, sector_lists, lookbacks,
+                                                                 enable_vol_adjusted_momentum=enable_vol_adjusted_momentum,
+                                                                 vol_window=vol_adjust_window)
+    momentum_rankings_test = calculate_sector_momentum_rankings(test_returns, sector_lists, lookbacks,
+                                                                enable_vol_adjusted_momentum=enable_vol_adjusted_momentum,
+                                                                vol_window=vol_adjust_window)
 
-    print("3/6: Identifying early strength sectors...")
+    print("3/8: Identifying early strength sectors...")
     early_strength = identify_early_strength_sectors(momentum_rankings_test, corr_data,
                                                      early_strength_threshold=3, min_lead_correlation=0.25)
 
-    print("4/6: Generating multi-timeframe consensus signals...")
+    print("4/8: Generating multi-timeframe consensus signals...")
     consensus_signals, signal_strength = generate_multi_timeframe_consensus_signals(momentum_rankings_test)
 
-    print("5/6: Generating weighted timeframe signals...")
-    weights = {f'{lb}d': w for lb, w in zip(lookbacks, [0.5, 0.3, 0.2][:len(lookbacks)])}
+    print("5/8: Generating weighted timeframe signals...")
+    weights = {f'{lb}d': w for lb, w in zip(lookbacks, [0.7, 0.2, 0.1][:len(lookbacks)])}
     weighted_signals, weighted_scores = weighted_multi_timeframe_signals(momentum_rankings_test, weights)
 
-    print("6/7: Filtering out late movers...")
+    print("6/8: Filtering out late movers...")
     late_mover_filter = avoid_late_movers(momentum_rankings_test, early_strength)
 
-    print("7/7: Adding volatility filtering...")
+    print("7/8: Adding volatility filtering...")
     volatility_filter = calculate_market_volatility_filter(test_pc_scaled)
+
+    # NEW: Regime detection
+    regimes = pd.Series(0, index=test_pc_scaled.index)  # 0=neutral, 1=bull, -1=bear
+    if enable_regime_filter:
+        print("Applying market regime filter...")
+        regimes[test_pc_scaled['PC1'] > bull_threshold] = 1
+        regimes[test_pc_scaled['PC1'] < bear_threshold] = -1
+
+    # NEW: KMeans regimes (overrides simple if enabled)
+    if enable_kmeans_regimes:
+        print(f"Applying KMeans regime clustering with {n_clusters} clusters...")
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+        kmeans.fit(train_pc_scaled)
+        test_clusters = kmeans.predict(test_pc_scaled)
+        # Map clusters to regimes based on mean PC1
+        cluster_means = [test_pc_scaled.iloc[test_clusters == c]['PC1'].mean() for c in range(n_clusters)]
+        cluster_regime_map = {}
+        for c in range(n_clusters):
+            if cluster_means[c] > bull_threshold:
+                cluster_regime_map[c] = 1
+            elif cluster_means[c] < bear_threshold:
+                cluster_regime_map[c] = -1
+            else:
+                cluster_regime_map[c] = 0
+        regimes = pd.Series([cluster_regime_map[cl] for cl in test_clusters], index=test_pc_scaled.index)
+
+    # NEW: VIX filter
+    vix_filter = pd.Series(1, index=test_returns.index)  # 1=ok, 0=high vol skip
+    if enable_vix_filter:
+        print(f"Downloading VIX data and applying threshold: {vix_threshold}")
+        vix_data = yf.download('^VIX', start=test_returns.index[0], end=test_returns.index[-1], auto_adjust=False)[
+            ('Close', '^VIX')]
+        vix_filter = pd.Series(1, index=vix_data.index)
+        vix_filter[vix_data > vix_threshold] = 0
+        vix_filter = vix_filter.reindex(test_returns.index, method='ffill')
+
+        # Forward fill
 
     common_dates = (early_strength.index
                     .intersection(consensus_signals.index)
                     .intersection(weighted_signals.index)
                     .intersection(late_mover_filter.index)
-                    .intersection(volatility_filter.index))
+                    .intersection(volatility_filter.index)
+                    .intersection(regimes.index)
+                    .intersection(vix_filter.index))
     common_sectors = (early_strength.columns
                       .intersection(consensus_signals.columns)
                       .intersection(weighted_signals.columns)
                       .intersection(late_mover_filter.columns))
 
-    print("Applying confirmation requirements...")
+    print("8/8: Applying confirmation requirements...")
     early_strength_confirmed = require_signal_confirmation(early_strength, confirmation_days=1)
     consensus_confirmed = require_signal_confirmation(consensus_signals, confirmation_days=1)
     weighted_confirmed = require_signal_confirmation(weighted_signals, confirmation_days=1)
@@ -607,7 +912,9 @@ def comprehensive_sector_strategy(returns, sector_lists, test_start_date, lookba
                     .intersection(consensus_confirmed.index)
                     .intersection(weighted_confirmed.index)
                     .intersection(late_mover_filter.index)
-                    .intersection(volatility_filter.index))
+                    .intersection(volatility_filter.index)
+                    .intersection(regimes.index)
+                    .intersection(vix_filter.index))
 
     final_signals = pd.DataFrame(0, index=common_dates, columns=common_sectors)
     pc1_threshold = 0.8
@@ -617,10 +924,21 @@ def comprehensive_sector_strategy(returns, sector_lists, test_start_date, lookba
             continue
         if date not in volatility_filter.index or volatility_filter.loc[date] == 0:
             continue
+        # NEW: Regime and VIX checks
+        if date in regimes.index and regimes.loc[date] != 1:  # Only buy in bull
+            if enable_shorts_in_bear and regimes.loc[date] == -1:
+                # NEW: Short bottom sectors in bear (simple: signal=-1 for bottom 3)
+                short_rankings = sorted(momentum_rankings_test['rankings'][min(lookbacks) + 'd'].loc[date], reverse=True)[:3]  # Bottom 3
+                for sector, rank in short_rankings.items():
+                    final_signals.loc[date, sector] = -1
+            continue
+        if date in vix_filter.index and vix_filter.loc[date] == 0:
+            continue
         for sector in common_sectors:
             if sector not in final_signals.columns:
                 continue
-            early_confirmed = early_strength_confirmed.loc[date, sector] if date in early_strength_confirmed.index else 0
+            early_confirmed = early_strength_confirmed.loc[
+                date, sector] if date in early_strength_confirmed.index else 0
             consensus_confirmed_sig = consensus_confirmed.loc[date, sector] if date in consensus_confirmed.index else 0
             weighted_confirmed_sig = weighted_confirmed.loc[date, sector] if date in weighted_confirmed.index else 0
             not_late_mover = late_mover_filter.loc[date, sector] if date in late_mover_filter.index else 1
@@ -635,8 +953,37 @@ def comprehensive_sector_strategy(returns, sector_lists, test_start_date, lookba
                                columns=[sector_to_ticker[s] for s in final_signals.columns])
     for date in final_signals.index:
         for sector in final_signals.columns:
-            if final_signals.loc[date, sector] == 1:
-                etf_signals.loc[date, sector_to_ticker[sector]] = 1
+            signal = final_signals.loc[date, sector]
+            if signal != 0:
+                etf_signals.loc[date, sector_to_ticker[sector]] = signal  # Support -1 for shorts
+
+    # NEW: Generate PC-based sell signals with new features
+    pc_sell_signals = None
+
+    if enable_pc_sell_signals:
+        print("\n" + "=" * 60)
+        print("GENERATING PC-BASED SELL SIGNALS")
+        print("=" * 60)
+
+        # Calculate rolling R² matrix for test period
+        r2_dfs = calculate_rolling_r2_matrix(test_returns, test_pc_df, window=r2_window)
+        ticker_to_sector = {tickers[0]: sector for sector, tickers in sector_lists.items()}
+        # Generate PC-based sell signals with new params
+        pc_sell_signals = generate_pc_based_sell_signals(
+            etf_signals, r2_dfs,
+            weighted_scores=weighted_scores,
+            high_r2_threshold=high_r2_threshold,
+            pc1_min_r2_threshold=pc1_min_r2_threshold,
+            lookback_days=pc_lookback_days,
+            enable_momentum_decay=enable_momentum_decay,
+            momentum_decay_threshold=momentum_decay_threshold,
+            enable_trailing_stop=enable_trailing_stop,
+            trailing_stop_pct=trailing_stop_pct,
+            enable_time_exit=enable_time_exit,
+            max_hold_days=max_hold_days,
+            prices_df=data,
+            ticker_to_sector=ticker_to_sector  # NEW: Pass it
+        )
 
     strategy_details = {
         'correlation_data': corr_data,
@@ -648,10 +995,14 @@ def comprehensive_sector_strategy(returns, sector_lists, test_start_date, lookba
         'weighted_scores': weighted_scores,
         'late_mover_filter': late_mover_filter,
         'sector_signals': final_signals,
-        'etf_signals': etf_signals
+        'etf_signals': etf_signals,
+        'pc_sell_signals': pc_sell_signals,
+        'r2_dfs': r2_dfs if enable_pc_sell_signals else None,
+        'regimes': regimes  # NEW: For analysis
     }
 
-    return etf_signals, strategy_details
+    return etf_signals, pc_sell_signals, strategy_details
+
 
 def plot_comprehensive_strategy_analysis(strategy_details, sector_lists):
     fig, axes = plt.subplots(3, 2, figsize=(20, 15))
@@ -686,7 +1037,7 @@ def plot_comprehensive_strategy_analysis(strategy_details, sector_lists):
     etf_signals = strategy_details['etf_signals']
     signal_totals = etf_signals.sum(axis=0).sort_values(ascending=True)
     signal_totals.plot(kind='barh', ax=axes[3], color='blue', alpha=0.7)
-    axes[3].set_title('Total Signals by ETF')
+    axes[3].set_title('Total Buy Signals by ETF')
     axes[3].set_xlabel('Number of Signals')
     axes[3].grid(True, alpha=0.3)
 
@@ -698,19 +1049,29 @@ def plot_comprehensive_strategy_analysis(strategy_details, sector_lists):
     axes[4].set_ylabel('Number of Sectors Avoided')
     axes[4].grid(True, alpha=0.3)
 
-    final_signals = strategy_details['sector_signals']
-    daily_signals = final_signals.sum(axis=1)
-    axes[5].hist(daily_signals, bins=range(len(final_signals.columns) + 2),
-                 alpha=0.7, color='green', edgecolor='black')
-    axes[5].set_title('Distribution of Daily Signal Count')
-    axes[5].set_xlabel('Number of Sectors Signaled Per Day')
-    axes[5].set_ylabel('Frequency')
-    axes[5].grid(True, alpha=0.3)
+    # NEW: Plot PC-based sell signals
+    if strategy_details['pc_sell_signals'] is not None:
+        pc_sell_signals = strategy_details['pc_sell_signals']
+        sell_signal_totals = pc_sell_signals.sum(axis=0).sort_values(ascending=True)
+        sell_signal_totals.plot(kind='barh', ax=axes[5], color='red', alpha=0.7)
+        axes[5].set_title('Total PC-based Sell Signals by ETF')
+        axes[5].set_xlabel('Number of Sell Signals')
+        axes[5].grid(True, alpha=0.3)
+    else:
+        final_signals = strategy_details['sector_signals']
+        daily_signals = final_signals.sum(axis=1)
+        axes[5].hist(daily_signals, bins=range(len(final_signals.columns) + 2),
+                     alpha=0.7, color='green', edgecolor='black')
+        axes[5].set_title('Distribution of Daily Signal Count')
+        axes[5].set_xlabel('Number of Sectors Signaled Per Day')
+        axes[5].set_ylabel('Frequency')
+        axes[5].grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.show()
 
-def calculate_trading_performance(buy_signals, sell_signals, test_returns, prices_df):
+# Modified: calculate_trading_performance to support risk parity and shorts
+def calculate_trading_performance(buy_signals, sell_signals, test_returns, prices_df, train_std=None, enable_risk_parity=False, target_risk=0.01):
     common_dates = (buy_signals.index
                     .intersection(sell_signals.index)
                     .intersection(test_returns.index)
@@ -745,19 +1106,29 @@ def calculate_trading_performance(buy_signals, sell_signals, test_returns, price
 
     for date in common_dates:
         for etf in common_etfs:
-            if buy_signals_aligned.loc[date, etf] == 1 and positions[etf] is None:
+            signal = buy_signals_aligned.loc[date, etf]
+            if signal != 0 and positions[etf] is None:
                 buy_price = test_prices_aligned.loc[date, etf]
+                # NEW: Risk parity sizing
+                shares = 1
+                if enable_risk_parity and train_std is not None and etf in train_std.index:
+                    annualized_vol = train_std[etf] * np.sqrt(252)  # Assuming daily std
+                    shares = target_risk / annualized_vol if annualized_vol > 0 else 1
+                direction = 1 if signal > 0 else -1  # For shorts
                 positions[etf] = {
                     'buy_date': date,
                     'buy_price': buy_price,
-                    'shares': 1
+                    'shares': shares * direction,  # Negative for shorts
+                    'direction': direction
                 }
-                total_capital_deployed += buy_price
+                total_capital_deployed += abs(buy_price * shares)
             elif sell_signals_aligned.loc[date, etf] == 1 and positions[etf] is not None:
                 sell_price = test_prices_aligned.loc[date, etf]
                 position = positions[etf]
-                trade_return = (sell_price - position['buy_price']) / position['buy_price']
-                trade_profit = sell_price - position['buy_price']
+                # For shorts, invert return calculation
+                price_change = (sell_price - position['buy_price']) * position['direction']
+                trade_return = price_change / position['buy_price']
+                trade_profit = price_change * abs(position['shares'])
                 days_held = (date - position['buy_date']).days
                 trades.append({
                     'etf': etf,
@@ -768,7 +1139,8 @@ def calculate_trading_performance(buy_signals, sell_signals, test_returns, price
                     'return_pct': trade_return,
                     'profit_dollar': trade_profit,
                     'days_held': days_held,
-                    'annualized_return': (trade_return + 1) ** (365 / days_held) - 1 if days_held > 0 else 0
+                    'annualized_return': (trade_return + 1) ** (365 / days_held) - 1 if days_held > 0 else 0,
+                    'direction': 'Long' if position['direction'] > 0 else 'Short'
                 })
                 positions[etf] = None
 
@@ -776,8 +1148,9 @@ def calculate_trading_performance(buy_signals, sell_signals, test_returns, price
     for etf, position in positions.items():
         if position is not None:
             final_price = test_prices_aligned.loc[final_date, etf]
-            trade_return = (final_price - position['buy_price']) / position['buy_price']
-            trade_profit = final_price - position['buy_price']
+            price_change = (final_price - position['buy_price']) * position['direction']
+            trade_return = price_change / position['buy_price']
+            trade_profit = price_change * abs(position['shares'])
             days_held = (final_date - position['buy_date']).days
             trades.append({
                 'etf': etf,
@@ -789,7 +1162,8 @@ def calculate_trading_performance(buy_signals, sell_signals, test_returns, price
                 'profit_dollar': trade_profit,
                 'days_held': days_held,
                 'annualized_return': (trade_return + 1) ** (365 / days_held) - 1 if days_held > 0 else 0,
-                'status': 'OPEN'
+                'status': 'OPEN',
+                'direction': 'Long' if position['direction'] > 0 else 'Short'
             })
 
     if not trades:
@@ -840,6 +1214,7 @@ def calculate_trading_performance(buy_signals, sell_signals, test_returns, price
 
     return trades_df, performance_metrics
 
+
 def print_performance_report(trades_df, performance_metrics):
     print("\n" + "=" * 80)
     print("                        TRADING PERFORMANCE REPORT")
@@ -883,6 +1258,7 @@ def print_performance_report(trades_df, performance_metrics):
                 f"   {etf}: {trades_count} trades, {avg_ret:.2%} avg return, ${total_profit:,.2f} profit, {win_rate:.2%} win rate, {avg_days:.1f} days avg")
     print("=" * 80)
 
+
 def plot_trading_results(buy_signals, sell_signals, trades_df, test_returns, test_prices):
     common_dates = (buy_signals.index
                     .intersection(sell_signals.index)
@@ -911,6 +1287,7 @@ def plot_trading_results(buy_signals, sell_signals, trades_df, test_returns, tes
     ax1.set_ylabel("ETF")
     ax1.set_yticks(range(len(buy_signals_plot.columns)))
     ax1.set_yticklabels(buy_signals_plot.columns)
+
 
 def plot_etf_signals_over_time(buy_signals, sell_signals, prices_df, sector_lists, etfs_per_page=4):
     print("Plotting buy and sell signals over time for each ETF...")
@@ -945,7 +1322,7 @@ def plot_etf_signals_over_time(buy_signals, sell_signals, prices_df, sector_list
             ax.scatter(buy_dates, buy_prices, marker='^', color='green', s=100, label='Buy Signal')
             sell_dates = sell_signals_plot.index[sell_signals_plot[etf] == 1]
             sell_prices = prices_plot.loc[sell_dates, etf]
-            ax.scatter(sell_dates, sell_prices, marker='v', color='red', s=100, label='Sell Signal')
+            ax.scatter(sell_dates, sell_prices, marker='v', color='red', s=100, label='Sell Signal (PC-based)')
             ax.set_title(f"{sector_name} ({etf}) - Price and Trading Signals")
             ax.set_ylabel("Price")
             ax.grid(True, alpha=0.3)
@@ -958,31 +1335,159 @@ def plot_etf_signals_over_time(buy_signals, sell_signals, prices_df, sector_list
         plt.show()
         print(f"Generated plot page {page + 1}/{num_pages}")
 
+
+def plot_pc_r2_analysis(r2_dfs, buy_signals, sell_signals, sector_lists, etfs_to_plot=None):
+    """
+    Plot R² evolution for ETFs with buy/sell signals overlaid
+    """
+    if r2_dfs is None:
+        print("No R² data available for plotting")
+        return
+
+    ticker_to_sector = {ticker: sector for sector, tickers in sector_lists.items() for ticker in tickers}
+
+    # Select ETFs to plot
+    if etfs_to_plot is None:
+        # Plot ETFs with most signals
+        signal_counts = (buy_signals.sum() + sell_signals.sum()).sort_values(ascending=False)
+        etfs_to_plot = signal_counts.head(6).index.tolist()
+
+    # Create subplots
+    fig, axes = plt.subplots(3, 2, figsize=(20, 15))
+    axes = axes.flatten()
+
+    for i, etf in enumerate(etfs_to_plot):
+        if i >= len(axes) or etf not in r2_dfs:
+            continue
+
+        ax = axes[i]
+        r2_df = r2_dfs[etf]
+        sector_name = ticker_to_sector.get(etf, "Unknown Sector")
+
+        # Plot R² for each PC
+        for pc in r2_df.columns:
+            ax.plot(r2_df.index, r2_df[pc], label=pc, linewidth=1.5, alpha=0.7)
+
+        # Overlay buy signals
+        if etf in buy_signals.columns:
+            buy_dates = buy_signals.index[buy_signals[etf] == 1]
+            for buy_date in buy_dates:
+                if buy_date in r2_df.index:
+                    ax.axvline(x=buy_date, color='green', alpha=0.6, linestyle='--', linewidth=2)
+
+        # Overlay sell signals
+        if etf in sell_signals.columns:
+            sell_dates = sell_signals.index[sell_signals[etf] == 1]
+            for sell_date in sell_dates:
+                if sell_date in r2_df.index:
+                    ax.axvline(x=sell_date, color='red', alpha=0.6, linestyle='--', linewidth=2)
+
+        ax.set_title(f"{sector_name} ({etf}) - R² with PCs Over Time")
+        ax.set_ylabel("R²")
+        ax.set_ylim(0, 1)
+        ax.legend(loc='upper right', fontsize='small')
+        ax.grid(True, alpha=0.3)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+        plt.setp(ax.get_xticklabels(), rotation=45)
+
+    # Add legend for buy/sell lines
+    from matplotlib.lines import Line2D
+    custom_lines = [Line2D([0], [0], color='green', linestyle='--', linewidth=2),
+                    Line2D([0], [0], color='red', linestyle='--', linewidth=2)]
+    fig.legend(custom_lines, ['Buy Signal', 'Sell Signal'],
+               loc='upper center', bbox_to_anchor=(0.5, 0.02), ncol=2)
+
+    plt.tight_layout()
+    plt.subplots_adjust(bottom=0.05)
+    plt.show()
+
+
 # -----------------------------
 # Run the strategy and generate plots
 # -----------------------------
 test_start_date = split_date
 lookbacks = [5, 10, 60]  # Adjustable lookback periods
-print("\nRunning comprehensive sector momentum strategy...")
-etf_signals, strategy_details = comprehensive_sector_strategy(returns, sector_lists, test_start_date, lookbacks)
 
-sell_signals = pd.DataFrame(0, index=etf_signals.index, columns=etf_signals.columns)
-for date_idx in range(1, len(etf_signals)):
-    prev_signals = etf_signals.iloc[date_idx - 1]
-    curr_signals = etf_signals.iloc[date_idx]
-    for etf in etf_signals.columns:
-        if prev_signals[etf] == 1 and curr_signals[etf] == 0:
-            sell_signals.iloc[date_idx][etf] = 1
+# PC-based sell signal parameters (easily adjustable)
+HIGH_R2_THRESHOLD = 0.1  # Sell when highest correlated PC R² drops below this
+PC1_MIN_R2_THRESHOLD = 0.25  # Sell when PC1 R² drops below this
+R2_WINDOW = 20  # Rolling window for R² calculation
+PC_LOOKBACK_DAYS = 5  # Days to look back for determining highest correlated PC
 
+print(f"\n{'=' * 80}")
+print("PC-BASED SELL SIGNAL PARAMETERS:")
+print(f"{'=' * 80}")
+print(f"High R² Threshold: {HIGH_R2_THRESHOLD}")
+print(f"PC1 Minimum R² Threshold: {PC1_MIN_R2_THRESHOLD}")
+print(f"R² Rolling Window: {R2_WINDOW} days")
+print(f"PC Lookback Days: {PC_LOOKBACK_DAYS}")
+print(f"{'=' * 80}")
+
+print("\nRunning comprehensive sector momentum strategy with PC-based sell signals...")
+buy_signals, pc_sell_signals, strategy_details = comprehensive_sector_strategy(
+    returns, sector_lists, test_start_date, lookbacks,
+    # PC-based sell signal parameters
+    enable_pc_sell_signals=True,
+    high_r2_threshold=HIGH_R2_THRESHOLD,
+    pc1_min_r2_threshold=PC1_MIN_R2_THRESHOLD,
+    r2_window=R2_WINDOW,
+    pc_lookback_days=PC_LOOKBACK_DAYS
+)
+
+# Use PC-based sell signals if available, otherwise fall back to original logic
+if pc_sell_signals is not None:
+    final_sell_signals = pc_sell_signals
+    print(f"\nUsing PC-based sell signals: {pc_sell_signals.sum().sum()} total sell signals")
+else:
+    # Original sell signal logic as fallback
+    final_sell_signals = pd.DataFrame(0, index=buy_signals.index, columns=buy_signals.columns)
+    for date_idx in range(1, len(buy_signals)):
+        prev_signals = buy_signals.iloc[date_idx - 1]
+        curr_signals = buy_signals.iloc[date_idx]
+        for etf in buy_signals.columns:
+            if prev_signals[etf] == 1 and curr_signals[etf] == 0:
+                final_sell_signals.iloc[date_idx][etf] = 1
+    print(f"\nUsing traditional sell signals: {final_sell_signals.sum().sum()} total sell signals")
+
+# Calculate and display performance
 trades_df, performance_metrics = calculate_trading_performance(
-    etf_signals, sell_signals, test_returns, data
+    buy_signals, final_sell_signals, test_returns, data, train_std=train_std, enable_risk_parity=True, target_risk=0.01
 )
+
 print_performance_report(trades_df, performance_metrics)
+
+# Generate all plots
+print("\n" + "=" * 80)
+print("GENERATING COMPREHENSIVE ANALYSIS PLOTS")
+print("=" * 80)
+
 plot_comprehensive_strategy_analysis(strategy_details, sector_lists)
-plot_trading_results(
-    etf_signals, sell_signals, trades_df, test_returns, data
-)
-plot_etf_signals_over_time(
-    etf_signals, sell_signals, data, sector_lists, etfs_per_page=4
-)
-print("\nStrategy execution and all plots generated successfully!")
+plot_trading_results(buy_signals, final_sell_signals, trades_df, test_returns, data)
+plot_etf_signals_over_time(buy_signals, final_sell_signals, data, sector_lists, etfs_per_page=4)
+
+# NEW: Plot PC R² analysis
+if strategy_details['r2_dfs'] is not None:
+    print("\nGenerating PC R² analysis plots...")
+    plot_pc_r2_analysis(strategy_details['r2_dfs'], buy_signals, final_sell_signals, sector_lists)
+
+print("\n" + "=" * 80)
+print("STRATEGY EXECUTION COMPLETE!")
+print("=" * 80)
+print(f"✅ Buy signals: {buy_signals.sum().sum()}")
+print(f"✅ Sell signals: {final_sell_signals.sum().sum()}")
+print(f"✅ Total trades: {len(trades_df)}")
+print(f"✅ Win rate: {performance_metrics.get('win_rate', 0):.2%}")
+print(f"✅ Average return per trade: {performance_metrics.get('avg_return_per_trade', 0):.2%}")
+print("=" * 80)
+
+print("Entry Timing Quality:")
+trades_df['max_drawdown_during_hold'] = 0.0
+for idx, trade in trades_df.iterrows():
+    hold_prices = data.loc[trade['buy_date']:trade['sell_date'], trade['etf']]
+    cum_returns = (hold_prices / trade['buy_price']) - 1
+    running_max = cum_returns.cummax()
+    drawdown = (cum_returns - running_max) / (running_max + 1)  # +1 to avoid div by zero
+    trades_df.at[idx, 'max_drawdown_during_hold'] = drawdown.min()
+
+print("Avg max drawdown during holds:", trades_df['max_drawdown_during_hold'].mean())
