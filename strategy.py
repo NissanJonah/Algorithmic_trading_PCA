@@ -467,6 +467,31 @@ def plot_rolling_r2_pc1_sp500(pc_df, sp500_returns, window=63):
 
     return dates, r2_values
 
+def get_average_returns(dates, returns_df):
+    """
+    Calculate the average return for each ETF over the given list of dates.
+
+    Parameters:
+    - dates: list of dates (string 'YYYY-MM-DD' or pandas Timestamps)
+    - returns_df: DataFrame of daily returns for all ETFs
+
+    Returns:
+    - Series of average returns per ETF
+    """
+    # Ensure dates are Timestamps so we can index properly
+    date_index = pd.to_datetime(dates)
+
+    # Filter for available dates only (avoids missing data errors)
+    valid_dates = date_index.intersection(returns_df.index)
+
+    if len(valid_dates) == 0:
+        raise ValueError("None of the provided dates are in the returns DataFrame index.")
+
+    # Subset and compute mean return per ETF
+    avg_returns = returns_df.loc[valid_dates].mean()
+    return avg_returns
+
+
 
 plot_explained_variance(pca)
 plot_all_pcs_over_time(pc_df)
@@ -543,5 +568,19 @@ r2_full = compute_and_print_r2_pc1_market(pc_df, spy_returns)
 plot_rolling_r2_pc1_sp500(pc_df, spy_returns, window=63)
 
 
+
+cluster_0_dates = cluster_dates[0]
+cluster_1_dates = cluster_dates[1]
+cluster_2_dates = cluster_dates[2]
+
+
+avg_cluster2_returns = get_average_returns(cluster_2_dates, returns)
+print(avg_cluster2_returns)
+
+avg_cluster1_returns = get_average_returns(cluster_1_dates, returns)
+print(avg_cluster2_returns)
+
+avg_cluster0_returns = get_average_returns(cluster_0_dates, returns)
+print(avg_cluster2_returns)
 
 

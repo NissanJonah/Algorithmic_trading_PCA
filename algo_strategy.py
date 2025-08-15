@@ -31,7 +31,7 @@ sector_lists = {
 # 2. Download and preprocess data
 # -----------------------------
 all_etfs = [etf for etfs in sector_lists.values() for etf in etfs]
-data = yf.download(all_etfs, period="5y", auto_adjust=True)
+data = yf.download(all_etfs, period="20y", auto_adjust=True)
 data = data['Close']
 print(f"Using {len(data.columns)} ETFs after filtering.")
 
@@ -521,6 +521,31 @@ def get_dates_by_cluster(pc_df, cluster_labels):
     for cluster in np.unique(cluster_labels):
         cluster_dates[cluster] = df.index[df['Cluster'] == cluster].tolist()
     return cluster_dates
+
+def get_average_returns(dates, returns_df):
+    """
+    Calculate the average return for each ETF over the given list of dates.
+
+    Parameters:
+    - dates: list of dates (string 'YYYY-MM-DD' or pandas Timestamps)
+    - returns_df: DataFrame of daily returns for all ETFs
+
+    Returns:
+    - Series of average returns per ETF
+    """
+    # Ensure dates are Timestamps so we can index properly
+    date_index = pd.to_datetime(dates)
+
+    # Filter for available dates only (avoids missing data errors)
+    valid_dates = date_index.intersection(returns_df.index)
+
+    if len(valid_dates) == 0:
+        raise ValueError("None of the provided dates are in the returns DataFrame index.")
+
+    # Subset and compute mean return per ETF
+    avg_returns = returns_df.loc[valid_dates].mean()
+    return avg_returns
+
 # -----------------------------
 # Main workflow example:
 # -----------------------------
@@ -528,7 +553,7 @@ plot_explained_variance(pca)
 plot_all_pcs_over_time(pc_df)
 
 # 1. Cluster PCA scores
-cluster_labels, kmeans_model = cluster_pca_scores(pc_df, n_clusters=4)
+cluster_labels, kmeans_model = cluster_pca_scores(pc_df, n_clusters=2)
 cluster_dates = get_dates_by_cluster(pc_df, cluster_labels)
 
 # 2. Plot clusters in 2D and 3D
@@ -543,12 +568,12 @@ r2_dict = compute_rolling_r2(returns, pc_df, sector_lists, window=63)
 
 # 5. Generate buy signals example for a date
 print()
-day = cluster_dates[2][3]
+day = cluster_dates[1][3]
 print(f"The day is: {day}")
 print()
 try:
     current_date = pd.Timestamp('2025-01-02')
-    day = cluster_dates[2][-1]
+    day = cluster_dates[1][-1]
 
     buy_signals, sector_scores = generate_cluster_based_signals(
 
@@ -575,7 +600,7 @@ all_tickers = [etf for etfs in sector_lists.values() for etf in etfs]
 plot_pca_r2_over_time(returns, sector_lists, window_size=63, etfs_to_plot=all_tickers)
  #hi f
 
-spy_data = yf.download('SPY', period='5y', auto_adjust=True)['Close']
+spy_data = yf.download('SPY', period='20y', auto_adjust=True)['Close']
 spy_returns = spy_data.pct_change().reindex(returns.index).dropna()
 
 # 2. Compute and print R² over full period
@@ -589,7 +614,7 @@ spy_returns_aligned = spy_returns.reindex(pc_df.index).ffill().bfill()
 # Call the plot function
 
 # Get market returns
-spy_returns = yf.download('SPY', period='5y', auto_adjust=True)['Close'].pct_change().dropna()
+spy_returns = yf.download('SPY', period='20y', auto_adjust=True)['Close'].pct_change().dropna()
 
 # Plot and calculate R²
 
@@ -613,3 +638,217 @@ plot_rolling_r2_clusters_returns(
 )
 
 
+
+cluster_0_dates = cluster_dates[0]
+cluster_1_dates = cluster_dates[1]
+
+
+
+
+avg_cluster1_returns = get_average_returns(cluster_1_dates, returns)
+print("cluster 1 average returns")
+print(f"{avg_cluster1_returns}")
+
+avg_cluster0_returns = get_average_returns(cluster_0_dates, returns)
+print("cluster 0 average returns")
+print(f"{avg_cluster0_returns}")
+print()
+print()
+
+#=================================
+#buy and sell signal momentum code
+#=================================
+print("====================")
+print("Momentum Information")
+print("====================")
+import pandas as pd
+
+def get_forward_returns_x_days(dates, returns_df, x):
+    """
+    Calculate average returns for each ETF x days AFTER the given dates.
+    Returns a text summary string.
+    """
+    date_index = pd.to_datetime(dates)
+    valid_dates = date_index.intersection(returns_df.index)
+
+    if len(valid_dates) == 0:
+        return f"No valid dates found for forward period of {x} days."
+
+    forward_returns = []
+    for date in valid_dates:
+        if date in returns_df.index:
+            pos = returns_df.index.get_loc(date)
+            if pos + x < len(returns_df.index):
+                future_date = returns_df.index[pos + x]
+                forward_returns.append(returns_df.loc[future_date])
+
+    if not forward_returns:
+        return f"No forward returns available for {x} days ahead."
+
+    avg_forward = pd.concat(forward_returns, axis=1).mean(axis=1)
+    return f"Average returns {x} days after given dates:\n{avg_forward.to_string()}"
+
+
+def get_forward_returns_y_days(dates, returns_df, y):
+    """
+    Calculate average returns for each ETF y days AFTER the given dates.
+    Returns a text summary string.
+    """
+    date_index = pd.to_datetime(dates)
+    valid_dates = date_index.intersection(returns_df.index)
+
+    if len(valid_dates) == 0:
+        return f"No valid dates found for forward period of {y} days."
+
+    forward_returns = []
+    for date in valid_dates:
+        if date in returns_df.index:
+            pos = returns_df.index.get_loc(date)
+            if pos + y < len(returns_df.index):
+                future_date = returns_df.index[pos + y]
+                forward_returns.append(returns_df.loc[future_date])
+
+    if not forward_returns:
+        return f"No forward returns available for {y} days ahead."
+
+    avg_forward = pd.concat(forward_returns, axis=1).mean(axis=1)
+    return f"Average returns {y} days after given dates:\n{avg_forward.to_string()}"
+
+
+def get_cluster_positive_return_percentages(dates, returns_df, x, y):
+    """
+    Calculate percentage of days with positive average returns:
+     - 1 day after
+     - x days after
+     - y days after
+    for the given list of dates.
+    Returns a text summary string.
+    """
+    date_index = pd.to_datetime(dates)
+    valid_dates = date_index.intersection(returns_df.index)
+
+    def pct_positive(dates_list, forward_days):
+        count_positive = 0
+        count_total = 0
+        for date in dates_list:
+            if date in returns_df.index:
+                pos = returns_df.index.get_loc(date)
+                if pos + forward_days < len(returns_df.index):
+                    future_date = returns_df.index[pos + forward_days]
+                    avg_return = returns_df.loc[future_date].mean()
+                    count_total += 1
+                    if avg_return > 0:
+                        count_positive += 1
+        return (count_positive / count_total * 100) if count_total > 0 else 0
+
+    pos_1d = pct_positive(valid_dates, 1)
+    pos_xd = pct_positive(valid_dates, x)
+    pos_yd = pct_positive(valid_dates, y)
+
+    return (
+        f"Percentage of positive average returns after given dates:\n"
+        f"  1 day after: {pos_1d:.2f}%\n"
+        f"  {x} days after: {pos_xd:.2f}%\n"
+        f"  {y} days after: {pos_yd:.2f}%"
+    )
+
+# Example usage calls for your clusters — exactly like your style:
+cluster_0_dates = cluster_dates[0]
+cluster_1_dates = cluster_dates[1]
+
+print("cluster 1 average returns (y days after):")
+print(get_forward_returns_y_days(cluster_1_dates, returns, y=20))
+
+print("cluster 0 average returns (y days after):")
+print(get_forward_returns_y_days(cluster_0_dates, returns, y=20))
+
+print("cluster 1 positive return percentages (1 day, x days, y days):")
+print(get_cluster_positive_return_percentages(cluster_1_dates, returns, x=5, y=20))
+
+print("cluster 0 positive return percentages (1 day, x days, y days):")
+print(get_cluster_positive_return_percentages(cluster_0_dates, returns, x=5, y=20))
+
+
+print()
+print("===========================")
+print()
+
+def cluster_profitability_with_pc1_momentum(pc_df, cluster_labels, returns_df, ma_window=5, lookahead_days=[1, 5, 10, 20]):
+    """
+    Calculate profitability % for each cluster at various lookahead days after dates where PC1 momentum is up.
+
+    Parameters:
+    - pc_df: DataFrame with PCs, index = dates
+    - cluster_labels: array-like cluster assignments aligned with pc_df index
+    - returns_df: DataFrame of daily returns for ETFs, indexed by date
+    - ma_window: window size for moving average to define PC1 momentum (default 5)
+    - lookahead_days: list of ints for days after to check returns (default [1,5,10,20])
+
+    Returns:
+    - text summary of profitability percentages per cluster and lookahead day
+    """
+
+    pc1 = pc_df['PC1']
+    # Calculate moving average of PC1
+    pc1_ma = pc1.rolling(window=ma_window).mean()
+
+    # Momentum up = pc1_ma today > pc1_ma yesterday
+    momentum_up = pc1_ma > pc1_ma.shift(1)
+
+    # Filter dates where momentum is up and drop NAs from rolling mean
+    valid_dates = pc_df.index[momentum_up.fillna(False)]
+
+    # Prepare results dict: cluster -> lookahead_day -> profitability %
+    results = {}
+
+    # Map cluster labels to index for convenience
+    cluster_labels = np.array(cluster_labels)
+
+    for cluster in np.unique(cluster_labels):
+        # Get all dates in this cluster where momentum is up
+        cluster_dates = [date for i, date in enumerate(pc_df.index) if cluster_labels[i] == cluster and date in valid_dates]
+
+        # Initialize nested dict for this cluster
+        results[cluster] = {}
+
+        for days_ahead in lookahead_days:
+            positive_count = 0
+            total_count = 0
+
+            for date in cluster_dates:
+                lookahead_date = date + pd.Timedelta(days=days_ahead)
+                # Find closest available date >= lookahead_date in returns_df
+                future_dates = returns_df.index[returns_df.index >= lookahead_date]
+                if len(future_dates) == 0:
+                    continue  # no future data
+                actual_date = future_dates[0]
+
+                # Calculate average return across ETFs on that day
+                avg_return = returns_df.loc[actual_date].mean()
+                total_count += 1
+                if avg_return > 0:
+                    positive_count += 1
+
+            profitability = (positive_count / total_count * 100) if total_count > 0 else float('nan')
+            results[cluster][days_ahead] = profitability
+
+    # Build summary text
+    summary_lines = ["Profitability % per cluster when PC1 momentum is UP (by days after):\n"]
+    for cluster in sorted(results.keys()):
+        summary_lines.append(f"Cluster {cluster}:")
+        for days_ahead in sorted(results[cluster].keys()):
+            profit_pct = results[cluster][days_ahead]
+            if np.isnan(profit_pct):
+                summary_lines.append(f"  {days_ahead} days after: No data")
+            else:
+                summary_lines.append(f"  {days_ahead} days after: {profit_pct:.2f}% positive returns")
+        summary_lines.append("")  # blank line for spacing
+
+    return "\n".join(summary_lines)
+
+
+print(cluster_profitability_with_pc1_momentum(pc_df, cluster_labels, returns))
+
+
+
+#+++++++++++++++++++++++++
