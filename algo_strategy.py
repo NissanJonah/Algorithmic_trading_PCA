@@ -90,7 +90,7 @@ print(f"PC1 explains {explained_var[0]:.2%} of variance and " +
 # -----------------------------
 # 6. Function: Plot PCA R² over time for selected ETFs
 # -----------------------------
-def plot_pca_r2_over_time(returns, sector_lists, window_size=63, etfs_to_plot=None, num_graphs=11):
+def plot_pca_r2_over_time(returns, sector_lists, window_size=63, etfs_to_plot=None, num_graphs=0):
     """
     Rolling-window R² over time for ETFs vs PCs.
     Each ETF gets its own graph showing all PCs as lines.
@@ -852,3 +852,4 @@ print(cluster_profitability_with_pc1_momentum(pc_df, cluster_labels, returns))
 
 
 #+++++++++++++++++++++++++
+
