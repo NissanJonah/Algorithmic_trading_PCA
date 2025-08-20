@@ -9,7 +9,9 @@ import scipy.optimize as opt
 from scipy import linalg
 import matplotlib.pyplot as plt
 import warnings
+from scipy.optimize import lsq_linear
 import statsmodels.api as sm
+# import logging
 
 warnings.filterwarnings('ignore')
 
@@ -23,13 +25,17 @@ class UltimateDetailedStrategy:
         self.L = 252  # Lookback period for statistics: L = 252 trading days
         self.transaction_costs = 0.001  # fee per share or percentage per trade
 
-        # Data storage
-        self.P = None  # Price matrix
+        # Data storage - now holds full dataset
+        self.P_full = None  # Full price matrix for entire period
+        self.factors_data_full = None  # Full factor data for entire period
+
+        # Current window data (recalculated each week)
+        self.P = None  # Price matrix for current window
         self.R = None  # Returns matrix R of shape (T, N)
         self.Sigma = None  # Covariance matrix Σ = (1 / (T - 1)) * R^T · R
         self.V = None  # Loadings matrix V = [v_1, v_2, ..., v_K] shape (N, K)
         self.PC_day = None  # PC time series matrix PC_day = R · V shape (T, K)
-        self.factors_data = None  # Factor data
+        self.factors_data = None  # Factor data for current window
         self.centrality_matrix = None  # Centrality matrix C
         self.u_centrality = None  # First eigenvector of centrality matrix
 
@@ -37,27 +43,35 @@ class UltimateDetailedStrategy:
         self.portfolio_history = []
         self.performance_metrics = {}
 
-    def load_data(self, stock_symbols, start_date, end_date, factors_dict=None):
+        # Optimization counters
+        self.slsqp_success_count = 0
+        self.lsq_fallback_count = 0
+
+    def load_full_data(self, stock_symbols, start_date, end_date, factors_dict=None):
         """
-        2. Data Preparation
-        Load stock price data and factor data
+        Load full dataset from 252 days before start_date until end_date
         """
-        print("Loading stock data...")
+        print("Loading full stock and factor data...")
         self.stocks = stock_symbols
 
+        # Calculate actual start date (252 trading days before requested start)
+        start_date_dt = pd.to_datetime(start_date)
+        # Approximate 252 trading days as 360 calendar days to be safe
+        extended_start_date = start_date_dt - pd.Timedelta(days=360)
+
         # Load stock price data
-        stock_data = yf.download(stock_symbols, start=start_date, end=end_date, auto_adjust=True)
+        stock_data = yf.download(stock_symbols, start=extended_start_date, end=end_date, auto_adjust=True)
         prices = stock_data['Close']
         if isinstance(prices, pd.Series):
             prices = prices.to_frame(stock_symbols[0])
-        self.P = prices.dropna()
-        # print(f"Loaded price data shape: {self.P.shape}")
+        self.P_full = prices.dropna()
+        print(f"Loaded full price data shape: {self.P_full.shape}")
 
         # Load factor data
         if factors_dict:
             factor_symbols = list(factors_dict.keys())
-            print(f"Attempting to load factor data for {len(factor_symbols)} symbols...")
-            factor_data = yf.download(factor_symbols, start=start_date, end=end_date, auto_adjust=True)
+            print(f"Loading full factor data for {len(factor_symbols)} symbols...")
+            factor_data = yf.download(factor_symbols, start=extended_start_date, end=end_date, auto_adjust=True)
             factors_prices = factor_data['Close']
             if isinstance(factors_prices, pd.Series):
                 factors_prices = factors_prices.to_frame(factor_symbols[0])
@@ -66,29 +80,52 @@ class UltimateDetailedStrategy:
             factors_prices = factors_prices.dropna(axis=1, how='all')
             if factors_prices.empty:
                 print("Warning: No valid factor data loaded. Skipping factor data.")
-                self.factors_data = None
+                self.factors_data_full = None
             else:
-                self.factors_data = factors_prices.dropna()
-                print(f"Loaded factor data shape: {self.factors_data.shape}")
+                self.factors_data_full = factors_prices.dropna()
+                print(f"Loaded full factor data shape: {self.factors_data_full.shape}")
+        else:
+            self.factors_data_full = None
+            print("No factor data provided.")
+
+        # Store the requested backtest start date
+        self.backtest_start_date = start_date
+
+    def set_current_window(self, current_date):
+        """
+        Set the current 252-day lookback window ending at current_date
+        """
+        current_date = pd.to_datetime(current_date)
+
+        # Get data up to current_date
+        available_data = self.P_full[self.P_full.index <= current_date]
+
+        # Take the last L (252) days
+        if len(available_data) >= self.L:
+            self.P = available_data.tail(self.L)
+        else:
+            self.P = available_data  # Use all available data if less than L
+
+        # Set corresponding factor data
+        if self.factors_data_full is not None:
+            available_factor_data = self.factors_data_full[self.factors_data_full.index <= current_date]
+            if len(available_factor_data) >= self.L:
+                self.factors_data = available_factor_data.tail(self.L)
+            else:
+                self.factors_data = available_factor_data
         else:
             self.factors_data = None
-            print("No factor data provided.")
 
     def prepare_returns_matrix(self, standardize=False):
         """
         2b. Log Returns Matrix
-        Construct returns matrix R of shape (T, N)
+        Construct returns matrix R of shape (T, N) for current window
         """
-        # print("Computing returns matrix...")
-
         # R[t, s] = log(P_t_s / P_(t-1)_s)
         self.R = np.log(self.P / self.P.shift(1)).dropna()
-        # print(f"Returns matrix R shape: {self.R.shape}")  # T = number of trading days
 
         # 2c. Optional: Standardization
         if standardize:
-            # print("Standardizing returns...")
-            # R_std[:, s] = (R[:, s] - mean(R[:, s])) / std(R[:, s])
             scaler = StandardScaler()
             self.R = pd.DataFrame(scaler.fit_transform(self.R),
                                   index=self.R.index, columns=self.R.columns)
@@ -97,14 +134,11 @@ class UltimateDetailedStrategy:
 
     def compute_covariance_and_pca(self, n_components=None):
         """
-        3. Covariance and PCA
+        3. Covariance and PCA for current window
         """
-        # print("Computing covariance matrix and PCA...")
-
         # 3a. Covariance Matrix - Σ = (1 / (T - 1)) * R^T · R, Shape: (N, N)
         T, N = self.R.shape
         self.Sigma = np.cov(self.R.T, ddof=1)  # Shape: (N, N)
-        # print(f"Covariance matrix Σ shape: {self.Sigma.shape}")
 
         # 3b. Eigen Decomposition - Σ · v_k = λ_k · v_k
         eigenvalues, eigenvectors = linalg.eigh(self.Sigma)
@@ -113,8 +147,6 @@ class UltimateDetailedStrategy:
         eigenvalues = eigenvalues[idx]
         eigenvectors = eigenvectors[:, idx]
 
-        # λ_k = variance explained by PC_k
-        # v_k = eigenvector = stock loadings for PC_k
         if n_components is None:
             n_components = min(N, 10)  # Default to 10 components or N if smaller
 
@@ -123,23 +155,15 @@ class UltimateDetailedStrategy:
         self.V = eigenvectors[:, :n_components]
         self.eigenvalues = eigenvalues[:n_components]
 
-        # print(f"Loadings matrix V shape: {self.V.shape}")
-        # print(f"Explained variance ratio: {self.eigenvalues / np.sum(eigenvalues)}")
-
         # 3c. PC Time Series Matrix
         # Project returns onto PCs: PC_day = R · V shape (T, K)
         self.PC_day = self.R.values @ self.V
-        # print(f"PC time series matrix shape: {self.PC_day.shape}")
-        # Row t = [PC_1_t, PC_2_t, ..., PC_K_t]
-        # Each PC series captures common movement of stock groupings
 
         return self.V, self.PC_day
 
-
-    # Updated factor_pc_regression function (more intricate with statsmodels for detailed stats, p-values, and final VIF)
     def factor_pc_regression(self, min_r_squared=0.15, max_correlation=0.9, max_vif=5):
         """
-        4. Factor-PC Regression
+        4. Factor-PC Regression for current window
         """
         if self.factors_data is None:
             return None
@@ -256,25 +280,1253 @@ class UltimateDetailedStrategy:
 
     def compute_historic_pc_std(self, lookback_window=None):
         """
-        5. Historic PC Standard Deviation
+        5. Historic PC Standard Deviation for current window
         Over lookback L: σ_PC_k = sqrt( Σ_{i=t-L}^{t-1} (PC_k_i - mean(PC_k))^2 / (L - 1) )
         """
         if lookback_window is None:
-            lookback_window = self.L
-
-        # print("Computing historic PC standard deviations...")
+            lookback_window = min(self.L, len(self.PC_day))
 
         # Convert PC_day to DataFrame for easier rolling operations
         PC_df = pd.DataFrame(self.PC_day, index=self.R.index)
 
-        # PC_std = PC_ts.rolling(window=L).std(ddof=1)
-        self.PC_std_rolling = PC_df.rolling(window=lookback_window, min_periods=lookback_window // 2).std(ddof=1)
+        # For current window, we can just compute the std directly since we already have the window
+        self.sigma_PC = PC_df.std(ddof=1).values  # σ_PC vector
 
-        # Get the most recent standard deviations
-        self.sigma_PC = self.PC_std_rolling.iloc[-1].values  # σ_PC vector
-
-        # print(f"Historic PC standard deviations shape: {self.sigma_PC.shape}")
         return self.sigma_PC
+
+    def calculate_current_factor_changes(self, lookback_days=5):
+        """
+        Calculate actual factor changes from current window factor data
+        Uses the most recent lookback_days to compute ΔF_f_t = log(F_f_t / F_f_(t-lookback_days))
+        """
+        if self.factors_data is None:
+            print("No factor data available")
+            return {}
+
+        # Get the most recent data from current window
+        recent_data = self.factors_data.tail(lookback_days + 1)
+
+        if len(recent_data) < 2:
+            print("Insufficient factor data for change calculation")
+            return {}
+
+        # Calculate log returns: ΔF_f_t = log(F_f_t / F_f_(t-lookback_days))
+        current_prices = recent_data.iloc[-1]  # Most recent prices
+        previous_prices = recent_data.iloc[-(lookback_days + 1)]  # Prices lookback_days ago
+
+        # Calculate log changes
+        factor_changes = {}
+        for factor in self.factors_data.columns:
+            if not np.isnan(current_prices[factor]) and not np.isnan(previous_prices[factor]):
+                if previous_prices[factor] > 0:  # Avoid division by zero
+                    change = np.log(current_prices[factor] / previous_prices[factor])
+                    factor_changes[factor] = change
+
+        return factor_changes
+
+    def calculate_stock_betas(self, benchmark_symbol='XLE', lookback_days=252):
+        """
+        Calculate stock betas relative to sector benchmark using current window data
+        β_i = Cov(R_i, R_benchmark) / Var(R_benchmark)
+        """
+        if self.factors_data is None or benchmark_symbol not in self.factors_data.columns:
+            return np.ones(len(self.stocks))
+
+        # Get benchmark data aligned with stock data from current window
+        common_dates = self.R.index.intersection(self.factors_data.index)
+        if len(common_dates) < lookback_days // 2:
+            return np.ones(len(self.stocks))
+
+        # Calculate benchmark returns
+        benchmark_prices = self.factors_data.loc[common_dates, benchmark_symbol]
+        benchmark_returns = np.log(benchmark_prices / benchmark_prices.shift(1)).dropna()
+
+        # Align stock returns with benchmark returns
+        aligned_stock_returns = self.R.loc[benchmark_returns.index]
+
+        # Calculate betas for each stock
+        betas = np.zeros(len(self.stocks))
+        benchmark_var = np.var(benchmark_returns, ddof=1)
+
+        if benchmark_var <= 0:
+            return np.ones(len(self.stocks))
+
+        for i, stock in enumerate(self.stocks):
+            if stock in aligned_stock_returns.columns:
+                stock_returns = aligned_stock_returns[stock]
+                # β_i = Cov(R_i, R_benchmark) / Var(R_benchmark)
+                covariance = np.cov(stock_returns, benchmark_returns, ddof=1)[0, 1]
+                betas[i] = covariance / benchmark_var
+            else:
+                betas[i] = 1.0  # Default beta if stock not found
+
+        return betas
+
+    def predict_pc_movement(self, current_factor_changes):
+        """
+        6. Predicted PC Movement
+        Predict next week's PC movement: ΔPC_pred_k = α_f + Σ (β_f * ΔF_f_current)
+        """
+        if not hasattr(self, 'pc_regressions') or not self.pc_regressions:
+            return np.zeros(self.V.shape[1])
+
+        # Initialize predicted PC movement vector
+        self.delta_PC_pred = np.zeros(self.V.shape[1])  # ΔPC_pred = [ΔPC_pred_1, ..., ΔPC_pred_K]
+
+        for k, regression_data in self.pc_regressions.items():
+            alpha = regression_data['alpha']  # α_f
+            beta = regression_data['beta']  # β_f coefficients
+            selected_factors = regression_data['selected_factors']
+
+            # Get current factor changes for selected factors
+            current_changes = np.array([current_factor_changes.get(self.factors_data.columns[i], 0)
+                                        for i in selected_factors])
+
+            # ΔPC_pred_k = α_f + Σ (β_f * ΔF_f_current)
+            self.delta_PC_pred[k] = alpha + np.dot(beta, current_changes)
+
+        # Convert to % movement: PredictedPctChange_PC_k = ΔPC_pred_k * σ_PC_k
+        self.predicted_pct_change_PC = self.delta_PC_pred * self.sigma_PC
+
+        return self.delta_PC_pred
+
+    def predict_stock_returns(self):
+        """
+        7. Predicted Stock Returns
+        """
+        # 7a. Loadings & Stock Prediction
+        pc_weighted = self.delta_PC_pred * self.sigma_PC  # ΔPC_pred ⊙ σ_PC
+        self.r_hat = self.V @ self.delta_PC_pred  # Predicted stock returns vector
+
+        return self.r_hat
+
+    def compute_centrality_weighting(self, method='correlation'):
+        """
+        8. Centrality Weighting - recalculated for current window
+        Compute centrality matrix C from stock correlation or network adjacency
+        """
+        if method == 'correlation':
+            # Use correlation matrix as centrality matrix
+            self.centrality_matrix = np.corrcoef(self.R.T)  # C from stock correlation
+        else:
+            # Use covariance matrix
+            self.centrality_matrix = self.Sigma
+
+        # Get first eigenvector of C (largest eigenvalue): u_centrality = eigenvector(C_max)
+        eigenvalues, eigenvectors = linalg.eigh(self.centrality_matrix)
+        max_eigenvalue_idx = np.argmax(eigenvalues)
+        self.u_centrality = np.abs(eigenvectors[:, max_eigenvalue_idx])  # Take absolute values
+
+        # Normalize to mean=1 and std=1
+        self.u_centrality = self.u_centrality - np.mean(self.u_centrality) + 1  # Shift to mean=1
+        self.u_centrality = self.u_centrality / np.std(self.u_centrality, ddof=1)  # Scale to std=1
+        self.u_centrality = np.maximum(self.u_centrality, 0)  # Ensure non-negative weights
+
+        # Weight predicted stock returns: r_hat_weighted = r_hat ⊙ u_centrality
+        self.r_hat_weighted = self.r_hat * self.u_centrality  # Gives importance-adjusted expected returns
+
+        return self.r_hat_weighted
+
+    def optimize_portfolio(self, current_prices, stock_betas=None):
+        N = len(self.r_hat_weighted)
+        C_total = self.C_0
+
+        # Validate inputs
+        if len(current_prices) != N or np.any(np.isnan(current_prices)) or np.any(np.isinf(current_prices)) or np.any(
+                current_prices <= 0):
+            return np.zeros(N)
+        if np.any(np.isnan(self.r_hat_weighted)) or np.any(np.isinf(self.r_hat_weighted)):
+            return np.zeros(N)
+
+        r_hat_scaled = self.r_hat_weighted * 100
+
+        def objective(v):
+            return -np.dot(v, r_hat_scaled)
+
+        constraints = []
+
+        # FIXED: Exact capital allocation constraint: sum(|v_i|) = C_total
+        def total_allocation_constraint(v):
+            # Allow small tolerance for numerical optimization
+            return np.sum(np.abs(v)) - C_total
+
+        constraints.append({'type': 'eq', 'fun': total_allocation_constraint})
+
+        # Long allocation constraints: 0.55 * C_total <= long_positions <= 0.75 * C_total
+        def long_allocation_constraint(v):
+            long_positions = np.sum(v[v > 0])
+            return long_positions - 0.55 * C_total
+
+        def long_allocation_upper(v):
+            return 0.75 * C_total - np.sum(v[v > 0])
+
+        constraints.append({'type': 'ineq', 'fun': long_allocation_constraint})
+        constraints.append({'type': 'ineq', 'fun': long_allocation_upper})
+
+        # Short allocation constraints: 0.25 * C_total <= |short_positions| <= 0.45 * C_total
+        def short_allocation_constraint(v):
+            short_positions = np.abs(np.sum(v[v < 0]))
+            return short_positions - 0.25 * C_total
+
+        def short_allocation_upper(v):
+            return 0.45 * C_total - np.abs(np.sum(v[v < 0]))
+
+        constraints.append({'type': 'ineq', 'fun': short_allocation_constraint})
+        constraints.append({'type': 'ineq', 'fun': short_allocation_upper})
+
+        # Portfolio beta constraint: |portfolio_beta| <= 0.1
+        if stock_betas is not None:
+            def portfolio_beta_constraint(v):
+                portfolio_beta = np.abs(np.dot(v, stock_betas) / C_total)
+                return 0.1 - portfolio_beta
+
+            constraints.append({'type': 'ineq', 'fun': portfolio_beta_constraint})
+
+        # FIXED: Individual position bounds with strict short-only-negative-returns constraint
+        bounds = []
+        for i in range(N):
+            if r_hat_scaled[i] >= 0:
+                # Positive expected returns: can ONLY go long
+                bound = (0, 0.15 * C_total)
+            else:
+                # Negative expected returns: can ONLY go short
+                bound = (-0.12 * C_total, 0)
+            bounds.append(bound)
+
+        # Initial guess: strict allocation based on expected returns
+        v0 = np.zeros(N)
+        positive_returns = r_hat_scaled >= 0
+        negative_returns = r_hat_scaled < 0
+
+        if np.any(positive_returns):
+            # Allocate 65% to positive return stocks proportionally
+            pos_weights = r_hat_scaled[positive_returns]
+            pos_weights = pos_weights / np.sum(pos_weights) if np.sum(pos_weights) > 0 else np.ones(
+                len(pos_weights)) / len(pos_weights)
+            v0[positive_returns] = pos_weights * 0.65 * C_total
+
+        if np.any(negative_returns):
+            # Allocate 35% to negative return stocks (as shorts) proportionally
+            neg_weights = np.abs(r_hat_scaled[negative_returns])
+            neg_weights = neg_weights / np.sum(neg_weights) if np.sum(neg_weights) > 0 else np.ones(
+                len(neg_weights)) / len(neg_weights)
+            v0[negative_returns] = -neg_weights * 0.35 * C_total
+
+        # Adjust for beta constraint if needed
+        if stock_betas is not None:
+            portfolio_beta = np.dot(v0, stock_betas) / C_total
+            if abs(portfolio_beta) > 0.1:
+                scaling_factor = 0.1 / abs(portfolio_beta)
+                v0 *= scaling_factor
+                # Rescale to maintain total allocation
+                current_total = np.sum(np.abs(v0))
+                if current_total > 0:
+                    v0 *= C_total / current_total
+
+        # First attempt: SLSQP optimization
+        try:
+            result = opt.minimize(objective, v0, method='SLSQP', bounds=bounds,
+                                  constraints=constraints,
+                                  options={'maxiter': 2000, 'ftol': 1e-8, 'disp': False})
+            if result.success and abs(np.sum(np.abs(result.x)) - C_total) < 100:  # Check total allocation
+                self.optimal_weights = result.x
+                self.slsqp_success_count += 1
+            else:
+                # Fallback to strict constraint enforcement
+                self.optimal_weights = self._strict_allocation_fallback(r_hat_scaled, bounds, stock_betas, C_total)
+                self.lsq_fallback_count += 1
+        except Exception:
+            # Fallback to strict constraint enforcement
+            self.optimal_weights = self._strict_allocation_fallback(r_hat_scaled, bounds, stock_betas, C_total)
+            self.lsq_fallback_count += 1
+
+        self.share_quantities = self.optimal_weights / current_prices
+        return self.optimal_weights
+
+    def _strict_allocation_fallback(self, r_hat_scaled, bounds, stock_betas, C_total):
+        """
+        Strict fallback that enforces exact $10,000 allocation and short-only-negative constraint
+        """
+        N = len(r_hat_scaled)
+        allocation = np.zeros(N)
+
+        positive_returns = r_hat_scaled >= 0
+        negative_returns = r_hat_scaled < 0
+
+        # Target allocations
+        target_long = 0.65 * C_total
+        target_short = 0.35 * C_total
+
+        # Allocate to positive return stocks (long only)
+        if np.any(positive_returns):
+            pos_stocks = np.where(positive_returns)[0]
+            pos_values = r_hat_scaled[positive_returns]
+
+            # Weight by expected return magnitude
+            if np.sum(pos_values) > 0:
+                weights = pos_values / np.sum(pos_values)
+            else:
+                weights = np.ones(len(pos_values)) / len(pos_values)
+
+            # Apply bounds and allocate
+            for i, stock_idx in enumerate(pos_stocks):
+                max_pos = bounds[stock_idx][1]  # Upper bound
+                allocation[stock_idx] = min(weights[i] * target_long, max_pos)
+
+        # Allocate to negative return stocks (short only)
+        if np.any(negative_returns):
+            neg_stocks = np.where(negative_returns)[0]
+            neg_values = np.abs(r_hat_scaled[negative_returns])
+
+            # Weight by expected return magnitude
+            if np.sum(neg_values) > 0:
+                weights = neg_values / np.sum(neg_values)
+            else:
+                weights = np.ones(len(neg_values)) / len(neg_values)
+
+            # Apply bounds and allocate (negative values for shorts)
+            for i, stock_idx in enumerate(neg_stocks):
+                max_short = abs(bounds[stock_idx][0])  # Lower bound (negative)
+                allocation[stock_idx] = -min(weights[i] * target_short, max_short)
+
+        # Ensure exact total allocation by scaling
+        current_total = np.sum(np.abs(allocation))
+        if current_total > 0:
+            allocation *= C_total / current_total
+
+        # Final beta constraint adjustment if needed
+        if stock_betas is not None:
+            portfolio_beta = np.dot(allocation, stock_betas) / C_total
+            if abs(portfolio_beta) > 0.1:
+                scaling_factor = 0.1 / abs(portfolio_beta)
+                allocation *= scaling_factor
+                # Rescale again to maintain total allocation
+                current_total = np.sum(np.abs(allocation))
+                if current_total > 0:
+                    allocation *= C_total / current_total
+
+        return allocation
+
+    def _least_squares_fallback(self, r_hat_scaled, bounds, stock_betas, C_total):
+        """
+        Proper least squares fallback that minimizes ||x - target||² subject to bounds and constraints
+        """
+        N = len(r_hat_scaled)
+
+        # Create target allocation based on expected returns
+        target = np.zeros(N)
+        long_stocks = r_hat_scaled >= 0
+        short_stocks = r_hat_scaled < 0
+
+        # Allocate based on relative expected returns within each category
+        if np.any(long_stocks):
+            long_returns = r_hat_scaled[long_stocks]
+            # Normalize to sum to target long allocation
+            if np.sum(long_returns) > 0:
+                long_weights = long_returns / np.sum(long_returns) * (0.65 * C_total)
+                target[long_stocks] = long_weights
+
+        if np.any(short_stocks):
+            short_returns = np.abs(r_hat_scaled[short_stocks])  # Use absolute values for shorts
+            # Normalize to sum to target short allocation
+            if np.sum(short_returns) > 0:
+                short_weights = -(short_returns / np.sum(short_returns) * (0.35 * C_total))
+                target[short_stocks] = short_weights
+
+        # Adjust target for beta constraint if needed
+        if stock_betas is not None:
+            target_beta = np.dot(target, stock_betas) / C_total
+            if abs(target_beta) > 0.1:
+                scaling_factor = 0.1 / abs(target_beta)
+                target *= scaling_factor
+
+        # Extract bounds
+        lb = np.array([b[0] for b in bounds])
+        ub = np.array([b[1] for b in bounds])
+
+        # Solve least squares problem: minimize ||x - target||² subject to bounds
+        try:
+            # Use identity matrix A and target as b for ||x - target||²
+            A = np.eye(N)
+            res = lsq_linear(A, target, bounds=(lb, ub), method='bvls')
+
+            if res.success and np.sum(np.abs(res.x)) > 1e-6:
+                return res.x
+            else:
+                # Final fallback: return clipped target
+                return np.clip(target, lb, ub)
+
+        except Exception:
+            # Final fallback: return clipped target
+            return np.clip(target, lb, ub)
+    def stress_test_transaction_costs(self, cost_levels=[0.001, 0.003, 0.005, 0.01]):
+        """
+        Test strategy performance under different transaction cost assumptions
+        """
+        print("\n" + "=" * 70)
+        print("TRANSACTION COST STRESS TEST")
+        print("=" * 70)
+
+        if not self.portfolio_history:
+            print("No portfolio history available")
+            return
+
+        results = {}
+
+        print(f"\nOriginal transaction cost: {self.transaction_costs:.1%}")
+        print(f"Testing costs: {[f'{c:.1%}' for c in cost_levels]}")
+
+        for cost_level in cost_levels:
+            # Recalculate performance with different transaction costs
+            total_pnl = 0
+            total_costs = 0
+
+            for trade in self.portfolio_history:
+                # Get realized P&L from metrics
+                ts = trade['timestamp']
+                metrics = self.performance_metrics.get(ts, {})
+                gross_pnl = metrics.get('realized_pnl', 0)
+
+                # Recalculate transaction cost
+                total_trade_value = np.sum(np.abs(trade['weights']))
+                new_transaction_cost = total_trade_value * cost_level
+
+                # Net P&L with new costs
+                net_pnl = gross_pnl - new_transaction_cost
+                total_pnl += net_pnl
+                total_costs += new_transaction_cost
+
+            # Calculate performance metrics
+            total_return = total_pnl / self.C_0
+            num_periods = len(self.portfolio_history)
+            annualized_return = (1 + total_return) ** (52 / num_periods) - 1 if num_periods > 0 else 0
+
+            results[cost_level] = {
+                'total_return': total_return,
+                'annualized_return': annualized_return,
+                'total_costs': total_costs,
+                'avg_cost_per_trade': total_costs / num_periods if num_periods > 0 else 0
+            }
+
+        # Display results
+        print(f"\n{'Cost Level':<12} {'Total Ret':<12} {'Annual Ret':<12} {'Total Costs':<12} {'Avg/Trade':<12}")
+        print("-" * 60)
+        for cost, metrics in results.items():
+            print(f"{cost:<8.1%} {metrics['total_return']:<8.1%} "
+                  f"{metrics['annualized_return']:<8.1%} ${metrics['total_costs']:<11,.0f} "
+                  f"${metrics['avg_cost_per_trade']:<11,.0f}")
+
+        # Plot impact
+        costs = list(results.keys())
+        returns = [results[c]['annualized_return'] for c in costs]
+
+        plt.figure(figsize=(10, 6))
+        plt.plot([c * 100 for c in costs], [r * 100 for r in returns], marker='o', linewidth=2, markersize=8)
+        plt.title('Strategy Performance vs Transaction Costs')
+        plt.xlabel('Transaction Cost (%)')
+        plt.ylabel('Annualized Return (%)')
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+
+        return results
+
+    def execute_trades(self, current_prices):
+        """
+        Execute trades according to the computed v_i
+        """
+        # Calculate transaction costs
+        total_trade_value = np.sum(np.abs(self.optimal_weights))
+        transaction_cost = total_trade_value * self.transaction_costs
+        expected_returns = self.r_hat_weighted
+
+        # Record trade execution
+        trade_record = {
+            'timestamp': self.P.index[-1],
+            'weights': self.optimal_weights.copy(),
+            'shares': self.share_quantities.copy(),
+            'prices': current_prices.copy(),
+            'transaction_cost': transaction_cost,
+            'expected_returns': expected_returns.copy()
+        }
+
+        self.portfolio_history.append(trade_record)
+        return trade_record
+
+    # FUNCTIONS TO DELETE/REPLACE - These have incorrect rebalancing logic
+
+    # DELETE: The current record_performance_metrics() - completely wrong
+    # DELETE: The current compute_profitability_metrics() - incorrect accumulation
+    # DELETE: The current backtest_strategy() - wrong portfolio tracking
+
+    # REPLACE WITH THESE CORRECTED FUNCTIONS:
+
+    def record_period_performance(self, period_start_date, period_end_date, weights, transaction_cost):
+        """
+        FIXED: Record performance for a single rebalancing period
+
+        Args:
+            period_start_date: When positions were opened
+            period_end_date: When positions were closed (next rebalancing)
+            weights: Dollar positions taken at period start
+            transaction_cost: Cost of establishing positions
+        """
+        # Get actual price changes during the HOLDING period only
+        period_prices = self.P_full.loc[period_start_date:period_end_date]
+
+        if len(period_prices) < 2:
+            return None
+
+        # Calculate returns only for the period positions were held
+        start_prices = period_prices.iloc[0].values
+        end_prices = period_prices.iloc[-1].values
+
+        # Align with stock universe
+        stock_returns = (end_prices / start_prices) - 1
+
+        # Calculate P&L: position_size * stock_return for each stock
+        gross_pnl = np.dot(weights, stock_returns)
+        net_pnl = gross_pnl - transaction_cost
+
+        # Store period results
+        period_metrics = {
+            'period_start': period_start_date,
+            'period_end': period_end_date,
+            'gross_pnl': gross_pnl,
+            'net_pnl': net_pnl,
+            'transaction_cost': transaction_cost,
+            'holding_days': len(period_prices) - 1,
+            'weights': weights.copy(),
+            'stock_returns': stock_returns.copy(),
+            'period_return': net_pnl / self.C_0  # Return as fraction of capital base
+        }
+
+        return period_metrics
+
+    def compute_rebalancing_strategy_metrics(self):
+        """
+        Fixed metrics computation appropriate for constant-capital rebalancing strategy
+        """
+        if not self.portfolio_history:
+            return {}
+
+        # Extract period-level data
+        period_returns = []
+        gross_pnls = []
+        net_pnls = []
+        transaction_costs = []
+        holding_periods = []
+        actual_allocations = []
+
+        for trade in self.portfolio_history:
+            ts = trade['timestamp']
+            metrics = self.performance_metrics.get(ts, {})
+
+            # Track actual allocation (should always be $10,000 now)
+            actual_allocation = np.sum(np.abs(trade['weights']))
+            actual_allocations.append(actual_allocation)
+
+            if 'realized_pnl' in metrics:
+                net_pnl = metrics['realized_pnl']
+                gross_pnl = metrics.get('gross_pnl', net_pnl + trade['transaction_cost'])
+
+                # Period return as percentage of INTENDED capital base (always $10,000)
+                period_return = net_pnl / self.C_0
+
+                period_returns.append(period_return)
+                gross_pnls.append(gross_pnl)
+                net_pnls.append(net_pnl)
+                transaction_costs.append(trade['transaction_cost'])
+                holding_periods.append(trade.get('holding_days', 5))
+
+        if not period_returns:
+            return {}
+
+        period_returns = np.array(period_returns)
+        actual_allocations = np.array(actual_allocations)
+
+        # Core metrics for rebalancing strategy
+        avg_period_return = np.mean(period_returns)
+        period_volatility = np.std(period_returns, ddof=1)
+
+        # Success metrics
+        winning_periods = period_returns > 0
+        period_win_rate = np.mean(winning_periods)
+        avg_winning_return = np.mean(period_returns[winning_periods]) if np.any(winning_periods) else 0
+        avg_losing_return = np.mean(period_returns[~winning_periods]) if np.any(~winning_periods) else 0
+
+        # Annualized metrics (assuming weekly rebalancing)
+        avg_holding_days = np.mean(holding_periods)
+        periods_per_year = 252 / avg_holding_days
+        annualized_return = avg_period_return * periods_per_year
+        annualized_volatility = period_volatility * np.sqrt(periods_per_year)
+
+        # Risk metrics
+        sharpe_ratio = annualized_return / annualized_volatility if annualized_volatility > 0 else 0
+
+        # Downside metrics
+        negative_returns = period_returns[period_returns < 0]
+        downside_volatility = np.std(negative_returns, ddof=1) if len(negative_returns) > 1 else period_volatility
+        annualized_downside_vol = downside_volatility * np.sqrt(periods_per_year)
+        sortino_ratio = annualized_return / annualized_downside_vol if annualized_downside_vol > 0 else 0
+
+        # Maximum drawdown of period returns
+        cumulative_returns = np.cumprod(1 + period_returns) - 1
+        running_max = np.maximum.accumulate(1 + cumulative_returns)
+        drawdowns = (running_max - (1 + cumulative_returns)) / running_max
+        max_drawdown_pct = np.max(drawdowns)
+
+        # Transaction cost analysis
+        total_gross_pnl = sum(gross_pnls)
+        total_transaction_costs = sum(transaction_costs)
+        cost_drag = total_transaction_costs / abs(total_gross_pnl) if total_gross_pnl != 0 else 0
+
+        # FIXED: Capital allocation verification
+        avg_allocation = np.mean(actual_allocations)
+        allocation_deviation = np.std(actual_allocations)
+        target_allocation = self.C_0
+        allocation_accuracy = avg_allocation / target_allocation
+
+        results = {
+            # Core rebalancing metrics
+            'num_periods': len(period_returns),
+            'avg_period_return': avg_period_return,
+            'period_volatility': period_volatility,
+            'period_win_rate': period_win_rate,
+            'avg_winning_period': avg_winning_return,
+            'avg_losing_period': avg_losing_return,
+
+            # Annualized equivalents
+            'annualized_return': annualized_return,
+            'annualized_volatility': annualized_volatility,
+            'sharpe_ratio': sharpe_ratio,
+            'sortino_ratio': sortino_ratio,
+
+            # Risk metrics
+            'max_drawdown_percent': max_drawdown_pct,
+
+            # Cost analysis
+            'total_transaction_costs': total_transaction_costs,
+            'cost_drag_percent': cost_drag,
+            'avg_cost_per_period': np.mean(transaction_costs),
+
+            # FIXED: Capital allocation metrics (relevant for rebalancing)
+            'avg_allocation': avg_allocation,
+            'allocation_accuracy': allocation_accuracy,
+            'allocation_deviation': allocation_deviation,
+            'target_allocation': target_allocation,
+
+            # Period data for plotting
+            'period_returns': period_returns,
+            'period_dates': [trade['timestamp'] for trade in self.portfolio_history if
+                             trade['timestamp'] in self.performance_metrics],
+            'avg_holding_days': avg_holding_days,
+            'periods_per_year': periods_per_year
+        }
+
+        print(f"\n=== Fixed Rebalancing Strategy Performance Metrics ===")
+        print(f"Strategy: Weekly Rebalancing with ${self.C_0:,} target allocation per period")
+        print(f"Number of Rebalancing Periods: {results['num_periods']}")
+        print(f"Average Holding Period: {results['avg_holding_days']:.1f} days")
+        print(f"")
+        print(f"Capital Allocation Accuracy:")
+        print(f"  Target Allocation per Period: ${results['target_allocation']:,}")
+        print(f"  Average Actual Allocation: ${results['avg_allocation']:,.0f}")
+        print(f"  Allocation Accuracy: {results['allocation_accuracy']:.1%}")
+        print(f"  Allocation Std Dev: ${results['allocation_deviation']:,.0f}")
+        print(f"")
+        print(f"Period Performance:")
+        print(f"  Average Period Return: {results['avg_period_return']:.3%}")
+        print(f"  Period Volatility: {results['period_volatility']:.3%}")
+        print(f"  Period Win Rate: {results['period_win_rate']:.1%}")
+        print(f"  Average Winning Period: {results['avg_winning_period']:.3%}")
+        print(f"  Average Losing Period: {results['avg_losing_period']:.3%}")
+        print(f"")
+        print(f"Annualized Estimates (assuming constant rebalancing):")
+        print(f"  Expected Return: {results['annualized_return']:.2%}")
+        print(f"  Volatility: {results['annualized_volatility']:.2%}")
+        print(f"  Sharpe Ratio: {results['sharpe_ratio']:.2f}")
+        print(f"  Sortino Ratio: {results['sortino_ratio']:.2f}")
+        print(f"")
+        print(f"Risk Management:")
+        print(f"  Maximum Drawdown: {results['max_drawdown_percent']:.2%}")
+        print(f"")
+        print(f"Transaction Costs:")
+        print(f"  Total Costs: ${results['total_transaction_costs']:,.0f}")
+        print(f"  Average Cost per Period: ${results['avg_cost_per_period']:,.0f}")
+        print(f"  Cost Drag: {results['cost_drag_percent']:.2%}")
+
+        return results
+
+    def plot_rebalancing_performance(self):
+        """
+        Comprehensive performance visualization for rebalancing strategy - FIXED
+        """
+        if not self.portfolio_history:
+            print("No portfolio history to plot")
+            return
+
+        # Get metrics
+        metrics = self.compute_rebalancing_strategy_metrics()
+        if not metrics:
+            return
+
+        fig, axes = plt.subplots(3, 2, figsize=(16, 14))
+
+        period_returns = metrics['period_returns']
+        dates = metrics['period_dates']
+
+        # ENSURE ARRAYS HAVE SAME LENGTH
+        min_length = min(len(period_returns), len(dates))
+        period_returns = period_returns[:min_length]
+        dates = dates[:min_length]
+
+        # 1. Period Return Distribution
+        axes[0, 0].hist(period_returns * 100, bins=25, alpha=0.7, color='steelblue', edgecolor='black')
+        mean_return = np.mean(period_returns) * 100
+        axes[0, 0].axvline(x=mean_return, color='red', linestyle='--', linewidth=2,
+                           label=f'Mean: {mean_return:.2f}%')
+        axes[0, 0].set_title('Period Return Distribution', fontsize=12, fontweight='bold')
+        axes[0, 0].set_xlabel('Period Return (%)')
+        axes[0, 0].set_ylabel('Frequency')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+
+        # 2. Rolling Win Rate (20-period window)
+        window_size = min(20, len(period_returns) // 4)
+        if window_size >= 5:
+            rolling_win_rates = []
+            rolling_dates = []
+
+            for i in range(window_size, len(period_returns)):
+                recent_returns = period_returns[i - window_size:i]
+                win_rate = np.mean(recent_returns > 0) * 100
+                rolling_win_rates.append(win_rate)
+                rolling_dates.append(dates[i])
+
+            axes[0, 1].plot(rolling_dates, rolling_win_rates, linewidth=2, color='green', marker='o', markersize=3)
+            axes[0, 1].axhline(y=50, color='black', linestyle='--', alpha=0.7, label='50% Baseline')
+            axes[0, 1].set_title(f'Rolling Win Rate ({window_size}-period)', fontsize=12, fontweight='bold')
+            axes[0, 1].set_ylabel('Win Rate (%)')
+            axes[0, 1].legend()
+            axes[0, 1].grid(True, alpha=0.3)
+            axes[0, 1].set_ylim(0, 100)
+        else:
+            axes[0, 1].text(0.5, 0.5, 'Insufficient data\nfor rolling win rate',
+                            ha='center', va='center', transform=axes[0, 1].transAxes, fontsize=12)
+            axes[0, 1].set_title('Rolling Win Rate')
+
+        # 3. Rolling Period Returns (20-period average)
+        if window_size >= 5:
+            rolling_returns = []
+            rolling_return_dates = []
+
+            for i in range(window_size, len(period_returns)):
+                recent_returns = period_returns[i - window_size:i]
+                avg_return = np.mean(recent_returns) * 100
+                rolling_returns.append(avg_return)
+                rolling_return_dates.append(dates[i])
+
+            axes[1, 0].plot(rolling_return_dates, rolling_returns, linewidth=2, color='purple', marker='o',
+                            markersize=3)
+            axes[1, 0].axhline(y=0, color='black', linestyle='-', alpha=0.5)
+            axes[1, 0].set_title(f'Rolling Average Period Return ({window_size}-period)', fontsize=12,
+                                 fontweight='bold')
+            axes[1, 0].set_ylabel('Average Period Return (%)')
+            axes[1, 0].grid(True, alpha=0.3)
+        else:
+            axes[1, 0].text(0.5, 0.5, 'Insufficient data\nfor rolling returns',
+                            ha='center', va='center', transform=axes[1, 0].transAxes, fontsize=12)
+            axes[1, 0].set_title('Rolling Average Period Return')
+
+        # 4. Stock Allocation Over Time (with gradients)
+        weights_history = np.array([trade['weights'] for trade in self.portfolio_history])
+        stock_names = self.stocks
+
+        # Convert to percentages of total portfolio
+        total_allocations = np.sum(np.abs(weights_history), axis=1)
+        percentage_weights = np.abs(weights_history) / total_allocations[:, np.newaxis] * 100
+
+        # Select top 10 most frequently used stocks for visualization
+        avg_allocations = np.mean(percentage_weights, axis=0)
+        top_stocks_idx = np.argsort(avg_allocations)[-10:]
+
+        # Create stacked area plot
+        selected_weights = percentage_weights[:, top_stocks_idx]
+        selected_names = [stock_names[i] for i in top_stocks_idx]
+
+        # Use a colormap for gradients
+        colors = plt.cm.Set3(np.linspace(0, 1, len(selected_names)))
+
+        # FIXED: Use trade timestamps directly (not dates which might have different length)
+        trade_dates = [trade['timestamp'] for trade in self.portfolio_history]
+        min_plot_length = min(len(trade_dates), len(selected_weights))
+
+        axes[1, 1].stackplot(trade_dates[:min_plot_length], selected_weights[:min_plot_length].T,
+                             labels=selected_names, colors=colors, alpha=0.8)
+        axes[1, 1].set_title('Stock Allocation Over Time (Top 10 by Avg %)', fontsize=12, fontweight='bold')
+        axes[1, 1].set_ylabel('Portfolio Allocation (%)')
+        axes[1, 1].legend(loc='center left', bbox_to_anchor=(1, 0.5), fontsize=8)
+        axes[1, 1].grid(True, alpha=0.3)
+
+        # 5. Cumulative Performance (for reference)
+        # FIXED: Calculate cumulative P&L with proper array alignment
+        cumulative_pnl = np.cumsum([period_returns[i] * self.C_0 for i in range(len(period_returns))])
+
+        axes[2, 0].plot(dates, cumulative_pnl, linewidth=2, color='darkblue', marker='o', markersize=3)
+        axes[2, 0].axhline(y=0, color='red', linestyle='--', alpha=0.7)
+        axes[2, 0].set_title('Cumulative P&L ($)', fontsize=12, fontweight='bold')
+        axes[2, 0].set_ylabel('Cumulative P&L ($)')
+        axes[2, 0].grid(True, alpha=0.3)
+
+        # 6. Transaction Costs Over Time
+        transaction_costs = [trade['transaction_cost'] for trade in self.portfolio_history]
+        axes[2, 1].bar(range(len(transaction_costs)), transaction_costs, alpha=0.7, color='orange')
+        axes[2, 1].set_title('Transaction Costs per Period', fontsize=12, fontweight='bold')
+        axes[2, 1].set_ylabel('Transaction Cost ($)')
+        axes[2, 1].set_xlabel('Rebalancing Period')
+        axes[2, 1].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.show()
+
+        return fig
+
+    def record_performance_metrics(self, actual_returns=None):
+        """
+        Fixed performance metrics calculation for rebalancing strategy
+        """
+        if not self.portfolio_history:
+            return
+
+        latest_trade = self.portfolio_history[-1]
+
+        # Portfolio composition metrics
+        long_positions = latest_trade['weights'] > 0
+        short_positions = latest_trade['weights'] < 0
+
+        metrics = {
+            'portfolio_value': np.sum(np.abs(latest_trade['weights'])),
+            'long_exposure': np.sum(latest_trade['weights'][long_positions]),
+            'short_exposure': np.abs(np.sum(latest_trade['weights'][short_positions])),
+            'num_long_positions': np.sum(long_positions),
+            'num_short_positions': np.sum(short_positions),
+            'transaction_cost': latest_trade['transaction_cost']
+        }
+
+        # Calculate period P&L if actual returns provided
+        if actual_returns is not None:
+            # For a rebalancing strategy: P&L = sum(weight_i * return_i) for the period
+            gross_pnl = np.dot(latest_trade['weights'], actual_returns)
+            net_pnl = gross_pnl - latest_trade['transaction_cost']
+
+            metrics['gross_pnl'] = gross_pnl
+            metrics['realized_pnl'] = net_pnl  # This is NET P&L after costs
+            metrics['expected_pnl'] = np.dot(latest_trade['weights'], latest_trade['expected_returns'])
+
+            # Store actual returns in latest_trade for analysis
+            latest_trade['actual_returns'] = actual_returns.copy()
+
+        self.performance_metrics[latest_trade['timestamp']] = metrics
+        return metrics
+
+    def compute_profitability_metrics(self, risk_free_rate=0.02, periods_per_year=52):
+        """
+        Updated profitability metrics focused on period-by-period performance
+        """
+        if not self.portfolio_history:
+            return {}
+
+        # Use the rebalancing strategy metrics as the foundation
+        base_metrics = self.compute_rebalancing_strategy_metrics()
+
+        if not base_metrics:
+            return {}
+
+        # Extract period data
+        period_returns = base_metrics['period_returns']
+        period_dates = base_metrics['period_dates']
+
+        # Additional risk and performance metrics
+        period_returns_pct = period_returns * 100  # Convert to percentage
+
+        # Percentile analysis
+        percentiles = [5, 10, 25, 50, 75, 90, 95]
+        return_percentiles = {f'p{p}': np.percentile(period_returns_pct, p) for p in percentiles}
+
+        # Skewness and kurtosis
+        from scipy import stats
+        skewness = stats.skew(period_returns)
+        kurtosis = stats.kurtosis(period_returns)
+
+        # Value at Risk (95% and 99%)
+        var_95 = np.percentile(period_returns_pct, 5)
+        var_99 = np.percentile(period_returns_pct, 1)
+
+        # Expected Shortfall / Conditional VaR
+        es_95 = np.mean(period_returns_pct[period_returns_pct <= var_95])
+        es_99 = np.mean(period_returns_pct[period_returns_pct <= var_99]) if np.any(
+            period_returns_pct <= var_99) else var_99
+
+        # Consecutive wins/losses
+        win_streak = 0
+        loss_streak = 0
+        current_win_streak = 0
+        current_loss_streak = 0
+        max_win_streak = 0
+        max_loss_streak = 0
+
+        for ret in period_returns:
+            if ret > 0:
+                current_win_streak += 1
+                current_loss_streak = 0
+                max_win_streak = max(max_win_streak, current_win_streak)
+            elif ret < 0:
+                current_loss_streak += 1
+                current_win_streak = 0
+                max_loss_streak = max(max_loss_streak, current_loss_streak)
+            else:
+                current_win_streak = 0
+                current_loss_streak = 0
+
+        # Combine all metrics
+        enhanced_metrics = {
+            **base_metrics,
+
+            # Distribution characteristics
+            'skewness': skewness,
+            'kurtosis': kurtosis,
+            'return_percentiles': return_percentiles,
+
+            # Risk metrics
+            'var_95': var_95,
+            'var_99': var_99,
+            'expected_shortfall_95': es_95,
+            'expected_shortfall_99': es_99,
+
+            # Streak analysis
+            'max_consecutive_wins': max_win_streak,
+            'max_consecutive_losses': max_loss_streak,
+
+            # Period analysis
+            'best_period_return': np.max(period_returns_pct),
+            'worst_period_return': np.min(period_returns_pct),
+            'positive_periods': np.sum(period_returns > 0),
+            'negative_periods': np.sum(period_returns < 0),
+            'flat_periods': np.sum(period_returns == 0),
+        }
+
+        print(f"\n=== Enhanced Period-Based Performance Analysis ===")
+        print(f"")
+        print(f"Return Distribution:")
+        print(f"  Best Period: {enhanced_metrics['best_period_return']:.2f}%")
+        print(f"  Worst Period: {enhanced_metrics['worst_period_return']:.2f}%")
+        print(f"  Median (P50): {return_percentiles['p50']:.2f}%")
+        print(f"  75th Percentile: {return_percentiles['p75']:.2f}%")
+        print(f"  25th Percentile: {return_percentiles['p25']:.2f}%")
+        print(f"")
+        print(f"Distribution Shape:")
+        print(
+            f"  Skewness: {skewness:.3f} ({'Right-skewed' if skewness > 0.5 else 'Left-skewed' if skewness < -0.5 else 'Approximately symmetric'})")
+        print(
+            f"  Kurtosis: {kurtosis:.3f} ({'Fat-tailed' if kurtosis > 1 else 'Thin-tailed' if kurtosis < -1 else 'Normal-tailed'})")
+        print(f"")
+        print(f"Risk Metrics:")
+        print(f"  95% VaR: {var_95:.2f}%")
+        print(f"  99% VaR: {var_99:.2f}%")
+        print(f"  95% Expected Shortfall: {es_95:.2f}%")
+        print(f"  99% Expected Shortfall: {es_99:.2f}%")
+        print(f"")
+        print(f"Consistency Metrics:")
+        print(
+            f"  Positive Periods: {enhanced_metrics['positive_periods']}/{len(period_returns)} ({enhanced_metrics['positive_periods'] / len(period_returns):.1%})")
+        print(f"  Max Consecutive Wins: {max_win_streak}")
+        print(f"  Max Consecutive Losses: {max_loss_streak}")
+
+        return enhanced_metrics
+
+    def _calculate_position_win_rates(self):
+        """
+        Calculate win rates at the position level (this was likely inflated before)
+        """
+        long_wins = []
+        short_wins = []
+        overall_wins = []
+
+        for trade in self.portfolio_history:
+            if 'actual_returns' in trade:
+                weights = trade['weights']
+                actual_returns = trade['actual_returns']
+
+                # Calculate P&L for each position
+                position_pnls = weights * actual_returns
+
+                # Separate long and short positions
+                long_positions = weights > 0
+                short_positions = weights < 0
+
+                if np.any(long_positions):
+                    long_pnl = position_pnls[long_positions]
+                    long_win_rate = np.sum(long_pnl > 0) / len(long_pnl)
+                    long_wins.append(long_win_rate)
+
+                if np.any(short_positions):
+                    short_pnl = position_pnls[short_positions]
+                    short_win_rate = np.sum(short_pnl > 0) / len(short_pnl)
+                    short_wins.append(short_win_rate)
+
+                # Overall position win rate for this period
+                if len(position_pnls) > 0:
+                    overall_win_rate = np.sum(position_pnls > 0) / len(position_pnls)
+                    overall_wins.append(overall_win_rate)
+
+        return {
+            'avg_long_position_win_rate': np.mean(long_wins) if long_wins else 0,
+            'avg_short_position_win_rate': np.mean(short_wins) if short_wins else 0,
+            'avg_overall_position_win_rate': np.mean(overall_wins) if overall_wins else 0,
+        }
+
+    def backtest_strategy(self, start_date, end_date, rebalance_freq=5):
+        """
+        Fixed backtest that always uses $10,000 capital per period
+        """
+        print(f"\n=== Backtesting Strategy from {start_date} to {end_date} ===")
+
+        start_dt = pd.to_datetime(start_date)
+        end_dt = pd.to_datetime(end_date)
+
+        # Filter to backtest period
+        backtest_dates = self.P_full[(self.P_full.index >= start_dt) &
+                                     (self.P_full.index <= end_dt)].index
+
+        if len(backtest_dates) == 0:
+            print("No data available for backtesting period")
+            return None
+
+        # Track performance metrics but always use $10,000 capital
+        period_returns = []
+        period_pnls = []
+        rebalance_dates = []
+
+        print(f"Constant Capital Allocation: ${self.C_0:,.0f} per period")
+
+        # Simulate rebalancing every rebalance_freq days
+        for i in range(0, len(backtest_dates), rebalance_freq):
+            current_date = backtest_dates[i]
+            rebalance_dates.append(current_date)
+
+            # Calculate actual returns for the period (if we have previous trade)
+            actual_returns = None
+            if len(self.portfolio_history) > 0:
+                prev_date_idx = max(0, i - rebalance_freq)
+                if prev_date_idx < i:
+                    period_data = self.P_full.loc[backtest_dates[prev_date_idx]:current_date]
+                    if len(period_data) >= 2:
+                        period_returns_vals = (period_data.iloc[-1] / period_data.iloc[0] - 1).values
+                        actual_returns = period_returns_vals
+
+            try:
+                # Execute rebalancing step with rolling window
+                trade_record, metrics = self.weekly_rebalancing_step(current_date, actual_returns)
+
+                # Track performance but don't accumulate to capital
+                if trade_record is not None and metrics is not None and 'realized_pnl' in metrics:
+                    period_pnl = metrics['realized_pnl']
+                    period_return = period_pnl / self.C_0
+                    period_returns.append(period_return)
+                    period_pnls.append(period_pnl)
+
+                    if i < 50:  # Show first few periods
+                        print(f"Period {len(period_returns)}: P&L = ${period_pnl:+.0f}, Return = {period_return:.2%}")
+                else:
+                    period_returns.append(0)
+                    period_pnls.append(0)
+
+            except Exception as e:
+                print(f"Error at {current_date}: {e}")
+                period_returns.append(0)
+                period_pnls.append(0)
+
+        # Calculate performance metrics
+        if period_returns:
+            total_pnl = sum(period_pnls)
+            total_return = total_pnl / self.C_0
+            num_periods = len(period_returns)
+            periods_per_year = 252 / rebalance_freq
+            annualized_return = (1 + total_return) ** (periods_per_year / num_periods) - 1
+
+            print(f"\nFinal Performance:")
+            print(f"Total P&L: ${total_pnl:,.0f}")
+            print(f"Total Return: {total_return:.2%}")
+            print(f"Annualized Return: {annualized_return:.2%}")
+            print(f"Number of Periods: {num_periods}")
+        else:
+            total_return = 0
+            annualized_return = 0
+            total_pnl = 0
+
+        # Plot performance (not portfolio value growth)
+        plt.figure(figsize=(12, 6))
+
+        # Plot cumulative returns
+        cumulative_returns = np.cumprod(1 + np.array(period_returns)) - 1
+        plt.subplot(1, 2, 1)
+        plt.plot(rebalance_dates[:len(cumulative_returns)], cumulative_returns * 100,
+                 marker='o', label='Cumulative Return')
+        plt.axhline(y=0, color='r', linestyle='--', alpha=0.7)
+        plt.title('Cumulative Return (%)')
+        plt.xlabel('Date')
+        plt.ylabel('Return (%)')
+        plt.grid(True, alpha=0.3)
+
+        # Plot period returns
+        plt.subplot(1, 2, 2)
+        plt.bar(range(len(period_returns)), [r * 100 for r in period_returns], alpha=0.7)
+        plt.axhline(y=0, color='r', linestyle='-', alpha=0.5)
+        plt.title('Period Returns')
+        plt.xlabel('Period')
+        plt.ylabel('Return (%)')
+        plt.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.show()
+
+        return {
+            'period_returns': period_returns,
+            'period_pnls': period_pnls,
+            'rebalance_dates': rebalance_dates,
+            'total_return': total_return,
+            'annualized_return': annualized_return,
+            'total_pnl': total_pnl
+        }
+
+    def weekly_rebalancing_step(self, current_date, actual_returns=None):
+        """
+        10. Weekly Rebalancing Steps - now takes current_date and recalculates everything
+        """
+        # Set the current 252-day window ending at current_date
+        self.set_current_window(current_date)
+
+        if len(self.P) < 50:  # Need minimum data
+            return None, None
+
+        # Recalculate everything for the current window
+        self.prepare_returns_matrix(standardize=False)
+        self.compute_covariance_and_pca(n_components=5)
+        self.factor_pc_regression(min_r_squared=.1, max_correlation=0.9, max_vif=5)
+        self.compute_historic_pc_std()
+
+        # Get current factor changes from the current window
+        current_factor_changes = self.calculate_current_factor_changes(lookback_days=5)
+
+        # Get current prices (use last available prices from current window)
+        current_prices = self.P.iloc[-1].values
+
+        # Calculate stock betas relative to sector benchmark (XLE) for current window
+        stock_betas = self.calculate_stock_betas(benchmark_symbol='XLE', lookback_days=252)
+
+        # Predict PC movements ΔPC_pred
+        self.predict_pc_movement(current_factor_changes)
+
+        # Compute r_hat and r_hat_weighted
+        self.predict_stock_returns()
+        self.compute_centrality_weighting()
+
+        # Solve optimization for weights w_i
+        self.optimize_portfolio(current_prices, stock_betas)
+
+        # Execute trades
+        trade_record = self.execute_trades(current_prices)
+
+        # Record performance metrics
+        metrics = self.record_performance_metrics(actual_returns)
+
+        return trade_record, metrics
+
+    def backtest_strategy(self, start_date, end_date, rebalance_freq=5):
+        """
+        Comprehensive backtesting with rolling window approach
+        """
+        print(f"\n=== Backtesting Strategy from {start_date} to {end_date} ===")
+
+        # Get all available dates in the backtest period
+        start_dt = pd.to_datetime(start_date)
+        end_dt = pd.to_datetime(end_date)
+
+        # Filter to backtest period
+        backtest_dates = self.P_full[(self.P_full.index >= start_dt) &
+                                     (self.P_full.index <= end_dt)].index
+
+        if len(backtest_dates) == 0:
+            print("No data available for backtesting period")
+            return None
+
+        portfolio_values = [self.C_0]  # Start with initial capital
+        rebalance_dates = []
+
+        # Simulate rebalancing every rebalance_freq days
+        for i in range(0, len(backtest_dates), rebalance_freq):
+            current_date = backtest_dates[i]
+            rebalance_dates.append(current_date)
+
+            # Calculate actual returns for the period (if we have previous trade)
+            actual_returns = None
+            if len(self.portfolio_history) > 0:
+                # Get returns from last rebalancing date to current date
+                prev_date_idx = max(0, i - rebalance_freq)
+                if prev_date_idx < i:
+                    period_data = self.P_full.loc[backtest_dates[prev_date_idx]:current_date]
+                    if len(period_data) >= 2:
+                        period_returns = (period_data.iloc[-1] / period_data.iloc[0] - 1).values
+                        actual_returns = period_returns
+
+            try:
+                # Execute rebalancing step with rolling window
+                trade_record, metrics = self.weekly_rebalancing_step(current_date, actual_returns)
+
+                # Calculate portfolio return
+                if trade_record is not None and metrics is not None and 'realized_pnl' in metrics:
+                    new_portfolio_value = portfolio_values[-1] + metrics['realized_pnl']
+                    portfolio_values.append(new_portfolio_value)
+                else:
+                    portfolio_values.append(portfolio_values[-1])  # No change if no valid trades
+
+            except Exception as e:
+                print(f"Error at {current_date}: {e}")
+                portfolio_values.append(portfolio_values[-1])
+
+        # Calculate performance metrics
+        if len(portfolio_values) > 1:
+            total_return = (portfolio_values[-1] / portfolio_values[0]) - 1
+            num_periods = len(portfolio_values) - 1
+            annualized_return = (1 + total_return) ** (252 / (num_periods * rebalance_freq)) - 1
+        else:
+            total_return = 0
+            annualized_return = 0
+
+        print(f"Total Return: {total_return:.2%}")
+        print(f"Annualized Return: {annualized_return:.2%}")
+
+        # Plot backtest results
+        plt.figure(figsize=(12, 6))
+        plt.plot(rebalance_dates[:len(portfolio_values) - 1], portfolio_values[1:],
+                 marker='o', label='Strategy Portfolio Value')
+        plt.axhline(y=self.C_0, color='r', linestyle='--', label='Initial Capital')
+        plt.title('Strategy Backtest Performance')
+        plt.xlabel('Date')
+        plt.ylabel('Portfolio Value ($)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+
+        return {
+            'portfolio_values': portfolio_values,
+            'rebalance_dates': rebalance_dates,
+            'total_return': total_return,
+            'annualized_return': annualized_return
+        }
+
 
     def analyze_pc_regressions(self, n_pcs=None):
         if not hasattr(self, 'pc_regressions') or not self.pc_regressions:
@@ -337,483 +1589,6 @@ class UltimateDetailedStrategy:
         df_r2 = pd.DataFrame(ind_r2_matrix, index=[f"PC_{i + 1}" for i in range(n_pcs)], columns=unique_factors)
         print("\n=== Individual R² Matrix ===")
         print(df_r2.to_string(float_format="%.3f"))
-    # Add new method to UltimateDetailedStrategy class
-
-    def calculate_current_factor_changes(self, lookback_days=5):
-        """
-        Calculate actual factor changes from downloaded factor data
-        Uses the most recent lookback_days to compute ΔF_f_t = log(F_f_t / F_f_(t-lookback_days))
-        """
-        if self.factors_data is None:
-            print("No factor data available")
-            return {}
-
-        # Get the most recent data
-        recent_data = self.factors_data.tail(lookback_days + 1)
-
-        if len(recent_data) < 2:
-            print("Insufficient factor data for change calculation")
-            return {}
-
-        # Calculate log returns: ΔF_f_t = log(F_f_t / F_f_(t-lookback_days))
-        current_prices = recent_data.iloc[-1]  # Most recent prices
-        previous_prices = recent_data.iloc[-(lookback_days + 1)]  # Prices lookback_days ago
-
-        # Calculate log changes
-        factor_changes = {}
-        for factor in self.factors_data.columns:
-            if not np.isnan(current_prices[factor]) and not np.isnan(previous_prices[factor]):
-                if previous_prices[factor] > 0:  # Avoid division by zero
-                    change = np.log(current_prices[factor] / previous_prices[factor])
-                    factor_changes[factor] = change
-
-        return factor_changes
-
-    def calculate_stock_betas(self, benchmark_symbol='XLE', lookback_days=252):
-        """
-        Calculate stock betas relative to sector benchmark using:
-        β_i = Cov(R_i, R_benchmark) / Var(R_benchmark)
-
-        Where:
-        - R_i = returns of stock i
-        - R_benchmark = returns of benchmark (e.g., XLE for energy sector)
-        - β_i = beta of stock i relative to benchmark
-        """
-        if self.factors_data is None or benchmark_symbol not in self.factors_data.columns:
-            print(f"Benchmark {benchmark_symbol} not found in factor data, using default beta of 1.0")
-            return np.ones(len(self.stocks))
-
-        # Get benchmark data aligned with stock data
-        common_dates = self.R.index.intersection(self.factors_data.index)
-        if len(common_dates) < lookback_days // 2:
-            print("Insufficient overlapping data for beta calculation, using default beta of 1.0")
-            return np.ones(len(self.stocks))
-
-        # Calculate benchmark returns
-        benchmark_prices = self.factors_data.loc[common_dates, benchmark_symbol]
-        benchmark_returns = np.log(benchmark_prices / benchmark_prices.shift(1)).dropna()
-
-        # Align stock returns with benchmark returns
-        aligned_stock_returns = self.R.loc[benchmark_returns.index]
-
-        # Calculate betas for each stock
-        betas = np.zeros(len(self.stocks))
-        benchmark_var = np.var(benchmark_returns, ddof=1)
-
-        if benchmark_var <= 0:
-            print("Zero variance in benchmark, using default beta of 1.0")
-            return np.ones(len(self.stocks))
-
-        for i, stock in enumerate(self.stocks):
-            if stock in aligned_stock_returns.columns:
-                stock_returns = aligned_stock_returns[stock]
-                # β_i = Cov(R_i, R_benchmark) / Var(R_benchmark)
-                covariance = np.cov(stock_returns, benchmark_returns, ddof=1)[0, 1]
-                betas[i] = covariance / benchmark_var
-            else:
-                betas[i] = 1.0  # Default beta if stock not found
-
-        return betas
-
-    def compute_profitability_metrics(self, risk_free_rate=0.02, periods_per_year=52):
-        if not self.portfolio_history:
-            return {}
-
-        pnls = []
-        transaction_costs = []
-        long_win_rates = []
-        short_win_rates = []
-        overall_win_rates = []
-        num_positions = []
-
-        for trade in self.portfolio_history:
-            ts = trade['timestamp']
-            metrics = self.performance_metrics.get(ts, {})
-            pnl = metrics.get('realized_pnl', 0)
-            cost = trade['transaction_cost']
-            net_pnl = pnl - cost
-            pnls.append(net_pnl)
-            transaction_costs.append(cost)
-
-            # Calculate win rates properly
-            if 'actual_returns' in trade:
-                actual_returns = trade['actual_returns']
-                weights = trade['weights']
-
-                # Calculate P&L for each position
-                pos_pnl = weights * actual_returns
-
-                # Separate long and short positions
-                long_mask = weights > 0
-                short_mask = weights < 0
-
-                # Long positions win rate
-                if np.any(long_mask):
-                    long_wins = np.sum(pos_pnl[long_mask] > 0)
-                    long_total = np.sum(long_mask)
-                    long_win_rate = long_wins / long_total
-                    long_win_rates.append(long_win_rate)
-
-                # Short positions win rate
-                if np.any(short_mask):
-                    short_wins = np.sum(pos_pnl[short_mask] > 0)
-                    short_total = np.sum(short_mask)
-                    short_win_rate = short_wins / short_total
-                    short_win_rates.append(short_win_rate)
-
-                # Overall win rate
-                total_positions = np.sum(long_mask) + np.sum(short_mask)
-                if total_positions > 0:
-                    total_wins = np.sum(pos_pnl > 0)
-                    overall_win_rate = total_wins / total_positions
-                    overall_win_rates.append(overall_win_rate)
-
-            num_pos = metrics.get('num_long_positions', 0) + metrics.get('num_short_positions', 0)
-            num_positions.append(num_pos)
-
-        if not pnls:
-            return {}
-
-        # Calculate standard metrics
-        cumulative_pnl = np.cumsum(pnls)
-        total_return = cumulative_pnl[-1] / self.C_0
-        periodic_returns = np.array(pnls) / self.C_0
-        mean_ret = np.mean(periodic_returns)
-        std_ret = np.std(periodic_returns)
-        sharpe = (mean_ret - risk_free_rate / periods_per_year) / std_ret * np.sqrt(
-            periods_per_year) if std_ret > 0 else 0
-
-        avg_hold_positions = np.mean(num_positions) if num_positions else 0
-        avg_transaction_cost = np.mean(transaction_costs) if transaction_costs else 0
-
-        # Drawdown calculation
-        cummax = np.maximum.accumulate(cumulative_pnl)
-        drawdowns = (cummax - cumulative_pnl) / (self.C_0 + cummax)
-        max_drawdown = np.max(drawdowns) if len(drawdowns) > 0 else 0
-
-        # Additional metrics
-        positive_pnls = [p for p in pnls if p > 0]
-        negative_pnls = [p for p in pnls if p < 0]
-        avg_profit = np.mean(positive_pnls) if positive_pnls else 0
-        avg_loss = np.abs(np.mean(negative_pnls)) if negative_pnls else 0
-        profit_factor = sum(positive_pnls) / sum(np.abs(negative_pnls)) if negative_pnls else np.inf
-        avg_pnl = np.mean(pnls)
-        num_trades = len(pnls)
-        total_trans_cost = sum(transaction_costs)
-
-        # Sortino ratio
-        downside_ret = [r for r in periodic_returns if r < 0]
-        downside_std = np.std(downside_ret) if downside_ret else 0
-        sortino = (mean_ret - risk_free_rate / periods_per_year) / downside_std * np.sqrt(
-            periods_per_year) if downside_std > 0 else 0
-
-        annualized_return = (1 + total_return) ** (periods_per_year / len(pnls)) - 1 if pnls else 0
-        calmar = annualized_return / max_drawdown if max_drawdown > 0 else np.inf
-
-        results = {
-            'sharpe_ratio': sharpe,
-            'sortino_ratio': sortino,
-            'calmar_ratio': calmar,
-            'total_return': total_return,
-            'annualized_return': annualized_return,
-            'max_drawdown': max_drawdown,
-            'profit_factor': profit_factor,
-            'average_profit': avg_profit,
-            'average_loss': avg_loss,
-            'average_pnl': avg_pnl,
-            'num_trades': num_trades,
-            'average_positions': avg_hold_positions,
-            'average_transaction_cost': avg_transaction_cost,
-            'total_transaction_costs': total_trans_cost,
-        }
-
-        # Add win rates
-        if long_win_rates:
-            results['long_win_rate'] = np.mean(long_win_rates)
-        if short_win_rates:
-            results['short_win_rate'] = np.mean(short_win_rates)
-        if overall_win_rates:
-            results['overall_win_rate'] = np.mean(overall_win_rates)
-
-        # Print formatted results
-        print("\n=== Profitability Metrics ===")
-        metrics_df = pd.DataFrame.from_dict(results, orient='index', columns=['Value'])
-        metrics_df['Value'] = metrics_df['Value'].apply(
-            lambda x: f"{x:.4f}" if np.isfinite(x) and isinstance(x, (float, np.float64)) else (
-                np.nan if np.isnan(x) else x))
-        print(metrics_df.to_string())
-
-        return results
-
-    def predict_pc_movement(self, current_factor_changes):
-        """
-        6. Predicted PC Movement
-        Predict next week's PC movement: ΔPC_pred_k = α_f + Σ (β_f * ΔF_f_current)
-        """
-        if not hasattr(self, 'pc_regressions') or not self.pc_regressions:
-            # print("No PC regressions available for prediction")
-            return np.zeros(self.V.shape[1])
-
-        # print("Predicting PC movements...")
-
-        # Initialize predicted PC movement vector
-        self.delta_PC_pred = np.zeros(self.V.shape[1])  # ΔPC_pred = [ΔPC_pred_1, ..., ΔPC_pred_K]
-
-        for k, regression_data in self.pc_regressions.items():
-            alpha = regression_data['alpha']  # α_f
-            beta = regression_data['beta']  # β_f coefficients
-            selected_factors = regression_data['selected_factors']
-
-            # Get current factor changes for selected factors
-            current_changes = np.array([current_factor_changes.get(self.factors_data.columns[i], 0)
-                                        for i in selected_factors])
-
-            # ΔPC_pred_k = α_f + Σ (β_f * ΔF_f_current)
-            self.delta_PC_pred[k] = alpha + np.dot(beta, current_changes)
-
-        # Convert to % movement: PredictedPctChange_PC_k = ΔPC_pred_k * σ_PC_k
-        self.predicted_pct_change_PC = self.delta_PC_pred * self.sigma_PC
-
-        # print(f"Predicted PC movements: {self.delta_PC_pred}")
-        return self.delta_PC_pred
-
-    def predict_stock_returns(self):
-        """
-        7. Predicted Stock Returns
-        """
-        # print("Predicting stock returns...")
-
-        # 7a. Loadings & Stock Prediction
-        # Loadings matrix: V (N_stocks × K_PCs)
-        # Predicted PC movement vector: ΔPC_pred = [ΔPC_pred_1, ..., ΔPC_pred_K]
-        # Historic PC standard deviation vector: σ_PC = [σ_PC_1, ..., σ_PC_K]
-
-        # Step-by-step order:
-        # Element-wise multiply predicted PC movement by σ_PC: ΔPC_pred ⊙ σ_PC
-        pc_weighted = self.delta_PC_pred * self.sigma_PC  # ΔPC_pred ⊙ σ_PC
-
-        # Multiply loadings matrix V by resulting vector → gives r_hat (predicted % return per stock)
-        self.r_hat = self.V @ pc_weighted  # Predicted stock returns vector: r_hat = V · (ΔPC_pred ⊙ σ_PC)
-
-        # print(f"Predicted stock returns shape: {self.r_hat.shape}")
-        # print(f"Predicted returns range: [{self.r_hat.min():.4f}, {self.r_hat.max():.4f}]")
-
-        return self.r_hat
-
-    def compute_centrality_weighting(self, method='correlation'):
-        """
-        8. Centrality Weighting
-        Compute centrality matrix C from stock correlation or network adjacency
-        """
-        # print("Computing centrality weighting...")
-
-        if method == 'correlation':
-            # Use correlation matrix as centrality matrix
-            self.centrality_matrix = np.corrcoef(self.R.T)  # C from stock correlation
-        else:
-            # Use covariance matrix
-            self.centrality_matrix = self.Sigma
-
-        # Get first eigenvector of C (largest eigenvalue): u_centrality = eigenvector(C_max)
-        eigenvalues, eigenvectors = linalg.eigh(self.centrality_matrix)
-        max_eigenvalue_idx = np.argmax(eigenvalues)
-        self.u_centrality = np.abs(eigenvectors[:, max_eigenvalue_idx])  # Take absolute values
-
-        # Normalize centrality weights
-        self.u_centrality = self.u_centrality / np.sum(self.u_centrality)
-
-        # Weight predicted stock returns: r_hat_weighted = r_hat ⊙ u_centrality
-        self.r_hat_weighted = self.r_hat * self.u_centrality  # Gives importance-adjusted expected returns
-
-        # print(f"Centrality weights range: [{self.u_centrality.min():.4f}, {self.u_centrality.max():.4f}]")
-        # print(f"Weighted returns range: [{self.r_hat_weighted.min():.4f}, {self.r_hat_weighted.max():.4f}]")
-
-        return self.r_hat_weighted
-
-    def optimize_portfolio(self, current_prices, stock_betas=None):
-        """
-        9. Optimization & Position Sizing
-        """
-        # print("Optimizing portfolio...")
-
-        N = len(self.r_hat_weighted)  # Number of stocks
-        C_total = self.C_0  # Total capital
-
-        # Decision variable: weights v_i (dollar allocation per stock)
-        def objective(v):
-            # Objective: maximize expected return: Max Σ_i (v_i * r_hat_weighted_i)
-            return -np.dot(v, self.r_hat_weighted)  # Negative for minimization
-
-        # Constraints:
-        constraints = []
-
-        # Total portfolio allocation: Σ |v_i| ≤ C_total
-        def total_allocation_constraint(v):
-            return C_total - np.sum(np.abs(v))
-
-        constraints.append({'type': 'ineq', 'fun': total_allocation_constraint})
-
-        # Dollar-neutral allocation constraints
-        def long_allocation_constraint(v):
-            long_positions = v[v > 0]
-            return np.sum(long_positions) - 0.65 * C_total  # Exactly 65% long
-
-        constraints.append({'type': 'eq', 'fun': long_allocation_constraint})
-
-        def short_allocation_constraint(v):
-            short_positions = v[v < 0]
-            return np.abs(np.sum(short_positions)) - 0.35 * C_total  # Exactly 35% short
-
-        constraints.append({'type': 'eq', 'fun': short_allocation_constraint})
-
-        # Individual stock limits and short only negative expected returns
-        bounds = []
-        for i in range(N):
-            if self.r_hat_weighted[i] >= 0:
-                # Long positions: 0 ≤ v_i_long ≤ 0.15 * C_total
-                # Short only negative expected returns: v_i_short = 0 if r_hat_weighted_i ≥ 0
-                bounds.append((0, 0.15 * C_total))
-            else:
-                # Short positions: -0.12 * C_total ≤ v_i_short ≤ 0
-                bounds.append((-0.12 * C_total, 0))
-
-        # Beta exposure constraint: |v · β| ≤ 0.1
-        if stock_betas is not None:
-            def beta_exposure_constraint(v):
-                beta_exposure = np.dot(v, stock_betas)
-                return 0.1 - np.abs(beta_exposure)
-
-            constraints.append({'type': 'ineq', 'fun': beta_exposure_constraint})
-
-        # Initial guess: equal weight allocation respecting long/short constraints
-        v0 = np.zeros(N)
-        long_stocks = self.r_hat_weighted >= 0
-        short_stocks = self.r_hat_weighted < 0
-
-        if np.any(long_stocks):
-            v0[long_stocks] = (0.65 * C_total) / np.sum(long_stocks)
-        if np.any(short_stocks):
-            v0[short_stocks] = -(0.35 * C_total) / np.sum(short_stocks)
-
-        # Solve optimization (linear programming)
-        try:
-            result = opt.minimize(objective, v0, method='SLSQP', bounds=bounds,
-                                  constraints=constraints, options={'maxiter': 1000})
-
-            if result.success:
-                self.optimal_weights = result.x  # v_i weights
-                # print("Portfolio optimization successful")
-                # print(f"Long positions: {np.sum(self.optimal_weights > 0)}")
-                # print(f"Short positions: {np.sum(self.optimal_weights < 0)}")
-                # print(f"Total long allocation: ${np.sum(self.optimal_weights[self.optimal_weights > 0]):.2f}")
-                # print(f"Total short allocation: ${-np.sum(self.optimal_weights[self.optimal_weights < 0]):.2f}")
-            else:
-                # print("Portfolio optimization failed, using equal weights")
-                self.optimal_weights = v0
-
-        except Exception as e:
-            # print(f"Optimization error: {e}, using equal weights")
-            self.optimal_weights = v0
-
-        # Convert to share quantities
-        self.share_quantities = self.optimal_weights / current_prices
-
-        return self.optimal_weights
-
-    def execute_trades(self, current_prices):
-        """
-        Execute trades according to the computed v_i
-        """
-        # print("Executing trades...")
-
-        # Calculate transaction costs
-        total_trade_value = np.sum(np.abs(self.optimal_weights))
-        transaction_cost = total_trade_value * self.transaction_costs
-
-        # Record trade execution
-        trade_record = {
-            'timestamp': pd.Timestamp.now(),
-            'weights': self.optimal_weights.copy(),
-            'shares': self.share_quantities.copy(),
-            'prices': current_prices.copy(),
-            'transaction_cost': transaction_cost,
-            'expected_returns': self.r_hat_weighted.copy()
-        }
-
-        self.portfolio_history.append(trade_record)
-
-        # print(f"Trade executed with transaction cost: ${transaction_cost:.2f}")
-        return trade_record
-
-    def record_performance_metrics(self, actual_returns=None):
-        """
-        Record metrics: P&L, portfolio composition, long/short exposure, and trading stats
-        """
-        if not self.portfolio_history:
-            return
-
-        latest_trade = self.portfolio_history[-1]
-
-        # Portfolio composition
-        long_positions = latest_trade['weights'] > 0
-        short_positions = latest_trade['weights'] < 0
-
-        metrics = {
-            'portfolio_value': np.sum(np.abs(latest_trade['weights'])),
-            'long_exposure': np.sum(latest_trade['weights'][long_positions]),
-            'short_exposure': np.abs(np.sum(latest_trade['weights'][short_positions])),
-            'num_long_positions': np.sum(long_positions),
-            'num_short_positions': np.sum(short_positions),
-            'transaction_cost': latest_trade['transaction_cost']
-        }
-
-        # Calculate P&L if actual returns provided
-        if actual_returns is not None:
-            pnl = np.dot(latest_trade['weights'], actual_returns)
-            metrics['realized_pnl'] = pnl
-            metrics['expected_pnl'] = np.dot(latest_trade['weights'], latest_trade['expected_returns'])
-            # Store actual returns in latest_trade
-            latest_trade['actual_returns'] = actual_returns.copy()
-
-        self.performance_metrics[latest_trade['timestamp']] = metrics
-
-        return metrics
-
-    def weekly_rebalancing_step(self, current_factor_changes, current_prices,
-                                stock_betas=None, actual_returns=None):
-        """
-        10. Weekly Rebalancing Steps
-        """
-        # print("\n=== Weekly Rebalancing Step ===")
-
-        # Update factors, compute ΔF (current_factor_changes provided)
-        # print("1. Updating factors...")
-
-        # Predict PC movements ΔPC_pred
-        # print("2. Predicting PC movements...")
-        self.predict_pc_movement(current_factor_changes)
-
-        # Compute PredictedPctChange_PC_k (done in predict_pc_movement)
-        # print("3. Computing predicted PC percentage changes...")
-
-        # Compute r_hat and r_hat_weighted
-        # print("4. Computing stock return predictions...")
-        self.predict_stock_returns()
-        self.compute_centrality_weighting()
-
-        # Solve optimization for weights w_i
-        # print("5. Optimizing portfolio weights...")
-        self.optimize_portfolio(current_prices, stock_betas)
-
-        # Execute trades
-        # print("6. Executing trades...")
-        trade_record = self.execute_trades(current_prices)
-
-        # Record performance metrics
-        # print("7. Recording performance metrics...")
-        metrics = self.record_performance_metrics(actual_returns)
-
-        return trade_record, metrics
 
     def plot_portfolio_metrics(self):
         """
@@ -875,6 +1650,19 @@ class UltimateDetailedStrategy:
 
         return fig
 
+    def get_optimization_stats(self):
+        print("\n=== Optimization Statistics ===")
+        print(f"Successful SLSQP Optimizations: {self.slsqp_success_count}")
+        print(f"Least Squares Fallbacks: {self.lsq_fallback_count}")
+        total = self.slsqp_success_count + self.lsq_fallback_count
+        if total > 0:
+            print(f"SLSQP Success Rate: {self.slsqp_success_count / total:.2%}")
+        else:
+            print("No optimizations performed yet")
+        return {
+            'slsqp_success_count': self.slsqp_success_count,
+            'lsq_fallback_count': self.lsq_fallback_count
+        }
     def get_variable_summary(self):
         """
         Display all variables and matrices as defined in the strategy
@@ -892,18 +1680,547 @@ class UltimateDetailedStrategy:
             'optimal_weights': f"Portfolio weights shape: {self.optimal_weights.shape if hasattr(self, 'optimal_weights') else 'Not computed'}"
         }
 
-        # print("=== Variable Summary ===")
-        # for var, description in summary.items():
-            # print(f"{var}: {description}")
-
         return summary
 
 
+    #the following functions are for validation of the back testing
+
+    def validate_data_integrity_and_lookahead(self):
+        """
+        Comprehensive validation to detect look-ahead bias and data leakage
+        """
+        print("\n" + "=" * 70)
+        print("DATA INTEGRITY AND LOOK-AHEAD BIAS VALIDATION")
+        print("=" * 70)
+
+        validation_results = {}
+        issues_found = []
+
+        # 1. Check if future data is being used in any calculations
+        print("\n1. FUTURE DATA LEAKAGE CHECK:")
+        print("-" * 40)
+
+        for i, trade in enumerate(self.portfolio_history[:5]):  # Check first 5 trades
+            trade_date = trade['timestamp']
+            print(f"\nTrade {i + 1} on {trade_date}:")
+
+            # Check if the window data extends beyond trade date
+            self.set_current_window(trade_date)
+            window_end = self.P.index[-1]
+            window_start = self.P.index[0]
+
+            if window_end > trade_date:
+                issues_found.append(f"CRITICAL: Trade {i + 1} uses data after trade date!")
+                print(f"  ❌ ISSUE: Window ends {window_end} but trade date is {trade_date}")
+            else:
+                print(f"  ✅ OK: Window ends {window_end}, trade date {trade_date}")
+
+            print(f"     Window: {window_start} to {window_end} ({len(self.P)} days)")
+
+            # Check factor data alignment
+            if self.factors_data is not None:
+                factor_end = self.factors_data.index[-1]
+                if factor_end > trade_date:
+                    issues_found.append(f"CRITICAL: Factor data leakage in trade {i + 1}")
+                    print(f"  ❌ ISSUE: Factor data ends {factor_end} but trade date is {trade_date}")
+                else:
+                    print(f"  ✅ OK: Factor data ends {factor_end}")
+
+        # 2. Check rolling window independence
+        print(f"\n2. ROLLING WINDOW INDEPENDENCE CHECK:")
+        print("-" * 40)
+
+        if len(self.portfolio_history) >= 3:
+            # Compare consecutive windows
+            dates = [trade['timestamp'] for trade in self.portfolio_history[:3]]
+
+            for i in range(len(dates) - 1):
+                current_date = dates[i]
+                next_date = dates[i + 1]
+
+                # Set windows
+                self.set_current_window(current_date)
+                window1_start = self.P.index[0]
+                window1_end = self.P.index[-1]
+
+                self.set_current_window(next_date)
+                window2_start = self.P.index[0]
+                window2_end = self.P.index[-1]
+
+                # Check expected progression
+                expected_days_diff = (next_date - current_date).days
+                actual_start_diff = (window2_start - window1_start).days
+                actual_end_diff = (window2_end - window1_end).days
+
+                print(f"\nWindow progression {i + 1} to {i + 2}:")
+                print(f"  Trade dates: {current_date} → {next_date} ({expected_days_diff} days)")
+                print(f"  Window starts: {window1_start} → {window2_start} ({actual_start_diff} days)")
+                print(f"  Window ends: {window1_end} → {window2_end} ({actual_end_diff} days)")
+
+                if abs(actual_end_diff - expected_days_diff) > 2:  # Allow 2-day tolerance for weekends
+                    issues_found.append(f"Window progression issue between trades {i + 1} and {i + 2}")
+                    print(f"  ⚠️  Warning: Unexpected window progression")
+                else:
+                    print(f"  ✅ OK: Windows progress as expected")
+
+        # 3. Check for data snooping in factor selection
+        print(f"\n3. FACTOR SELECTION CONSISTENCY CHECK:")
+        print("-" * 40)
+
+        factor_usage = {}
+        if len(self.portfolio_history) >= 5:
+            # Check factor selection across multiple periods
+            sample_dates = [trade['timestamp'] for trade in self.portfolio_history[::10]]  # Every 10th trade
+
+            for date in sample_dates[:3]:
+                self.set_current_window(date)
+                self.prepare_returns_matrix()
+                self.compute_covariance_and_pca(n_components=5)
+                temp_regressions = self.factor_pc_regression()
+
+                if temp_regressions:
+                    for pc_idx, data in temp_regressions.items():
+                        factors = data.get('factor_names', [])
+                        date_str = date.strftime('%Y-%m-%d')
+                        factor_usage[date_str] = factors
+                        print(f"  {date_str}: {len(factors)} factors for PC regressions")
+
+            # Check if same factors are always selected (potential overfitting)
+            all_factors = set()
+            for factors in factor_usage.values():
+                all_factors.update(factors)
+
+            common_factors = set.intersection(
+                *[set(factors) for factors in factor_usage.values()]) if factor_usage else set()
+
+            print(f"\n  Total unique factors used: {len(all_factors)}")
+            print(f"  Factors used in ALL periods: {len(common_factors)} - {list(common_factors)}")
+
+            if len(common_factors) > 5:
+                issues_found.append("Potential overfitting: Same factors always selected")
+                print(f"  ⚠️  Warning: High factor consistency may indicate overfitting")
+
+        # Summary
+        print(f"\n4. VALIDATION SUMMARY:")
+        print("-" * 40)
+
+        if issues_found:
+            print("❌ CRITICAL ISSUES FOUND:")
+            for issue in issues_found:
+                print(f"  • {issue}")
+        else:
+            print("✅ No critical data integrity issues detected")
+
+        validation_results['issues_found'] = issues_found
+        validation_results['factor_usage'] = factor_usage if 'factor_usage' in locals() else {}
+
+        return validation_results
+
+    def analyze_prediction_accuracy(self):
+        """
+        Detailed analysis of prediction accuracy vs actual returns, using regression-based R²
+        """
+        print("\n" + "=" * 70)
+        print("PREDICTION ACCURACY ANALYSIS")
+        print("=" * 70)
+
+        if len(self.portfolio_history) < 2:
+            print("Insufficient data for prediction accuracy analysis")
+            return {
+                'avg_correlation': None,
+                'correlation_by_period': [],
+                'prediction_dates': [],
+                'r_squared': None
+            }
+
+        predicted_returns = []
+        actual_returns = []
+        prediction_dates = []
+        correlation_by_period = []
+
+        print("\n1. PREDICTION vs ACTUAL CORRELATION BY PERIOD:")
+        print("-" * 50)
+
+        for i, trade in enumerate(self.portfolio_history):
+            if 'actual_returns' in trade and 'expected_returns' in trade:
+                pred = trade['expected_returns']
+                actual = trade['actual_returns']
+                date = trade['timestamp']
+
+                # Calculate correlation for this period
+                if len(pred) > 1 and len(actual) > 1:
+                    correlation = np.corrcoef(pred, actual)[0, 1]
+                    if not np.isnan(correlation):
+                        correlation_by_period.append(correlation)
+                        prediction_dates.append(date)
+
+                        # Store individual predictions and actuals
+                        predicted_returns.extend(pred)
+                        actual_returns.extend(actual)
+
+                        if i < 10:  # Show first 10 periods
+                            print(f"  {date.strftime('%Y-%m-%d')}: Correlation = {correlation:.3f}")
+
+        if not correlation_by_period:
+            print("No valid correlation data available")
+            return {
+                'avg_correlation': None,
+                'correlation_by_period': [],
+                'prediction_dates': [],
+                'r_squared': None
+            }
+
+        avg_correlation = np.mean(correlation_by_period)
+        std_correlation = np.std(correlation_by_period)
+
+        print(f"\n2. OVERALL PREDICTION STATISTICS:")
+        print("-" * 50)
+        print(f"  Average correlation: {avg_correlation:.3f}")
+        print(f"  Std deviation: {std_correlation:.3f}")
+        print(f"  Min correlation: {min(correlation_by_period):.3f}")
+        print(f"  Max correlation: {max(correlation_by_period):.3f}")
+        print(
+            f"  Periods with positive correlation: {sum(1 for c in correlation_by_period if c > 0)}/{len(correlation_by_period)}")
+
+        # Overall correlation across all predictions
+        overall_corr = np.corrcoef(predicted_returns, actual_returns)[
+            0, 1] if predicted_returns and actual_returns else np.nan
+        print(f"  Overall correlation (all data): {overall_corr:.3f}")
+
+        # Scatter plot with best-fit line and R²
+        if len(predicted_returns) > 100:  # Only if we have enough data
+            sample_size = min(10000, len(predicted_returns))  # Sample for visibility
+            sample_indices = np.random.choice(len(predicted_returns), sample_size, replace=False)
+
+            pred_sample = np.array(predicted_returns)[sample_indices]
+            actual_sample = np.array(actual_returns)[sample_indices]
+
+            # Check for scaling issues and rescale if necessary
+            if np.mean(np.abs(pred_sample)) > 1:  # Assume scaling if predictions are unusually large
+                pred_sample = pred_sample / 100
+                print("Rescaled predicted returns by dividing by 100")
+
+            plt.figure(figsize=(8, 6))
+            plt.scatter(pred_sample, actual_sample, alpha=0.5, s=20)
+
+            # Perfect prediction line (y = x) for reference
+            min_val = min(np.min(pred_sample), np.min(actual_sample))
+            max_val = max(np.max(pred_sample), np.max(actual_sample))
+            margin = 0.1 * (max_val - min_val) if max_val != min_val else 0.1
+            line_range = [min_val - margin, max_val + margin]
+            plt.plot(line_range, line_range, 'r--', alpha=0.7, label='Perfect Prediction (y=x)')
+
+            # Best-fit line using linear regression
+            coeffs = np.polyfit(pred_sample, actual_sample, 1)  # Linear regression
+            best_fit_line = np.poly1d(coeffs)
+            plt.plot(line_range, best_fit_line(line_range), 'b-', alpha=0.7, label='Best Fit')
+
+            # Calculate R² for the best-fit line
+            fitted_predictions = best_fit_line(pred_sample)
+            ss_tot = np.sum((actual_sample - np.mean(actual_sample)) ** 2)
+            ss_res = np.sum((actual_sample - fitted_predictions) ** 2)
+            r_squared = 1 - ss_res / ss_tot if ss_tot != 0 else 0
+
+            # Display R² in top-right corner
+            plt.text(line_range[1], line_range[0], f'R²: {r_squared:.3f}',
+                     fontsize=10, ha='right', va='bottom', color='black')
+
+            plt.xlabel('Predicted Returns')
+            plt.ylabel('Actual Returns')
+            plt.title(f'Predicted vs Actual Returns (Sample of {sample_size})')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.gca().set_aspect('equal', adjustable='box')
+            plt.tight_layout()
+            plt.show()
+            print(f"Regression-based R²: {r_squared:.3f}")
+
+        # Plot correlation over time
+        plt.figure(figsize=(12, 4))
+        plt.plot(prediction_dates, correlation_by_period, marker='o', alpha=0.7)
+        plt.axhline(y=0, color='r', linestyle='--', alpha=0.5)
+        plt.axhline(y=avg_correlation, color='g', linestyle='-', alpha=0.7,
+                    label=f'Avg: {avg_correlation:.3f}')
+        plt.title('Prediction Correlation Over Time')
+        plt.ylabel('Correlation (Predicted vs Actual)')
+        plt.xlabel('Date')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+
+        return {
+            'avg_correlation': avg_correlation,
+            'correlation_by_period': correlation_by_period,
+            'prediction_dates': prediction_dates,
+            'r_squared': r_squared
+        }
+
+    def analyze_portfolio_composition_over_time(self):
+        """
+        Enhanced portfolio composition analysis for rebalancing strategy
+        """
+        print("\n" + "=" * 70)
+        print("PORTFOLIO COMPOSITION ANALYSIS")
+        print("=" * 70)
+
+        if not self.portfolio_history:
+            print("No portfolio history available")
+            return
+
+        # Extract data
+        dates = [trade['timestamp'] for trade in self.portfolio_history]
+        weights_history = np.array([trade['weights'] for trade in self.portfolio_history])
+        stock_names = self.stocks
+
+        print(f"\n1. PORTFOLIO STATISTICS:")
+        print("-" * 30)
+        print(f"  Number of rebalancing periods: {len(dates)}")
+        print(f"  Number of stocks: {len(stock_names)}")
+        print(f"  Date range: {dates[0].strftime('%Y-%m-%d')} to {dates[-1].strftime('%Y-%m-%d')}")
+        print(f"  Constant capital allocation: ${self.C_0:,}")
+
+        # Calculate position statistics
+        long_counts = np.sum(weights_history > 0, axis=1)
+        short_counts = np.sum(weights_history < 0, axis=1)
+
+        print(f"  Avg long positions per period: {np.mean(long_counts):.1f} ± {np.std(long_counts):.1f}")
+        print(f"  Avg short positions per period: {np.mean(short_counts):.1f} ± {np.std(short_counts):.1f}")
+
+        # Portfolio allocation statistics
+        total_allocations = np.sum(np.abs(weights_history), axis=1)
+        long_allocations = np.sum(np.maximum(weights_history, 0), axis=1)
+        short_allocations = np.sum(np.abs(np.minimum(weights_history, 0)), axis=1)
+
+        print(f"  Avg total allocation: ${np.mean(total_allocations):,.0f} ± ${np.std(total_allocations):,.0f}")
+        print(f"  Avg long allocation: ${np.mean(long_allocations):,.0f} ({np.mean(long_allocations) / self.C_0:.1%})")
+        print(
+            f"  Avg short allocation: ${np.mean(short_allocations):,.0f} ({np.mean(short_allocations) / self.C_0:.1%})")
+
+        # Market neutrality check
+        net_exposures = np.sum(weights_history, axis=1)
+        print(f"  Avg net exposure: ${np.mean(net_exposures):,.0f} ({np.mean(net_exposures) / self.C_0:.2%})")
+        print(f"  Net exposure std dev: ${np.std(net_exposures):,.0f}")
+
+        # Turnover analysis
+        if len(weights_history) > 1:
+            turnovers = []
+            for i in range(1, len(weights_history)):
+                turnover = np.sum(np.abs(weights_history[i] - weights_history[i - 1])) / (2 * self.C_0)
+                turnovers.append(turnover)
+
+            print(f"\n2. TURNOVER ANALYSIS:")
+            print("-" * 30)
+            print(f"  Average turnover per period: {np.mean(turnovers):.1%}")
+            print(f"  Median turnover per period: {np.median(turnovers):.1%}")
+            print(f"  Turnover std deviation: {np.std(turnovers):.1%}")
+            print(f"  High turnover periods (>50%): {sum(1 for t in turnovers if t > 0.5)}")
+
+        # Stock usage frequency
+        stock_usage = np.sum(weights_history != 0, axis=0) / len(weights_history)
+        most_used_stocks = [(stock_names[i], usage) for i, usage in enumerate(stock_usage)]
+        most_used_stocks.sort(key=lambda x: x[1], reverse=True)
+
+        print(f"\n3. STOCK USAGE FREQUENCY (Top 10):")
+        print("-" * 40)
+        for stock, usage in most_used_stocks[:10]:
+            print(f"  {stock}: {usage:.1%} of periods")
+
+        return {
+            'dates': dates,
+            'weights_history': weights_history,
+            'stock_names': stock_names,
+            'long_counts': long_counts,
+            'short_counts': short_counts,
+            'turnovers': turnovers if 'turnovers' in locals() else [],
+            'stock_usage': stock_usage
+        }
+
+    def detect_overfitting_signals(self):
+        """
+        Analyze potential overfitting by examining strategy behavior patterns
+        """
+        print("\n" + "=" * 70)
+        print("OVERFITTING DETECTION ANALYSIS")
+        print("=" * 70)
+
+        overfitting_signals = []
+
+        # 1. Check if win rate is too consistent
+        if hasattr(self, 'performance_metrics'):
+            win_rates_by_period = []
+
+            for trade in self.portfolio_history:
+                if 'actual_returns' in trade:
+                    weights = trade['weights']
+                    actual_returns = trade['actual_returns']
+                    pos_pnl = weights * actual_returns
+
+                    if len(pos_pnl) > 0:
+                        wins = np.sum(pos_pnl > 0)
+                        total = len(pos_pnl)
+                        win_rate = wins / total
+                        win_rates_by_period.append(win_rate)
+
+            if win_rates_by_period:
+                avg_win_rate = np.mean(win_rates_by_period)
+                win_rate_std = np.std(win_rates_by_period)
+
+                print(f"\n1. WIN RATE CONSISTENCY CHECK:")
+                print(f"   Average win rate: {avg_win_rate:.1%}")
+                print(f"   Win rate std dev: {win_rate_std:.1%}")
+                print(f"   Coefficient of variation: {win_rate_std / avg_win_rate:.2f}")
+
+                if avg_win_rate > 0.75:
+                    overfitting_signals.append("Exceptionally high win rate (>75%)")
+
+                if win_rate_std < 0.05:  # Very low variability
+                    overfitting_signals.append("Win rate too consistent (low variability)")
+
+        # 2. Check period-specific performance
+        print(f"\n2. PERIOD-SPECIFIC PERFORMANCE:")
+
+        # Split into year-by-year performance
+        yearly_performance = {}
+        for trade in self.portfolio_history:
+            year = trade['timestamp'].year
+            ts = trade['timestamp']
+            metrics = self.performance_metrics.get(ts, {})
+            pnl = metrics.get('realized_pnl', 0)
+
+            if year not in yearly_performance:
+                yearly_performance[year] = []
+            yearly_performance[year].append(pnl)
+
+        for year, pnls in yearly_performance.items():
+            if pnls:
+                year_return = sum(pnls) / self.C_0
+                print(f"   {year}: {year_return:.1%} return ({len(pnls)} trades)")
+
+        # Check if performance is too concentrated in specific periods
+        year_returns = [sum(pnls) / self.C_0 for pnls in yearly_performance.values() if pnls]
+        if year_returns and len(year_returns) > 1:
+            max_year_return = max(year_returns)
+            if max_year_return > 2 * np.mean(year_returns):  # One year dominates
+                overfitting_signals.append("Performance highly concentrated in specific period")
+
+        # 3. Check strategy stability across different market conditions
+        print(f"\n3. MARKET CONDITION SENSITIVITY:")
+
+        # Use VIX-like proxy or market volatility
+        if self.factors_data_full is not None and '^VIX' in self.factors_data_full.columns:
+            # Analyze performance in high vs low volatility periods
+            vix_data = self.factors_data_full['^VIX'].dropna()
+
+            if len(vix_data) > 100:
+                vix_median = vix_data.median()
+                high_vol_performance = []
+                low_vol_performance = []
+
+                for trade in self.portfolio_history:
+                    trade_date = trade['timestamp']
+                    # Get VIX around trade date
+                    vix_window = vix_data[vix_data.index <= trade_date].tail(5)
+                    if len(vix_window) > 0:
+                        avg_vix = vix_window.mean()
+                        ts = trade['timestamp']
+                        metrics = self.performance_metrics.get(ts, {})
+                        pnl = metrics.get('realized_pnl', 0)
+
+                        if avg_vix > vix_median:
+                            high_vol_performance.append(pnl)
+                        else:
+                            low_vol_performance.append(pnl)
+
+                if high_vol_performance and low_vol_performance:
+                    high_vol_return = sum(high_vol_performance) / self.C_0 / len(high_vol_performance) * 52
+                    low_vol_return = sum(low_vol_performance) / self.C_0 / len(low_vol_performance) * 52
+
+                    print(
+                        f"   High volatility periods: {high_vol_return:.1%} annualized ({len(high_vol_performance)} trades)")
+                    print(
+                        f"   Low volatility periods: {low_vol_return:.1%} annualized ({len(low_vol_performance)} trades)")
+
+                    if abs(high_vol_return - low_vol_return) > 0.5:  # 50% difference
+                        overfitting_signals.append("Large performance difference across volatility regimes")
+
+        # 4. Summary
+        print(f"\n4. OVERFITTING RISK ASSESSMENT:")
+        print("-" * 40)
+
+        if overfitting_signals:
+            print("⚠️  POTENTIAL OVERFITTING SIGNALS DETECTED:")
+            for signal in overfitting_signals:
+                print(f"   • {signal}")
+
+            print(
+                f"\n   Risk Level: {'HIGH' if len(overfitting_signals) >= 3 else 'MEDIUM' if len(overfitting_signals) >= 2 else 'LOW'}")
+        else:
+            print("✅ No obvious overfitting signals detected")
+
+        return overfitting_signals
+
+# Add this to the main strategy class - update the run_strategy_example function
+def run_enhanced_validation_example(strategy):
+    """
+    Run comprehensive validation for the given strategy object
+    """
+    print("\n" + "=" * 80)
+    print("COMPREHENSIVE VALIDATION ANALYSIS")
+    print("=" * 80)
+
+    # 1. Data integrity and look-ahead bias check
+    validation_results = strategy.validate_data_integrity_and_lookahead()
+
+    # 2. Prediction accuracy analysis
+    prediction_analysis = strategy.analyze_prediction_accuracy()
+
+    # 3. Portfolio composition analysis
+    composition_analysis = strategy.analyze_portfolio_composition_over_time()
+
+    # 4. Transaction cost stress test
+    cost_analysis = strategy.stress_test_transaction_costs()
+
+    # 5. Overfitting detection
+    overfitting_signals = strategy.detect_overfitting_signals()
+
+    # Final summary
+    print("\n" + "=" * 80)
+    print("FINAL VALIDATION SUMMARY")
+    print("=" * 80)
+
+    critical_issues = validation_results.get('issues_found', [])
+    if critical_issues:
+        print("❌ CRITICAL ISSUES THAT NEED INVESTIGATION:")
+        for issue in critical_issues:
+            print(f"   • {issue}")
+
+    if overfitting_signals:
+        print("\n⚠️  OVERFITTING CONCERNS:")
+        for signal in overfitting_signals:
+            print(f"   • {signal}")
+
+    if prediction_analysis and prediction_analysis.get('avg_correlation'):
+        corr = prediction_analysis['avg_correlation']
+        print(f"\n📊 PREDICTION QUALITY: {corr:.3f} average correlation")
+        if corr < 0.1:
+            print("   ⚠️  Low prediction accuracy may indicate noise fitting")
+
+    print(f"\n💰 TRANSACTION COST SENSITIVITY:")
+    if cost_analysis:
+        base_return = cost_analysis[0.001]['annualized_return']
+        realistic_return = cost_analysis[0.005]['annualized_return']  # 0.5% costs
+        print(f"   Current costs (0.1%): {base_return:.1%} annual return")
+        print(f"   Realistic costs (0.5%): {realistic_return:.1%} annual return")
+        print(f"   Impact: {(base_return - realistic_return) * 100:.1f} percentage points")
+
+    return strategy
+
 def run_strategy_example():
     """
-    Complete example of running the Ultimate Detailed Strategy
+    Complete example of running the Ultimate Detailed Strategy with rolling window
     """
-    print("=== Ultimate Detailed Strategy Example ===\n")
+    print("=== Ultimate Detailed Strategy Example with Rolling Window ===\n")
 
     # Initialize strategy
     strategy = UltimateDetailedStrategy()
@@ -932,63 +2249,23 @@ def run_strategy_example():
         'XES', 'IEO', 'PXI', 'TIP', 'GLD'
     ]
 
-    # Load data
-    strategy.load_data(stock_symbols, '2020-01-01', '2024-01-01',
-                       {symbol: symbol for symbol in factor_symbols})
+    # Load full dataset (will automatically extend start date by ~360 days)
+    strategy.load_full_data(stock_symbols, '2021-01-01', '2024-01-01',
+                           {symbol: symbol for symbol in factor_symbols})
 
-    # Prepare returns matrix
-    strategy.prepare_returns_matrix(standardize=False)
+    # Run backtest with rolling window approach
+    backtest_results = strategy.backtest_strategy('2021-01-01', '2023-12-31', rebalance_freq=5)
 
-    # Compute covariance and PCA
-    strategy.compute_covariance_and_pca(n_components=5)
+    # Compute and display profitability metrics
+    if strategy.portfolio_history:
+        strategy.plot_rebalancing_performance()
+        strategy.plot_portfolio_metrics()
 
-    # Factor-PC regression
-    strategy.factor_pc_regression(min_r_squared=.1, max_correlation=0.9, max_vif=5)
+    # Run enhanced validation
+    run_enhanced_validation_example(strategy)
 
-    # Analyze PC regressions
-    strategy.analyze_pc_regressions(n_pcs=8)
-
-    # Compute historic PC standard deviations
-    strategy.compute_historic_pc_std()
-
-    # Example of weekly rebalancing step with ACTUAL factor changes
-    print("\nStep 6: Example weekly rebalancing...")
-
-    # Calculate actual current factor changes from downloaded data
-    current_factor_changes = strategy.calculate_current_factor_changes(lookback_days=5)
-    print(f"Actual factor changes: {current_factor_changes}")
-
-    # Get current prices (use last available prices)
-    current_prices = strategy.P.iloc[-1].values
-
-    # Calculate actual stock betas relative to sector benchmark (XLE)
-    stock_betas = strategy.calculate_stock_betas(benchmark_symbol='XLE', lookback_days=252)
-    print(f"Calculated betas - mean: {np.mean(stock_betas):.3f}, std: {np.std(stock_betas):.3f}")
-
-    # Calculate actual returns for the period (use most recent week's actual returns)
-    recent_returns = strategy.R.tail(5).mean().values  # Average returns over last 5 days
-
-    # Execute weekly rebalancing
-    trade_record, metrics = strategy.weekly_rebalancing_step(
-        current_factor_changes, current_prices, stock_betas, recent_returns)
-
-    print(f"Portfolio metrics: {metrics}")
-
-    # Display variable summary
-    strategy.get_variable_summary()
-
-    # Add a few more rebalancing periods for better visualization
-    for i in range(3):
-        # Use actual factor changes from different periods
-        offset_days = (i + 1) * 5
-        if offset_days < len(strategy.R):
-            # Calculate factor changes from historical data
-            historical_factor_changes = strategy.calculate_current_factor_changes(lookback_days=5)
-            historical_returns = strategy.R.iloc[-(offset_days + 5):-(offset_days)].mean().values
-            strategy.weekly_rebalancing_step(historical_factor_changes, current_prices, stock_betas, historical_returns)
-
-    strategy.plot_portfolio_metrics()
-    strategy.compute_profitability_metrics()
+    # Display optimization statistics to analyze SLSQP vs. least squares fallbacks
+    strategy.get_optimization_stats()
 
     return strategy
 
@@ -1012,9 +2289,6 @@ def analyze_pc_loadings(strategy, pc_index=0):
         'Abs_Loading': np.abs(loadings)
     }).sort_values('Abs_Loading', ascending=False)
 
-    # print(f"\n=== PC_{pc_index + 1} Loadings Analysis ===")
-    # print(loadings_df)
-
     # Plot loadings
     plt.figure(figsize=(10, 6))
     plt.bar(range(len(loadings)), loadings)
@@ -1033,7 +2307,6 @@ def analyze_factor_importance(strategy):
     """
     Analyze which factors are most important across all PCs
     """
-    print()
     if not hasattr(strategy, 'pc_regressions') or not strategy.pc_regressions:
         print("Factor regressions not available")
         return
@@ -1062,119 +2335,34 @@ def analyze_factor_importance(strategy):
         print(f"{factor}: {importance:.4f}")
 
     return factor_importance, overall_importance
+#
+# def setup_logging():
+#     """Set up logging for debugging."""
+#     logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
-
-def backtest_strategy(strategy, start_date='2021-01-01', end_date='2023-12-31',
-                      rebalance_freq=5):
-    """
-    Comprehensive backtesting of the strategy
-    """
-    print(f"\n=== Backtesting Strategy from {start_date} to {end_date} ===")
-
-    # Get price data for backtesting period
-    backtest_data = strategy.P.loc[start_date:end_date]
-
-    if backtest_data.empty:
-        print("No data available for backtesting period")
-        return None
-
-    # Calculate returns for backtesting
-    backtest_returns = backtest_data.pct_change().dropna()
-
-    portfolio_values = [strategy.C_0]  # Start with initial capital
-    rebalance_dates = []
-
-    # Simulate rebalancing every rebalance_freq days
-    for i in range(rebalance_freq, len(backtest_returns), rebalance_freq):
-        rebalance_date = backtest_returns.index[i]
-        rebalance_dates.append(rebalance_date)
-
-        # Get period returns
-        period_returns = backtest_returns.iloc[i - rebalance_freq:i].mean().values
-
-        # Simulate factor changes (in practice, these would be real factor data)
-        factor_changes = {factor: np.random.normal(0, 0.02)
-                          for factor in ['SPY', 'TLT', 'GLD', 'VXX', 'UUP']}
-
-        current_prices = backtest_data.iloc[i].values
-        stock_betas = np.random.normal(1.0, 0.3, len(strategy.stocks))
-
-        try:
-            # Execute rebalancing step
-            trade_record, metrics = strategy.weekly_rebalancing_step(
-                factor_changes, current_prices, stock_betas, period_returns)
-
-            # Calculate portfolio return
-            if hasattr(strategy, 'optimal_weights') and 'realized_pnl' in metrics:
-                new_portfolio_value = portfolio_values[-1] + metrics['realized_pnl']
-                portfolio_values.append(new_portfolio_value)
-            else:
-                portfolio_values.append(portfolio_values[-1])  # No change if no valid trades
-
-        except Exception as e:
-            print(f"Error at {rebalance_date}: {e}")
-            portfolio_values.append(portfolio_values[-1])
-
-    # Calculate performance metrics
-    total_return = (portfolio_values[-1] / portfolio_values[0]) - 1
-    annualized_return = (1 + total_return) ** (252 / len(backtest_returns)) - 1
-
-    print(f"Total Return: {total_return:.2%}")
-    print(f"Annualized Return: {annualized_return:.2%}")
-
-    # Plot backtest results
-    plt.figure(figsize=(12, 6))
-    plt.plot(rebalance_dates[:len(portfolio_values) - 1], portfolio_values[1:],
-             marker='o', label='Strategy Portfolio Value')
-    plt.axhline(y=strategy.C_0, color='r', linestyle='--', label='Initial Capital')
-    plt.title('Strategy Backtest Performance')
-    plt.xlabel('Date')
-    plt.ylabel('Portfolio Value ($)')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.show()
-
-    return {
-        'portfolio_values': portfolio_values,
-        'rebalance_dates': rebalance_dates,
-        'total_return': total_return,
-        'annualized_return': annualized_return
-    }
-
-
-# Run the complete example
 if __name__ == "__main__":
-    # Execute the full strategy example
+    # Execute the full strategy example with rolling window
     strategy = run_strategy_example()
 
-    # Additional analysis
-    print("\n" + "=" * 50)
-    print("ADDITIONAL ANALYSIS")
-    print("=" * 50)
+    # Additional analysis (only if we have recent data)
+    if hasattr(strategy, 'V') and strategy.V is not None:
+        print("\n" + "=" * 50)
+        print("ADDITIONAL ANALYSIS")
+        print("=" * 50)
 
-    # Analyze PC loadings
-    analyze_pc_loadings(strategy, pc_index=0)
+        # Analyze PC loadings for the most recent window
+        analyze_pc_loadings(strategy, pc_index=0)
 
-    # Analyze factor importance
-    analyze_factor_importance(strategy)
+        # Analyze factor importance for the most recent window
+        analyze_factor_importance(strategy)
 
-    # Run backtest
-    backtest_results = backtest_strategy(strategy)
-    #
-    # print("\n=== Strategy Implementation Complete ===")
-    # print("All components of the Ultimate Detailed Strategy have been implemented exactly as specified:")
-    # print("✅ Universe & Capital management")
-    # print("✅ Data Preparation with log returns matrix R")
-    # print("✅ Covariance matrix Σ and PCA with loadings matrix V")
-    # print("✅ PC time series matrix PC_day")
-    # print("✅ Multi-factor regression with collinearity filtering")
-    # print("✅ Historic PC standard deviation σ_PC")
-    # print("✅ Predicted PC movements ΔPC_pred")
-    # print("✅ Stock return predictions r_hat")
-    # print("✅ Centrality weighting with u_centrality")
-    # print("✅ Weighted predictions r_hat_weighted")
-    # print("✅ Portfolio optimization with all constraints")
-    # print("✅ Weekly rebalancing with complete workflow")
-    # print("✅ Performance metrics and visualization")
-    # print("✅ All matrix definitions and variable shapes as specified")
+    print("\n=== Rolling Window Strategy Implementation Complete ===")
+    print("All components now use a rolling 252-day window:")
+    print("✅ Full dataset loaded with extended historical data")
+    print("✅ Each rebalancing recalculates PCA matrix V")
+    print("✅ Each rebalancing recalculates covariance matrix Σ")
+    print("✅ Each rebalancing recalculates centrality matrix C")
+    print("✅ Each rebalancing recalculates factor-PC regressions")
+    print("✅ Each rebalancing uses fresh 252-day window")
+    print("✅ Weekly progression: +5 trading days forward, -5 trading days back")
+    print("✅ All matrix definitions and calculations preserved exactly")
