@@ -362,172 +362,142 @@ class UltimateDetailedStrategy:
     ###########################################################################
 
     def optimize_portfolio(self, current_prices, stock_betas=None):
-        """Simple, guaranteed-to-work optimization with exact constraints"""
         N = len(self.r_hat_weighted)
         C_total = self.C_0
 
-        # Validate inputs
-        if (len(current_prices) != N or np.any(np.isnan(current_prices)) or
-                np.any(current_prices <= 0) or np.any(np.isnan(self.r_hat_weighted))):
+        if len(current_prices) != N or np.any(np.isnan(current_prices)) or np.any(np.isinf(current_prices)) or np.any(
+                current_prices <= 0):
+            return np.zeros(N)
+        if np.any(np.isnan(self.r_hat_weighted)) or np.any(np.isinf(self.r_hat_weighted)):
             return np.zeros(N)
 
-        # STORE ORIGINAL VALUES to prevent modification
-        original_r_hat = self.r_hat_weighted.copy()
+        r_hat_scaled = self.r_hat_weighted * 100
 
-        # 1. Separate stocks by predicted return sign
-        long_mask = original_r_hat >= 0
-        short_mask = original_r_hat < 0
+        def objective(v):
+            return -np.dot(v, r_hat_scaled)
 
-        n_long = np.sum(long_mask)
-        n_short = np.sum(short_mask)
+        constraints = []
 
-        print(f"DEBUG: {n_long} long candidates, {n_short} short candidates")
+        def total_allocation_constraint(v):
+            return np.sum(np.abs(v)) - C_total  # Should equal 0
 
-        # If no valid positions, return zeros
-        if n_long == 0 and n_short == 0:
-            return np.zeros(N)
+        constraints.append({'type': 'eq', 'fun': total_allocation_constraint})
 
-        # 2. Calculate target allocations
-        target_long = 0.65 * C_total  # $6,500
-        target_short = 0.35 * C_total  # $3,500
+        def market_neutral_constraint(v):
+            return np.sum(v)  # Should equal 0
 
-        # 3. Initialize weights
-        weights = np.zeros(N)
+        constraints.append({'type': 'eq', 'fun': market_neutral_constraint})
+        # ADD market neutrality constraint
+        def market_neutral_constraint(v):
+            return np.sum(v)  # Should equal 0
 
-        # 4. Handle BOTH longs and shorts in the SAME function
-        if n_long > 0:
-            long_returns = original_r_hat[long_mask]
-            print(f"DEBUG: Long returns range: {np.min(long_returns):.4f} to {np.max(long_returns):.4f}")
+        constraints.append({'type': 'eq', 'fun': market_neutral_constraint})
+        def long_allocation_constraint(v):
+            long_positions = np.sum(v[v > 0])
+            return long_positions - 0.55 * C_total
 
-            # Simple proportional allocation
-            if np.sum(long_returns) > 0:
-                long_weights = long_returns / np.sum(long_returns) * target_long
-            else:
-                long_weights = np.ones(n_long) * target_long / n_long
+        def long_allocation_upper(v):
+            return 0.75 * C_total - np.sum(v[v > 0])
 
-            weights[long_mask] = long_weights
+        constraints.append({'type': 'ineq', 'fun': long_allocation_constraint})
+        constraints.append({'type': 'ineq', 'fun': long_allocation_upper})
 
-        if n_short > 0:
-            short_returns = np.abs(original_r_hat[short_mask])  # Use magnitude
-            print(f"DEBUG: Short returns range: {np.min(short_returns):.4f} to {np.max(short_returns):.4f}")
+        def short_allocation_constraint(v):
+            short_positions = np.abs(np.sum(v[v < 0]))
+            return short_positions - 0.25 * C_total
 
-            # Simple proportional allocation
-            if np.sum(short_returns) > 0:
-                short_weights = short_returns / np.sum(short_returns) * target_short
-            else:
-                short_weights = np.ones(n_short) * target_short / n_short
+        def short_allocation_upper(v):
+            return 0.45 * C_total - np.abs(np.sum(v[v < 0]))
 
-            weights[short_mask] = -short_weights  # Make negative
+        constraints.append({'type': 'ineq', 'fun': short_allocation_constraint})
+        constraints.append({'type': 'ineq', 'fun': short_allocation_upper})
 
-        # 5. Apply position limits
-        weights = self._apply_position_limits(weights, C_total, target_short)
-
-        # 6. ENFORCE EXACT 65/35 ALLOCATION
-        weights = self._enforce_exact_allocation(weights, target_long, target_short)
-
-        # 7. Apply beta constraint if needed
         if stock_betas is not None:
-            weights = self._apply_beta_constraint_simple(weights, stock_betas, C_total)
-            weights = self._enforce_exact_allocation(weights, target_long, target_short)
+            def portfolio_beta_constraint(v):
+                portfolio_beta = np.abs(np.dot(v, stock_betas) / C_total)
+                return 0.1 - portfolio_beta
 
-        self.optimal_weights = weights
-        self.share_quantities = weights / current_prices
+            constraints.append({'type': 'ineq', 'fun': portfolio_beta_constraint})
 
-        # 8. VALIDATE WITH THE SAME DATA
-        self._validate_with_original_data(weights, original_r_hat, C_total, target_long, target_short)
+        bounds = []
+        for i in range(N):
+            if r_hat_scaled[i] >= 0:
+                bound = (0, 0.15 * C_total)
+            else:
+                bound = (-0.12 * C_total, 0.15 * C_total)
+            bounds.append(bound)
 
-        return weights
+        v0 = np.zeros(N)
+        long_stocks = r_hat_scaled >= 0
+        short_stocks = r_hat_scaled < 0
 
-    def _apply_position_limits(self, weights, C_total, target_short):
-        """Apply individual position limits"""
-        max_long_per_stock = 0.15 * C_total  # $1,500
-        max_short_per_stock = 0.12 * C_total  # $1,200
-        max_short_concentration = 0.25 * target_short  # $875
+        if np.any(long_stocks):
+            v0[long_stocks] = (0.65 * C_total) / np.sum(long_stocks)
+        if np.any(short_stocks):
+            v0[short_stocks] = -(0.35 * C_total) / np.sum(short_stocks)
 
-        # Long limits
-        long_positions = weights > 0
-        if np.any(long_positions):
-            weights[long_positions] = np.minimum(weights[long_positions], max_long_per_stock)
+        if stock_betas is not None:
+            portfolio_beta = np.dot(v0, stock_betas) / C_total
+            if abs(portfolio_beta) > 0.1:
+                scaling_factor = 0.1 / abs(portfolio_beta)
+                v0 *= scaling_factor
 
-        # Short limits (take minimum of both constraints)
-        short_positions = weights < 0
-        if np.any(short_positions):
-            short_limit = np.minimum(max_short_per_stock, max_short_concentration)
-            weights[short_positions] = np.maximum(weights[short_positions], -short_limit)
+        try:
+            result = opt.minimize(objective, v0, method='SLSQP', bounds=bounds,
+                                  constraints=constraints, options={'maxiter': 2000, 'ftol': 1e-8, 'disp': False})
+            if result.success and np.sum(np.abs(result.x)) > 1e-6:
+                self.optimal_weights = result.x
+                self.slsqp_success_count += 1
+            else:
+                self.optimal_weights = self._least_squares_fallback(r_hat_scaled, bounds, stock_betas, C_total)
+                self.lsq_fallback_count += 1
+        except Exception:
+            self.optimal_weights = self._least_squares_fallback(r_hat_scaled, bounds, stock_betas, C_total)
+            self.lsq_fallback_count += 1
 
-        return weights
-
-    def _enforce_exact_allocation(self, weights, target_long, target_short):
-        """Force exact 65/35 allocation"""
-        current_long = np.sum(weights[weights > 0])
-        current_short = np.abs(np.sum(weights[weights < 0]))
-
-        # Scale longs to exact target
-        if current_long > 0:
-            weights[weights > 0] *= target_long / current_long
-
-        # Scale shorts to exact target
-        if current_short > 0:
-            weights[weights < 0] *= target_short / current_short
-
-        return weights
-
-    def _apply_beta_constraint_simple(self, weights, stock_betas, C_total):
-        """Simple beta constraint"""
-        current_beta = np.abs(np.dot(weights, stock_betas) / C_total)
-        max_beta = 0.1
-
-        if current_beta <= max_beta:
-            return weights
-
-        # Simple scaling to reduce beta
-        reduction_factor = max_beta / current_beta
-        return weights * reduction_factor
-
-    def _validate_with_original_data(self, weights, original_r_hat, C_total, target_long, target_short):
-        """Validation using the same data as optimization"""
-        # Check short-only constraint
-        wrong_short = np.sum((weights < 0) & (original_r_hat >= 0))
-        wrong_long = np.sum((weights > 0) & (original_r_hat < 0))
-
-        # Calculate allocations
-        actual_long = np.sum(weights[weights > 0])
-        actual_short = np.abs(np.sum(weights[weights < 0]))
-        actual_total = actual_long + actual_short
-        actual_net = np.sum(weights)
-
-        print(f"=== EXACT VALIDATION ===")
-        print(f"Long: ${actual_long:.0f} (target: ${target_long:.0f})")
-        print(f"Short: ${actual_short:.0f} (target: ${target_short:.0f})")
-        print(f"Total: ${actual_total:.0f} (target: ${C_total:.0f})")
-        print(f"Net: ${actual_net:.0f} (target: $0)")
-        print(f"Wrong shorts: {wrong_short}, Wrong longs: {wrong_long}")
-
-        # Check if we have both longs and shorts
-        has_long = actual_long > 1
-        has_short = actual_short > 1
-        print(f"Has longs: {has_long}, Has shorts: {has_short}")
-
-        if not has_long or not has_short:
-            print("WARNING: Missing either longs or shorts!")
-            print(f"Original long candidates: {np.sum(original_r_hat >= 0)}")
-            print(f"Original short candidates: {np.sum(original_r_hat < 0)}")
+        self.share_quantities = self.optimal_weights / current_prices
+        return self.optimal_weights
 
     def _least_squares_fallback(self, r_hat_scaled, bounds, stock_betas, C_total):
-        """Fallback - use simple proportional allocation"""
-        # Use the same logic as main optimizer but simpler
+        """Proper least squares fallback"""
         N = len(r_hat_scaled)
-        weights = np.zeros(N)
 
-        long_mask = r_hat_scaled >= 0
-        short_mask = r_hat_scaled < 0
+        target = np.zeros(N)
+        long_stocks = r_hat_scaled >= 0
+        short_stocks = r_hat_scaled < 0
 
-        if np.any(long_mask):
-            weights[long_mask] = 0.65 * C_total / np.sum(long_mask)
-        if np.any(short_mask):
-            weights[short_mask] = -0.35 * C_total / np.sum(short_mask)
+        if np.any(long_stocks):
+            long_returns = r_hat_scaled[long_stocks]
+            if np.sum(long_returns) > 0:
+                long_weights = long_returns / np.sum(long_returns) * (0.65 * C_total)
+                target[long_stocks] = long_weights
 
-        return weights
+        if np.any(short_stocks):
+            short_returns = np.abs(r_hat_scaled[short_stocks])
+            if np.sum(short_returns) > 0:
+                short_weights = -(short_returns / np.sum(short_returns) * (0.35 * C_total))
+                target[short_stocks] = short_weights
+
+        if stock_betas is not None:
+            target_beta = np.dot(target, stock_betas) / C_total
+            if abs(target_beta) > 0.1:
+                scaling_factor = 0.1 / abs(target_beta)
+                target *= scaling_factor
+
+        lb = np.array([b[0] for b in bounds])
+        ub = np.array([b[1] for b in bounds])
+
+        try:
+            A = np.eye(N)
+            res = lsq_linear(A, target, bounds=(lb, ub), method='bvls')
+
+            if res.success and np.sum(np.abs(res.x)) > 1e-6:
+                return res.x
+            else:
+                return np.clip(target, lb, ub)
+
+        except Exception:
+            return np.clip(target, lb, ub)
 
     ###########################################################################
     # TRADE EXECUTION AND PERFORMANCE TRACKING
