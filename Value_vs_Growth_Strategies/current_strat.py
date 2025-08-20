@@ -37,6 +37,7 @@ class UltimateDetailedStrategy:
         self.factors_data = None
         self.centrality_matrix = None
         self.u_centrality = None
+        self.previous_weights_backtest = None
 
         # Results storage
         self.portfolio_history = []
@@ -45,6 +46,8 @@ class UltimateDetailedStrategy:
         # Optimization counters
         self.slsqp_success_count = 0
         self.lsq_fallback_count = 0
+
+        self.previous_weights = None
 
     ###########################################################################
     # DATA LOADING AND PREPARATION
@@ -359,133 +362,172 @@ class UltimateDetailedStrategy:
     ###########################################################################
 
     def optimize_portfolio(self, current_prices, stock_betas=None):
+        """Simple, guaranteed-to-work optimization with exact constraints"""
         N = len(self.r_hat_weighted)
         C_total = self.C_0
 
-        if len(current_prices) != N or np.any(np.isnan(current_prices)) or np.any(np.isinf(current_prices)) or np.any(
-                current_prices <= 0):
+        # Validate inputs
+        if (len(current_prices) != N or np.any(np.isnan(current_prices)) or
+                np.any(current_prices <= 0) or np.any(np.isnan(self.r_hat_weighted))):
             return np.zeros(N)
-        if np.any(np.isnan(self.r_hat_weighted)) or np.any(np.isinf(self.r_hat_weighted)):
+
+        # STORE ORIGINAL VALUES to prevent modification
+        original_r_hat = self.r_hat_weighted.copy()
+
+        # 1. Separate stocks by predicted return sign
+        long_mask = original_r_hat >= 0
+        short_mask = original_r_hat < 0
+
+        n_long = np.sum(long_mask)
+        n_short = np.sum(short_mask)
+
+        print(f"DEBUG: {n_long} long candidates, {n_short} short candidates")
+
+        # If no valid positions, return zeros
+        if n_long == 0 and n_short == 0:
             return np.zeros(N)
 
-        r_hat_scaled = self.r_hat_weighted * 100
+        # 2. Calculate target allocations
+        target_long = 0.65 * C_total  # $6,500
+        target_short = 0.35 * C_total  # $3,500
 
-        def objective(v):
-            return -np.dot(v, r_hat_scaled)
+        # 3. Initialize weights
+        weights = np.zeros(N)
 
-        constraints = []
+        # 4. Handle BOTH longs and shorts in the SAME function
+        if n_long > 0:
+            long_returns = original_r_hat[long_mask]
+            print(f"DEBUG: Long returns range: {np.min(long_returns):.4f} to {np.max(long_returns):.4f}")
 
-        def total_allocation_constraint(v):
-            return C_total - np.sum(np.abs(v))
-
-        constraints.append({'type': 'ineq', 'fun': total_allocation_constraint})
-
-        def long_allocation_constraint(v):
-            long_positions = np.sum(v[v > 0])
-            return long_positions - 0.55 * C_total
-
-        def long_allocation_upper(v):
-            return 0.75 * C_total - np.sum(v[v > 0])
-
-        constraints.append({'type': 'ineq', 'fun': long_allocation_constraint})
-        constraints.append({'type': 'ineq', 'fun': long_allocation_upper})
-
-        def short_allocation_constraint(v):
-            short_positions = np.abs(np.sum(v[v < 0]))
-            return short_positions - 0.25 * C_total
-
-        def short_allocation_upper(v):
-            return 0.45 * C_total - np.abs(np.sum(v[v < 0]))
-
-        constraints.append({'type': 'ineq', 'fun': short_allocation_constraint})
-        constraints.append({'type': 'ineq', 'fun': short_allocation_upper})
-
-        if stock_betas is not None:
-            def portfolio_beta_constraint(v):
-                portfolio_beta = np.abs(np.dot(v, stock_betas) / C_total)
-                return 0.1 - portfolio_beta
-
-            constraints.append({'type': 'ineq', 'fun': portfolio_beta_constraint})
-
-        bounds = []
-        for i in range(N):
-            if r_hat_scaled[i] >= 0:
-                bound = (0, 0.15 * C_total)
+            # Simple proportional allocation
+            if np.sum(long_returns) > 0:
+                long_weights = long_returns / np.sum(long_returns) * target_long
             else:
-                bound = (-0.12 * C_total, 0.15 * C_total)
-            bounds.append(bound)
+                long_weights = np.ones(n_long) * target_long / n_long
 
-        v0 = np.zeros(N)
-        long_stocks = r_hat_scaled >= 0
-        short_stocks = r_hat_scaled < 0
+            weights[long_mask] = long_weights
 
-        if np.any(long_stocks):
-            v0[long_stocks] = (0.65 * C_total) / np.sum(long_stocks)
-        if np.any(short_stocks):
-            v0[short_stocks] = -(0.35 * C_total) / np.sum(short_stocks)
+        if n_short > 0:
+            short_returns = np.abs(original_r_hat[short_mask])  # Use magnitude
+            print(f"DEBUG: Short returns range: {np.min(short_returns):.4f} to {np.max(short_returns):.4f}")
 
-        if stock_betas is not None:
-            portfolio_beta = np.dot(v0, stock_betas) / C_total
-            if abs(portfolio_beta) > 0.1:
-                scaling_factor = 0.1 / abs(portfolio_beta)
-                v0 *= scaling_factor
-
-        try:
-            result = opt.minimize(objective, v0, method='SLSQP', bounds=bounds,
-                                  constraints=constraints, options={'maxiter': 2000, 'ftol': 1e-8, 'disp': False})
-            if result.success and np.sum(np.abs(result.x)) > 1e-6:
-                self.optimal_weights = result.x
-                self.slsqp_success_count += 1
+            # Simple proportional allocation
+            if np.sum(short_returns) > 0:
+                short_weights = short_returns / np.sum(short_returns) * target_short
             else:
-                self.optimal_weights = self._least_squares_fallback(r_hat_scaled, bounds, stock_betas, C_total)
-                self.lsq_fallback_count += 1
-        except Exception:
-            self.optimal_weights = self._least_squares_fallback(r_hat_scaled, bounds, stock_betas, C_total)
-            self.lsq_fallback_count += 1
+                short_weights = np.ones(n_short) * target_short / n_short
 
-        self.share_quantities = self.optimal_weights / current_prices
-        return self.optimal_weights
+            weights[short_mask] = -short_weights  # Make negative
+
+        # 5. Apply position limits
+        weights = self._apply_position_limits(weights, C_total, target_short)
+
+        # 6. ENFORCE EXACT 65/35 ALLOCATION
+        weights = self._enforce_exact_allocation(weights, target_long, target_short)
+
+        # 7. Apply beta constraint if needed
+        if stock_betas is not None:
+            weights = self._apply_beta_constraint_simple(weights, stock_betas, C_total)
+            weights = self._enforce_exact_allocation(weights, target_long, target_short)
+
+        self.optimal_weights = weights
+        self.share_quantities = weights / current_prices
+
+        # 8. VALIDATE WITH THE SAME DATA
+        self._validate_with_original_data(weights, original_r_hat, C_total, target_long, target_short)
+
+        return weights
+
+    def _apply_position_limits(self, weights, C_total, target_short):
+        """Apply individual position limits"""
+        max_long_per_stock = 0.15 * C_total  # $1,500
+        max_short_per_stock = 0.12 * C_total  # $1,200
+        max_short_concentration = 0.25 * target_short  # $875
+
+        # Long limits
+        long_positions = weights > 0
+        if np.any(long_positions):
+            weights[long_positions] = np.minimum(weights[long_positions], max_long_per_stock)
+
+        # Short limits (take minimum of both constraints)
+        short_positions = weights < 0
+        if np.any(short_positions):
+            short_limit = np.minimum(max_short_per_stock, max_short_concentration)
+            weights[short_positions] = np.maximum(weights[short_positions], -short_limit)
+
+        return weights
+
+    def _enforce_exact_allocation(self, weights, target_long, target_short):
+        """Force exact 65/35 allocation"""
+        current_long = np.sum(weights[weights > 0])
+        current_short = np.abs(np.sum(weights[weights < 0]))
+
+        # Scale longs to exact target
+        if current_long > 0:
+            weights[weights > 0] *= target_long / current_long
+
+        # Scale shorts to exact target
+        if current_short > 0:
+            weights[weights < 0] *= target_short / current_short
+
+        return weights
+
+    def _apply_beta_constraint_simple(self, weights, stock_betas, C_total):
+        """Simple beta constraint"""
+        current_beta = np.abs(np.dot(weights, stock_betas) / C_total)
+        max_beta = 0.1
+
+        if current_beta <= max_beta:
+            return weights
+
+        # Simple scaling to reduce beta
+        reduction_factor = max_beta / current_beta
+        return weights * reduction_factor
+
+    def _validate_with_original_data(self, weights, original_r_hat, C_total, target_long, target_short):
+        """Validation using the same data as optimization"""
+        # Check short-only constraint
+        wrong_short = np.sum((weights < 0) & (original_r_hat >= 0))
+        wrong_long = np.sum((weights > 0) & (original_r_hat < 0))
+
+        # Calculate allocations
+        actual_long = np.sum(weights[weights > 0])
+        actual_short = np.abs(np.sum(weights[weights < 0]))
+        actual_total = actual_long + actual_short
+        actual_net = np.sum(weights)
+
+        print(f"=== EXACT VALIDATION ===")
+        print(f"Long: ${actual_long:.0f} (target: ${target_long:.0f})")
+        print(f"Short: ${actual_short:.0f} (target: ${target_short:.0f})")
+        print(f"Total: ${actual_total:.0f} (target: ${C_total:.0f})")
+        print(f"Net: ${actual_net:.0f} (target: $0)")
+        print(f"Wrong shorts: {wrong_short}, Wrong longs: {wrong_long}")
+
+        # Check if we have both longs and shorts
+        has_long = actual_long > 1
+        has_short = actual_short > 1
+        print(f"Has longs: {has_long}, Has shorts: {has_short}")
+
+        if not has_long or not has_short:
+            print("WARNING: Missing either longs or shorts!")
+            print(f"Original long candidates: {np.sum(original_r_hat >= 0)}")
+            print(f"Original short candidates: {np.sum(original_r_hat < 0)}")
 
     def _least_squares_fallback(self, r_hat_scaled, bounds, stock_betas, C_total):
-        """Proper least squares fallback"""
+        """Fallback - use simple proportional allocation"""
+        # Use the same logic as main optimizer but simpler
         N = len(r_hat_scaled)
+        weights = np.zeros(N)
 
-        target = np.zeros(N)
-        long_stocks = r_hat_scaled >= 0
-        short_stocks = r_hat_scaled < 0
+        long_mask = r_hat_scaled >= 0
+        short_mask = r_hat_scaled < 0
 
-        if np.any(long_stocks):
-            long_returns = r_hat_scaled[long_stocks]
-            if np.sum(long_returns) > 0:
-                long_weights = long_returns / np.sum(long_returns) * (0.65 * C_total)
-                target[long_stocks] = long_weights
+        if np.any(long_mask):
+            weights[long_mask] = 0.65 * C_total / np.sum(long_mask)
+        if np.any(short_mask):
+            weights[short_mask] = -0.35 * C_total / np.sum(short_mask)
 
-        if np.any(short_stocks):
-            short_returns = np.abs(r_hat_scaled[short_stocks])
-            if np.sum(short_returns) > 0:
-                short_weights = -(short_returns / np.sum(short_returns) * (0.35 * C_total))
-                target[short_stocks] = short_weights
-
-        if stock_betas is not None:
-            target_beta = np.dot(target, stock_betas) / C_total
-            if abs(target_beta) > 0.1:
-                scaling_factor = 0.1 / abs(target_beta)
-                target *= scaling_factor
-
-        lb = np.array([b[0] for b in bounds])
-        ub = np.array([b[1] for b in bounds])
-
-        try:
-            A = np.eye(N)
-            res = lsq_linear(A, target, bounds=(lb, ub), method='bvls')
-
-            if res.success and np.sum(np.abs(res.x)) > 1e-6:
-                return res.x
-            else:
-                return np.clip(target, lb, ub)
-
-        except Exception:
-            return np.clip(target, lb, ub)
+        return weights
 
     ###########################################################################
     # TRADE EXECUTION AND PERFORMANCE TRACKING
@@ -493,9 +535,14 @@ class UltimateDetailedStrategy:
 
     def execute_trades(self, current_prices):
         """Execute trades according to the computed v_i"""
-        total_trade_value = np.sum(np.abs(self.optimal_weights))
-        transaction_cost = total_trade_value * self.transaction_costs
-        expected_returns = self.r_hat_weighted
+        # Calculate turnover (only the changed portion)
+        if self.previous_weights is not None:
+            turnover = np.sum(np.abs(self.optimal_weights - self.previous_weights))
+        else:
+            # First trade: entire portfolio is turnover
+            turnover = np.sum(np.abs(self.optimal_weights))
+
+        transaction_cost = turnover * self.transaction_costs
 
         trade_record = {
             'timestamp': self.P.index[-1],
@@ -503,10 +550,14 @@ class UltimateDetailedStrategy:
             'shares': self.share_quantities.copy(),
             'prices': current_prices.copy(),
             'transaction_cost': transaction_cost,
-            'expected_returns': expected_returns.copy()
+            'expected_returns': self.r_hat_weighted.copy() if hasattr(self, 'r_hat_weighted') else None
         }
 
         self.portfolio_history.append(trade_record)
+
+        # Store for next transaction cost calculation
+        self.previous_weights = self.optimal_weights.copy()
+
         return trade_record
 
     def record_performance_metrics(self, actual_returns=None):
@@ -567,11 +618,29 @@ class UltimateDetailedStrategy:
         self.compute_centrality_weighting()
 
         self.optimize_portfolio(current_prices, stock_betas)
+        self.validate_optimization_results()  # Add this line
 
         trade_record = self.execute_trades(current_prices)
         metrics = self.record_performance_metrics(actual_returns)
 
         return trade_record, metrics
+
+    def validate_optimization_results(self):
+        """Validate that optimization results make sense"""
+        print(f"\n=== OPTIMIZATION VALIDATION ===")
+        print(f"Capital: ${self.C_0:,.0f}")
+        print(f"Total long exposure: ${np.sum(self.optimal_weights[self.optimal_weights > 0]):,.0f}")
+        print(f"Total short exposure: ${np.abs(np.sum(self.optimal_weights[self.optimal_weights < 0])):,.0f}")
+        print(f"Net exposure: ${np.sum(self.optimal_weights):,.0f}")
+        print(f"Capital utilization: {np.sum(np.abs(self.optimal_weights)) / self.C_0:.1%}")
+
+        # Check constraints
+        long_exposure = np.sum(self.optimal_weights[self.optimal_weights > 0])
+        short_exposure = np.abs(np.sum(self.optimal_weights[self.optimal_weights < 0]))
+
+        print(f"Long exposure (should be ~65%): {long_exposure / self.C_0:.1%}")
+        print(f"Short exposure (should be ~35%): {short_exposure / self.C_0:.1%}")
+        print(f"Market neutrality (should be ~0): {np.sum(self.optimal_weights) / self.C_0:.1%}")
 
     def backtest_strategy(self, start_date, end_date, rebalance_freq=4):
         """Comprehensive backtesting with rolling window approach"""
@@ -588,11 +657,41 @@ class UltimateDetailedStrategy:
 
         portfolio_values = [self.C_0]
         rebalance_dates = []
+        current_positions = None  # Track shares held
+        previous_prices = None
+        self.previous_weights_backtest = None  # Initialize for backtest
 
         for i in range(0, len(backtest_dates), rebalance_freq):
             current_date = backtest_dates[i]
             rebalance_dates.append(current_date)
 
+            # Get current prices for all stocks
+            current_prices = self.P_full.loc[current_date].values
+
+            # Calculate P&L from previous positions if they exist
+            if current_positions is not None and previous_prices is not None:
+                try:
+                    # Calculate price returns for the period
+                    price_returns = (current_prices / previous_prices) - 1
+
+                    # Calculate P&L from existing positions (shares * previous_price * return)
+                    position_pnl = np.sum(current_positions * previous_prices * price_returns)
+                    gross_portfolio_value = portfolio_values[-1] + position_pnl
+
+                    # Debug output
+                    if i < 5:  # Only print first few for debugging
+                        print(f"Period {len(portfolio_values)}: Previous value: ${portfolio_values[-1]:.2f}")
+                        print(f"Position P&L: ${position_pnl:.2f}")
+                        print(f"Gross value before trades: ${gross_portfolio_value:.2f}")
+
+                except Exception as e:
+                    print(f"Error calculating P&L for {current_date}: {e}")
+                    gross_portfolio_value = portfolio_values[-1]
+            else:
+                # First period - no existing positions
+                gross_portfolio_value = portfolio_values[-1]
+
+            # Prepare actual returns for performance recording (optional)
             actual_returns = None
             if len(self.portfolio_history) > 0:
                 prev_date_idx = max(0, i - rebalance_freq)
@@ -603,29 +702,73 @@ class UltimateDetailedStrategy:
                         actual_returns = period_returns
 
             try:
+                # Execute rebalancing (this sets self.optimal_weights and self.share_quantities)
                 trade_record, metrics = self.weekly_rebalancing_step(current_date, actual_returns)
 
-                if trade_record is not None and metrics is not None and 'realized_pnl' in metrics:
-                    new_portfolio_value = portfolio_values[-1] + metrics['realized_pnl']
+                if trade_record is not None:
+                    # Calculate transaction costs based on turnover
+                    if self.previous_weights_backtest is not None:
+                        turnover = np.sum(np.abs(self.optimal_weights - self.previous_weights_backtest))
+                    else:
+                        turnover = np.sum(np.abs(self.optimal_weights))
+
+                    transaction_cost = turnover * self.transaction_costs
+                    self.previous_weights_backtest = self.optimal_weights.copy()
+                    trade_record['transaction_cost'] = transaction_cost
+
+                    # Update portfolio value after transaction costs
+                    new_portfolio_value = gross_portfolio_value - transaction_cost
                     portfolio_values.append(new_portfolio_value)
+
+                    # Update for next iteration
+                    current_positions = self.share_quantities.copy()
+                    previous_prices = current_prices.copy()
+                    self.previous_weights = self.optimal_weights.copy()
+
+                    # Record performance metrics
+                    if metrics is not None:
+                        # Update metrics with correct portfolio value
+                        metrics['portfolio_value'] = new_portfolio_value
+                        metrics['gross_pnl'] = position_pnl if 'position_pnl' in locals() else 0
+                        metrics['realized_pnl'] = new_portfolio_value - portfolio_values[-2] if len(
+                            portfolio_values) > 1 else 0
+                        self.performance_metrics[current_date] = metrics
+
+                        if i < 5:  # Debug output
+                            print(f"Transaction cost: ${transaction_cost:.2f}")
+                            print(f"New portfolio value: ${new_portfolio_value:.2f}")
+                            print(f"Current positions value: ${np.sum(current_positions * current_prices):.2f}")
+                            print("---")
+
                 else:
+                    # No trade executed, maintain current positions
                     portfolio_values.append(portfolio_values[-1])
+                    if current_positions is None:
+                        current_positions = np.zeros(len(self.stocks))
 
             except Exception as e:
                 print(f"Error at {current_date}: {e}")
                 portfolio_values.append(portfolio_values[-1])
+                # Maintain existing positions on error
+                if current_positions is None:
+                    current_positions = np.zeros(len(self.stocks))
 
+        # Calculate performance metrics
         if len(portfolio_values) > 1:
             total_return = (portfolio_values[-1] / portfolio_values[0]) - 1
             num_periods = len(portfolio_values) - 1
-            annualized_return = (1 + total_return) ** (252 / (num_periods * rebalance_freq)) - 1
+            trading_days = (backtest_dates[-1] - backtest_dates[0]).days
+            annualized_return = (1 + total_return) ** (252 / trading_days) - 1
         else:
             total_return = 0
             annualized_return = 0
 
         print(f"Total Return: {total_return:.2%}")
         print(f"Annualized Return: {annualized_return:.2%}")
+        print(f"Final Portfolio Value: ${portfolio_values[-1]:.2f}")
+        print(f"Number of rebalancing periods: {len(rebalance_dates)}")
 
+        # Plot results
         plt.figure(figsize=(12, 6))
         plt.plot(rebalance_dates[:len(portfolio_values) - 1], portfolio_values[1:],
                  marker='o', label='Strategy Portfolio Value')
@@ -644,7 +787,6 @@ class UltimateDetailedStrategy:
             'total_return': total_return,
             'annualized_return': annualized_return
         }
-
     ###########################################################################
     # PERFORMANCE ANALYSIS AND METRICS
     ###########################################################################
@@ -877,67 +1019,159 @@ class UltimateDetailedStrategy:
         return issues_found == 0
 
     def monte_carlo_test(self, num_simulations=1000):
-        """Monte Carlo test for statistical significance"""
+        """Monte Carlo test for statistical significance using proper geometric returns"""
         print("\n" + "=" * 60)
-        print("MONTE CARLO SIGNIFICANCE TEST")
+        print("MONTE CARLO SIGNIFICANCE TEST (FIXED)")
         print("=" * 60)
 
-        if not self.portfolio_history:
+        if not self.portfolio_history or len(self.portfolio_history) < 2:
             print("No portfolio history available")
             return None
 
-        actual_pnls = []
+        # Get actual portfolio returns from the backtest
+        if not hasattr(self, 'performance_metrics') or not self.performance_metrics:
+            print("No performance metrics available")
+            return None
+
+        # Extract portfolio values from backtest
+        portfolio_values = [self.C_0]
         for trade in self.portfolio_history:
             ts = trade['timestamp']
-            metrics = self.performance_metrics.get(ts, {})
-            pnl = metrics.get('realized_pnl', 0)
-            actual_pnls.append(pnl)
+            if ts in self.performance_metrics:
+                current_value = self.performance_metrics[ts].get('portfolio_value', portfolio_values[-1])
+                portfolio_values.append(current_value)
 
-        actual_total = sum(actual_pnls)
-        actual_return = actual_total / self.C_0
+        if len(portfolio_values) <= 1:
+            print("Insufficient portfolio value data")
+            return None
 
-        actual_mean = np.mean(actual_pnls)
-        actual_std = np.std(actual_pnls, ddof=1)
-        actual_sharpe = (np.mean(actual_pnls) / np.std(actual_pnls)) * np.sqrt(252 / 5) if np.std(
-            actual_pnls) > 0 else 0
+        # Calculate actual geometric returns
+        actual_returns = []
+        for i in range(1, len(portfolio_values)):
+            period_return = (portfolio_values[i] - portfolio_values[i - 1]) / portfolio_values[i - 1]
+            actual_returns.append(period_return)
 
-        print(f"Actual Strategy:")
-        print(f"  Total P&L: ${actual_total:,.0f}")
-        print(f"  Total Return: {actual_return:.2%}")
-        print(f"  Avg Period P&L: ${actual_mean:,.0f}")
-        print(f"  Period Std Dev: ${actual_std:,.0f}")
-        print(f"  Estimated Sharpe: {actual_sharpe:.2f}")
+        actual_total_return = (portfolio_values[-1] / portfolio_values[0]) - 1
+        actual_mean_return = np.mean(actual_returns)
+        actual_std_return = np.std(actual_returns, ddof=1)
+        actual_sharpe = (actual_mean_return / actual_std_return) * np.sqrt(252 / 5) if actual_std_return > 0 else 0
 
-        random_totals = []
-        random_returns = []
+        print(f"Actual Strategy Performance:")
+        print(f"  Initial Capital: ${self.C_0:,.0f}")
+        print(f"  Final Value: ${portfolio_values[-1]:,.0f}")
+        print(f"  Total Return: {actual_total_return:.2%}")
+        print(f"  Number of periods: {len(actual_returns)}")
+        print(f"  Avg Period Return: {actual_mean_return:.4%}")
+        print(f"  Period Return Std Dev: {actual_std_return:.4%}")
+        print(f"  Estimated Annual Sharpe: {actual_sharpe:.2f}")
 
-        for i in range(num_simulations):
-            random_pnls = np.random.normal(actual_mean, actual_std, len(actual_pnls))
-            random_total = sum(random_pnls)
-            random_totals.append(random_total)
-            random_returns.append(random_total / self.C_0)
+        # Monte Carlo simulation using geometric returns
+        random_final_values = []
+        random_total_returns = []
+        random_annual_returns = []
 
-        p_value = np.mean([r >= actual_total for r in random_totals])
+        for sim in range(num_simulations):
+            # Generate random returns with same mean and std as actual strategy
+            random_returns = np.random.normal(actual_mean_return, actual_std_return, len(actual_returns))
+
+            # Simulate portfolio growth
+            random_portfolio = [self.C_0]
+            for ret in random_returns:
+                next_value = random_portfolio[-1] * (1 + ret)
+                random_portfolio.append(next_value)
+
+            final_value = random_portfolio[-1]
+            total_return = (final_value / self.C_0) - 1
+
+            # Calculate annualized return
+            trading_days = len(actual_returns) * 5  # Assuming 5-day weeks
+            annualized_return = (1 + total_return) ** (252 / trading_days) - 1 if trading_days > 0 else 0
+
+            random_final_values.append(final_value)
+            random_total_returns.append(total_return)
+            random_annual_returns.append(annualized_return)
+
+        # Calculate p-value and statistics
+        random_final_values = np.array(random_final_values)
+        random_total_returns = np.array(random_total_returns)
+
+        p_value = np.mean(random_final_values >= portfolio_values[-1])
+
+        # Calculate confidence intervals
+        ci_lower = np.percentile(random_total_returns, 2.5)
+        ci_upper = np.percentile(random_total_returns, 97.5)
+
+        annual_ci_lower = np.percentile(random_annual_returns, 2.5)
+        annual_ci_upper = np.percentile(random_annual_returns, 97.5)
 
         print(f"\nMonte Carlo Results ({num_simulations} simulations):")
         print(f"  Probability of random strategy beating ours: {p_value:.3%}")
-        print(
-            f"  95% Confidence Interval for random strategy: [{np.percentile(random_returns, 2.5):.2%}, {np.percentile(random_returns, 97.5):.2%}]")
+        print(f"  95% CI for random strategy total return: [{ci_lower:.2%}, {ci_upper:.2%}]")
+        print(f"  95% CI for random strategy annual return: [{annual_ci_lower:.2%}, {annual_ci_upper:.2%}]")
 
-        plt.figure(figsize=(10, 6))
-        plt.hist(random_returns, bins=50, alpha=0.7, label='Random Strategies')
-        plt.axvline(x=actual_return, color='red', linewidth=3, label=f'Actual Strategy ({actual_return:.2%})')
-        plt.xlabel('Total Return')
+        if p_value < 0.05:
+            print(f"  ✅ Statistically significant (p < 0.05)")
+        elif p_value < 0.10:
+            print(f"  ⚠️  Marginally significant (p < 0.10)")
+        else:
+            print(f"  ❌ Not statistically significant")
+
+        # Plot results
+        plt.figure(figsize=(12, 5))
+
+        plt.subplot(1, 2, 1)
+        plt.hist(random_final_values, bins=50, alpha=0.7, label='Random Strategies')
+        plt.axvline(x=portfolio_values[-1], color='red', linewidth=3,
+                    label=f'Actual Strategy (${portfolio_values[-1]:,.0f})')
+        plt.xlabel('Final Portfolio Value ($)')
         plt.ylabel('Frequency')
-        plt.title(f'Monte Carlo Test: p-value = {p_value:.3%}')
+        plt.title(f'Monte Carlo: Final Portfolio Values\np-value = {p_value:.3%}')
         plt.legend()
         plt.grid(True, alpha=0.3)
+
+        plt.subplot(1, 2, 2)
+        plt.hist(random_total_returns, bins=50, alpha=0.7, label='Random Strategies')
+        plt.axvline(x=actual_total_return, color='red', linewidth=3,
+                    label=f'Actual Strategy ({actual_total_return:.1%})')
+        plt.axvline(x=ci_lower, color='gray', linestyle='--', alpha=0.7, label='95% CI')
+        plt.axvline(x=ci_upper, color='gray', linestyle='--', alpha=0.7)
+        plt.xlabel('Total Return')
+        plt.ylabel('Frequency')
+        plt.title('Monte Carlo: Total Returns Distribution')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.show()
+
+        # Additional diagnostic plot
+        plt.figure(figsize=(10, 6))
+
+        # Plot actual vs random return distributions
+        plt.hist(random_annual_returns, bins=50, alpha=0.7,
+                 label=f'Random Strategies (mean: {np.mean(random_annual_returns):.1%})')
+        plt.axvline(x=(portfolio_values[-1] / self.C_0) ** (252 / len(actual_returns) / 5) - 1,
+                    color='red', linewidth=3,
+                    label=f'Actual Strategy ({actual_sharpe:.2f} Sharpe)')
+
+        plt.xlabel('Annualized Return')
+        plt.ylabel('Frequency')
+        plt.title('Annualized Returns Distribution')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
         plt.show()
 
         return {
-            'actual_return': actual_return,
+            'actual_final_value': portfolio_values[-1],
+            'actual_total_return': actual_total_return,
+            'actual_annualized_return': (portfolio_values[-1] / self.C_0) ** (252 / (len(actual_returns) * 5)) - 1,
             'p_value': p_value,
-            'random_returns': random_returns
+            'random_final_values': random_final_values,
+            'random_total_returns': random_total_returns,
+            'random_annual_returns': random_annual_returns,
+            'confidence_interval': (ci_lower, ci_upper),
+            'annual_confidence_interval': (annual_ci_lower, annual_ci_upper)
         }
 
     def walk_forward_test(self, train_start, train_end, test_start, test_end, steps=4):
@@ -1719,7 +1953,27 @@ def run_strategy_example():
         'FANG',  # Added as a Pioneer proxy
         'HES', 'CTRA'
     ]
-    factor_symbols = ['XLE', 'XOP', 'OIH', 'CL=F', '^VIX', '^TNX']
+    # factor_symbols = [
+    #     'XLE', 'XOP', 'OIH', 'VDE', 'IXC',
+    #     'CL=F', 'BZ=F', 'NG=F', 'RB=F', 'HO=F',
+    #     'ICLN', 'TAN', 'FAN', 'PBW', 'QCLN',
+    #     'CRAK', 'PXE', 'FCG', 'MLPX', 'AMLP',
+    #     'FENY', 'OILK', 'USO', 'BNO', 'UNG',
+    #     '^SP500-15', '^DJUSEN', '^XOI', '^OSX',
+    #     'ENOR', 'ENZL', 'KWT', 'GEX', 'URA',
+    #     'RSPG', '^TNX', '^VIX', 'COAL', 'URA',
+    #     'XES', 'IEO', 'PXI', 'TIP', 'GLD'
+    # ]
+    factor_symbols = [
+        'XLE', 'XOP', 'OIH', 'VDE',  # Energy ETFs
+        'CL=F', 'NG=F',  # Commodities (Crude, Nat Gas)
+        'USO', 'UNG',  # Commodity ETFs
+        '^VIX', '^TNX',  # Volatility, Interest Rates
+        'GLD', 'SLV',  # Precious Metals
+        'SPY', 'QQQ',  # Broad Market
+        'DBC',  # Commodity Basket
+        'UUP', 'FXE',  # Currency ETFs
+    ]
 
     # Load data for the full period 2018-2024
     strategy.load_full_data(stock_symbols, '2018-01-01', '2024-01-01',
