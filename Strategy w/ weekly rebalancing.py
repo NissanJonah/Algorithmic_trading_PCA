@@ -958,6 +958,103 @@ class UltimateDetailedStrategy:
             'final_value': final_value
         }
 
+    def validate_no_lookahead(self):
+        """
+        Check for data leakage in all trades
+        """
+        print("\n" + "=" * 60)
+        print("DATA LEAKAGE VALIDATION")
+        print("=" * 60)
+
+        issues_found = 0
+        for i, trade in enumerate(self.portfolio_history):
+            trade_date = trade['timestamp']
+
+            # Set the window that was used for this trade
+            self.set_current_window(trade_date)
+
+            # Check if window end is after trade date
+            window_end = self.P.index[-1]
+            if window_end > trade_date:
+                print(f"❌ Trade {i + 1} on {trade_date}: Window ends {window_end} (LOOKAHEAD BIAS)")
+                issues_found += 1
+            else:
+                print(f"✅ Trade {i + 1} on {trade_date}: Window ends {window_end} (OK)")
+
+        print(f"\nFound {issues_found} lookahead issues out of {len(self.portfolio_history)} trades")
+        return issues_found == 0
+
+    def monte_carlo_test(self, num_simulations=1000):
+        """
+        Monte Carlo test for statistical significance
+        """
+        print("\n" + "=" * 60)
+        print("MONTE CARLO SIGNIFICANCE TEST")
+        print("=" * 60)
+
+        if not self.portfolio_history:
+            print("No portfolio history available")
+            return None
+
+        # Get actual performance
+        actual_pnls = []
+        for trade in self.portfolio_history:
+            ts = trade['timestamp']
+            metrics = self.performance_metrics.get(ts, {})
+            pnl = metrics.get('realized_pnl', 0)
+            actual_pnls.append(pnl)
+
+        actual_total = sum(actual_pnls)
+        actual_return = actual_total / self.C_0
+
+        # Calculate statistics of actual returns
+        actual_mean = np.mean(actual_pnls)
+        actual_std = np.std(actual_pnls, ddof=1)
+        actual_sharpe = (np.mean(actual_pnls) / np.std(actual_pnls)) * np.sqrt(252 / 5) if np.std(
+            actual_pnls) > 0 else 0
+
+        print(f"Actual Strategy:")
+        print(f"  Total P&L: ${actual_total:,.0f}")
+        print(f"  Total Return: {actual_return:.2%}")
+        print(f"  Avg Period P&L: ${actual_mean:,.0f}")
+        print(f"  Period Std Dev: ${actual_std:,.0f}")
+        print(f"  Estimated Sharpe: {actual_sharpe:.2f}")
+
+        # Generate random strategies with same risk characteristics
+        random_totals = []
+        random_returns = []
+
+        for i in range(num_simulations):
+            # Random returns with same mean and std as actual strategy
+            random_pnls = np.random.normal(actual_mean, actual_std, len(actual_pnls))
+            random_total = sum(random_pnls)
+            random_totals.append(random_total)
+            random_returns.append(random_total / self.C_0)
+
+        # Calculate p-value
+        p_value = np.mean([r >= actual_total for r in random_totals])
+
+        print(f"\nMonte Carlo Results ({num_simulations} simulations):")
+        print(f"  Probability of random strategy beating ours: {p_value:.3%}")
+        print(
+            f"  95% Confidence Interval for random strategy: [{np.percentile(random_returns, 2.5):.2%}, {np.percentile(random_returns, 97.5):.2%}]")
+
+        # Plot distribution
+        plt.figure(figsize=(10, 6))
+        plt.hist(random_returns, bins=50, alpha=0.7, label='Random Strategies')
+        plt.axvline(x=actual_return, color='red', linewidth=3, label=f'Actual Strategy ({actual_return:.2%})')
+        plt.xlabel('Total Return')
+        plt.ylabel('Frequency')
+        plt.title(f'Monte Carlo Test: p-value = {p_value:.3%}')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.show()
+
+        return {
+            'actual_return': actual_return,
+            'p_value': p_value,
+            'random_returns': random_returns
+        }
     def weekly_rebalancing_step(self, current_date, actual_returns=None):
         """
         10. Weekly Rebalancing Steps - now takes current_date and recalculates everything
@@ -1770,6 +1867,50 @@ class UltimateDetailedStrategy:
 
         return overfitting_signals
 
+    def walk_forward_test(self, train_start, train_end, test_start, test_end, steps=4):
+        """
+        Walk-forward validation across multiple periods
+        """
+        print(f"\nWALK-FORWARD VALIDATION: {steps} steps")
+
+        results = []
+
+        # Calculate date ranges for each step
+        total_days = (pd.to_datetime(test_end) - pd.to_datetime(train_start)).days
+        step_days = total_days // steps
+
+        for step in range(steps):
+            # Calculate dates for this step
+            step_train_start = pd.to_datetime(train_start) + pd.Timedelta(days=step * step_days)
+            step_train_end = step_train_start + pd.Timedelta(days=step_days * 0.7)  # 70% train
+            step_test_start = step_train_end
+            step_test_end = step_train_start + pd.Timedelta(days=step_days)
+
+            print(f"\nStep {step + 1}: Train {step_train_start.date()} to {step_train_end.date()}")
+            print(f"          Test  {step_test_start.date()} to {step_test_end.date()}")
+
+            # Create new strategy for this step
+            step_strategy = UltimateDetailedStrategy()
+            step_strategy.load_full_data(self.stocks,
+                                         step_train_start.strftime('%Y-%m-%d'),
+                                         step_test_end.strftime('%Y-%m-%d'),
+                                         {s: s for s in self.factors_data_full.columns if
+                                          s in self.factors_data_full.columns})
+
+            # Test on out-of-sample period
+            step_results = step_strategy.backtest_strategy(
+                step_test_start.strftime('%Y-%m-%d'),
+                step_test_end.strftime('%Y-%m-%d'),
+                rebalance_freq=5
+            )
+
+            if step_results:
+                results.append(step_results['total_return'])
+                print(f"  Return: {step_results['total_return']:.2%}")
+
+        return results
+
+
 # Add this to the main strategy class - update the run_strategy_example function
 def run_enhanced_validation_example(strategy):
     """
@@ -1826,58 +1967,73 @@ def run_enhanced_validation_example(strategy):
 
     return strategy
 
+
+
+# After running your backtest, add these validation calls:
 def run_strategy_example():
     """
-    Complete example of running the Ultimate Detailed Strategy with rolling window
+    Complete example with validation
     """
-    print("=== Ultimate Detailed Strategy Example with Rolling Window ===\n")
+    print("=== Ultimate Detailed Strategy Example ===")
 
     # Initialize strategy
     strategy = UltimateDetailedStrategy()
 
-    # Define stock universe (example: energy sector ETFs and stocks)
-    stock_symbols = [
-        'XOM', 'CVX', 'SHEL', 'BP', 'TTE',
-        'COP', 'EOG', 'DVN', 'APA',
-        'MPC', 'PSX', 'VLO', 'PBF', 'DK',
-        'KMI', 'WMB', 'OKE', 'ET', 'ENB',
-        'SLB', 'HAL', 'BKR', 'FTI', 'NOV',
-        'FANG',  # Added as a Pioneer proxy
-        'HES', 'CTRA'
-    ]
+    # Define your universes
+    stock_symbols = ['XOM', 'CVX', 'SHEL', 'BP', 'TTE', 'COP', 'EOG', 'DVN', 'APA']
+    factor_symbols = ['XLE', 'XOP', 'OIH', 'CL=F', '^VIX', '^TNX']
 
-    # Define factor universe
-    factor_symbols = [
-        'XLE', 'XOP', 'OIH', 'VDE', 'IXC',
-        'CL=F', 'BZ=F', 'NG=F', 'RB=F', 'HO=F',
-        'ICLN', 'TAN', 'FAN', 'PBW', 'QCLN',
-        'CRAK', 'PXE', 'FCG', 'MLPX', 'AMLP',
-        'FENY', 'OILK', 'USO', 'BNO', 'UNG',
-        '^SP500-15', '^DJUSEN', '^XOI', '^OSX',
-        'ENOR', 'ENZL', 'KWT', 'GEX', 'URA',
-        'RSPG', '^TNX', '^VIX', 'COAL', 'URA',
-        'XES', 'IEO', 'PXI', 'TIP', 'GLD'
-    ]
-
-    # Load full dataset (will automatically extend start date by ~360 days)
+    # 1. IN-SAMPLE TEST (your original period)
+    print("\n1. IN-SAMPLE TEST (2021-2023)")
     strategy.load_full_data(stock_symbols, '2021-01-01', '2024-01-01',
-                           {symbol: symbol for symbol in factor_symbols})
+                            {symbol: symbol for symbol in factor_symbols})
 
-    # Run backtest with rolling window approach
     backtest_results = strategy.backtest_strategy('2021-01-01', '2023-12-31', rebalance_freq=5)
 
-    # Compute and display profitability metrics
-    if strategy.portfolio_history:
-        strategy.compute_profitability_metrics()
-        strategy.plot_portfolio_metrics()
+    # Run validations
+    strategy.validate_no_lookahead()
+    mc_results = strategy.monte_carlo_test(num_simulations=1000)
 
-    # Run enhanced validation
-    run_enhanced_validation_example(strategy)
+    # 2. OUT-OF-SAMPLE TEST (completely different period)
+    print("\n" + "=" * 60)
+    print("2. OUT-OF-SAMPLE TEST (2018-2020)")
+    print("=" * 60)
 
-    # Display optimization statistics to analyze SLSQP vs. least squares fallbacks
-    strategy.get_optimization_stats()
+    # Create new strategy instance for clean test
+    strategy_oos = UltimateDetailedStrategy()
+    strategy_oos.load_full_data(stock_symbols, '2018-01-01', '2021-01-01',
+                                {symbol: symbol for symbol in factor_symbols})
 
-    return strategy
+    oos_results = strategy_oos.backtest_strategy('2018-01-01', '2020-12-31', rebalance_freq=5)
+
+    # Run validations on out-of-sample
+    strategy_oos.validate_no_lookahead()
+    oos_mc_results = strategy_oos.monte_carlo_test(num_simulations=1000)
+
+    walk_forward_returns = strategy.walk_forward_test(
+        train_start='2018-01-01',
+        train_end='2023-12-31',
+        test_start='2019-01-01',
+        test_end='2023-12-31',
+        steps=5
+    )
+
+    print(f"\nWalk-Forward Average Return: {np.mean(walk_forward_returns):.2%}")
+    print(f"Walk-Forward Std Dev: {np.std(walk_forward_returns):.2%}")
+
+    # 3. Compare results
+    print("\n" + "=" * 60)
+    print("COMPARISON: In-Sample vs Out-of-Sample")
+    print("=" * 60)
+
+    is_return = backtest_results['total_return'] if backtest_results else 0
+    oos_return = oos_results['total_return'] if oos_results else 0
+
+    print(f"In-Sample Return (2021-2023): {is_return:.2%}")
+    print(f"Out-of-Sample Return (2018-2020): {oos_return:.2%}")
+    print(f"Performance Drop: {(is_return - oos_return):.2%} points")
+
+    return strategy, strategy_oos
 
 
 # Additional utility functions for analysis

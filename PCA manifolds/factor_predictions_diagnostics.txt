@@ -1,0 +1,175 @@
+=== Backtest Diagnostics ===
+
+=== Diagnostics for factor predictions at rebalance date 2025-07-25 ===
+
+Factor: VIX_change
+Available data points: 252
+Short-term momentum (20 days): -0.343000
+Medium-term momentum (60 days): -0.259500
+Long-term mean (120 days): -0.003750
+Current level: -0.110001
+Mean reversion signal: 0.010625
+Recent volatility (20 days): 0.742117
+Long-term volatility (120 days): 2.960996
+Low volatility regime detected, multiplier: 1.2
+Base prediction (before clipping): -0.211862
+Prediction after volatility adjustment: -0.254235
+Final clipped prediction: -0.200000
+
+Factor: TNX_change
+Available data points: 252
+Short-term momentum (20 days): 0.000442
+Medium-term momentum (60 days): 0.000230
+Long-term mean (120 days): -0.000263
+Current level: -0.006946
+Mean reversion signal: 0.000668
+Recent volatility (20 days): 0.009803
+Long-term volatility (120 days): 0.013771
+Neutral volatility regime, multiplier: 1.0
+Base prediction (before clipping): 0.000446
+Prediction after volatility adjustment: 0.000446
+Final clipped prediction: 0.000446
+
+Factor: DXY_change
+Available data points: 252
+Short-term momentum (20 days): 0.000013
+Medium-term momentum (60 days): 0.000043
+Long-term mean (120 days): -0.000658
+Current level: -0.002532
+Mean reversion signal: 0.000187
+Recent volatility (20 days): 0.003345
+Long-term volatility (120 days): 0.005439
+Low volatility regime detected, multiplier: 1.2
+Base prediction (before clipping): 0.000074
+Prediction after volatility adjustment: 0.000089
+Final clipped prediction: 0.000089
+
+Factor: GOLD_change
+Available data points: 252
+Short-term momentum (20 days): -0.000262
+Medium-term momentum (60 days): 0.000055
+Long-term mean (120 days): 0.001755
+Current level: 0.003862
+Mean reversion signal: -0.000211
+Recent volatility (20 days): 0.008005
+Long-term volatility (120 days): 0.013151
+Low volatility regime detected, multiplier: 1.2
+Base prediction (before clipping): -0.000152
+Prediction after volatility adjustment: -0.000182
+Final clipped prediction: -0.000182
+
+=== Diagnostics for factor predictions at rebalance date 2025-08-01 ===
+
+Factor: VIX_change
+Available data points: 249
+Short-term momentum (20 days): -0.343000
+Medium-term momentum (60 days): -0.259500
+Long-term mean (120 days): -0.003750
+Current level: -0.110001
+Mean reversion signal: 0.010625
+Recent volatility (20 days): 0.742117
+Long-term volatility (120 days): 2.960996
+Low volatility regime detected, multiplier: 1.2
+Base prediction (before clipping): -0.211862
+Prediction after volatility adjustment: -0.254235
+Final clipped prediction: -0.200000
+
+Factor: TNX_change
+Available data points: 249
+Short-term momentum (20 days): 0.000442
+Medium-term momentum (60 days): 0.000230
+Long-term mean (120 days): -0.000263
+Current level: -0.006946
+Mean reversion signal: 0.000668
+Recent volatility (20 days): 0.009803
+Long-term volatility (120 days): 0.013771
+Neutral volatility regime, multiplier: 1.0
+Base prediction (before clipping): 0.000446
+Prediction after volatility adjustment: 0.000446
+Final clipped prediction: 0.000446
+
+Factor: DXY_change
+Available data points: 249
+Short-term momentum (20 days): 0.000013
+Medium-term momentum (60 days): 0.000043
+Long-term mean (120 days): -0.000658
+Current level: -0.002532
+Mean reversion signal: 0.000187
+Recent volatility (20 days): 0.003345
+Long-term volatility (120 days): 0.005439
+Low volatility regime detected, multiplier: 1.2
+Base prediction (before clipping): 0.000074
+Prediction after volatility adjustment: 0.000089
+Final clipped prediction: 0.000089
+
+Factor: GOLD_change
+Available data points: 249
+Short-term momentum (20 days): -0.000262
+Medium-term momentum (60 days): 0.000055
+Long-term mean (120 days): 0.001755
+Current level: 0.003862
+Mean reversion signal: -0.000211
+Recent volatility (20 days): 0.008005
+Long-term volatility (120 days): 0.013151
+Low volatility regime detected, multiplier: 1.2
+Base prediction (before clipping): -0.000152
+Prediction after volatility adjustment: -0.000182
+Final clipped prediction: -0.000182
+
+=== Diagnostics for factor predictions at rebalance date 2025-08-08 ===
+
+Factor: VIX_change
+Available data points: 244
+Short-term momentum (20 days): -0.343000
+Medium-term momentum (60 days): -0.259500
+Long-term mean (120 days): -0.003750
+Current level: -0.110001
+Mean reversion signal: 0.010625
+Recent volatility (20 days): 0.742117
+Long-term volatility (120 days): 2.960996
+Low volatility regime detected, multiplier: 1.2
+Base prediction (before clipping): -0.211862
+Prediction after volatility adjustment: -0.254235
+Final clipped prediction: -0.200000
+
+Factor: TNX_change
+Available data points: 244
+Short-term momentum (20 days): 0.000442
+Medium-term momentum (60 days): 0.000230
+Long-term mean (120 days): -0.000263
+Current level: -0.006946
+Mean reversion signal: 0.000668
+Recent volatility (20 days): 0.009803
+Long-term volatility (120 days): 0.013771
+Neutral volatility regime, multiplier: 1.0
+Base prediction (before clipping): 0.000446
+Prediction after volatility adjustment: 0.000446
+Final clipped prediction: 0.000446
+
+Factor: DXY_change
+Available data points: 244
+Short-term momentum (20 days): 0.000013
+Medium-term momentum (60 days): 0.000043
+Long-term mean (120 days): -0.000658
+Current level: -0.002532
+Mean reversion signal: 0.000187
+Recent volatility (20 days): 0.003345
+Long-term volatility (120 days): 0.005439
+Low volatility regime detected, multiplier: 1.2
+Base prediction (before clipping): 0.000074
+Prediction after volatility adjustment: 0.000089
+Final clipped prediction: 0.000089
+
+Factor: GOLD_change
+Available data points: 244
+Short-term momentum (20 days): -0.000262
+Medium-term momentum (60 days): 0.000055
+Long-term mean (120 days): 0.001755
+Current level: 0.003862
+Mean reversion signal: -0.000211
+Recent volatility (20 days): 0.008005
+Long-term volatility (120 days): 0.013151
+Low volatility regime detected, multiplier: 1.2
+Base prediction (before clipping): -0.000152
+Prediction after volatility adjustment: -0.000182
+Final clipped prediction: -0.000182
