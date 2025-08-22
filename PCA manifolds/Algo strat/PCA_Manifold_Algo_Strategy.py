@@ -82,6 +82,9 @@ class PCAFactorStrategy:
         eigenvalues, eigenvectors = la.eigh(corr_matrix)
         idx = np.argmax(eigenvalues)
         u_centrality = eigenvectors[:, idx]
+        lambda_max = eigenvalues[idx]
+        # Eigenvalue verification
+        ev_check = np.allclose(corr_matrix.to_numpy() @ u_centrality, lambda_max * u_centrality, atol=1e-6)
         u_scaled = u_centrality / np.std(u_centrality) * 0.13
         u_centrality = u_scaled + (1 - np.mean(u_scaled))
         return corr_matrix.to_numpy(), u_centrality
@@ -127,6 +130,7 @@ class PCAFactorStrategy:
                 return {}
         except (KeyError, IndexError):
             return {}
+
         results = {}
         self.selected_factors = {}
         for pc in pc_series_full.columns:
@@ -197,6 +201,7 @@ class PCAFactorStrategy:
                 'returns_shape': returns.shape,
                 'std_returns_mean': std_returns.mean().mean(),
                 'std_returns_std': std_returns.std().mean(),
+                'pca_eigenvalues': eigenvalues.tolist(),
                 'pca_explained_var': explained_var.tolist(),
                 'pca_orthogonal': np.allclose(V.T @ V, np.eye(V.shape[1]), atol=1e-6),
                 'centrality_mean': np.mean(u_centrality),
@@ -234,28 +239,39 @@ class PCAFactorStrategy:
                     print(f"  Rebalancing R² Mean: {np.mean(rebalancing_r2s):.4f}, Std: {np.std(rebalancing_r2s):.4f}")
                     print(f"  R² Correlation: {np.corrcoef(training_r2s, rebalancing_r2s)[0,1]:.4f}")
 
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+        # Enhanced plotting from Document 2
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10))
+        plotted_training = False
         for pc in [f'PC_{i+1}' for i in range(min(3, len(self.r2_training_history)))]:
             if self.r2_training_history[pc]:
                 dates, r2s = zip(*self.r2_training_history[pc])
-                ax1.plot(dates, r2s, marker='o', label=f'Training R² {pc}')
-        ax1.set_title('Training R² (252-day)')
-        ax1.set_ylabel('Adjusted R²')
-        ax1.legend()
-        ax1.grid(True)
-        ax1.tick_params(axis='x', rotation=45)
+                ax1.plot(dates, r2s, marker='o', label=f'Training R² {pc}', linewidth=2, markersize=4)
+                plotted_training = True
+        if plotted_training:
+            ax1.set_title('Training R² (252-day period): Model Fit Quality', fontsize=14, fontweight='bold')
+            ax1.set_xlabel('Rebalance Date')
+            ax1.set_ylabel('Adjusted R² (252-day training)')
+            ax1.legend()
+            ax1.grid(True, alpha=0.3)
+            ax1.tick_params(axis='x', rotation=45)
+
+        plotted_rebalancing = False
         for pc in [f'PC_{i+1}' for i in range(min(3, len(self.r2_history)))]:
             if self.r2_history[pc]:
                 dates, r2s = zip(*self.r2_history[pc])
-                ax2.plot(dates, r2s, marker='s', label=f'Rebalancing R² {pc}')
-        ax2.set_title('Rebalancing R² (5-day)')
-        ax2.set_xlabel('Rebalance Date')
-        ax2.set_ylabel('Adjusted R²')
-        ax2.legend()
-        ax2.grid(True)
-        ax2.tick_params(axis='x', rotation=45)
-        plt.tight_layout()
-        plt.show()
+                ax2.plot(dates, r2s, marker='s', label=f'Rebalancing R² {pc}', linewidth=2, markersize=4)
+                plotted_rebalancing = True
+        if plotted_rebalancing:
+            ax2.set_title('Rebalancing R² (5-day period): Prediction Quality', fontsize=14, fontweight='bold')
+            ax2.set_xlabel('Rebalance Date')
+            ax2.set_ylabel('Adjusted R² (5-day rebalancing)')
+            ax2.legend()
+            ax2.grid(True, alpha=0.3)
+            ax2.tick_params(axis='x', rotation=45)
+
+        if plotted_training or plotted_rebalancing:
+            plt.tight_layout()
+            plt.show()
 
 if __name__ == "__main__":
     stocks = ['GE', 'CAT', 'RTX', 'UNP', 'HON', 'BA', 'DE', 'UPS', 'LMT', 'ETN', 'PH', 'ITW', 'GD', 'NOC', 'MMM']
