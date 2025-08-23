@@ -8,17 +8,28 @@ import matplotlib.pyplot as plt
 import datetime
 import scipy.linalg as la
 from itertools import combinations
+import pandas.tseries.offsets as offsets
+from sklearn.linear_model import LassoCV
 
 class PCAFactorStrategy:
-    def __init__(self, stocks, start_date, end_date, lookback=252, initial_capital=10000):
-        self.stocks = stocks
+    def __init__(self, stocks, start_date, end_date, lookback=252, initial_capital=10000, LR_lookback=30):
+        self.stocks = stocks  # Industrial ETFs and stocks
         self.start_date = start_date
         self.end_date = end_date
         self.lookback = lookback
+        self.LR_lookback = LR_lookback
         self.initial_capital = initial_capital
         self.data = None
         self.rebalance_dates = None
-        self.factors = ['XLI', '^TNX', '^GSPC', 'UUP', 'IYT', 'DIA', 'COPX', 'XME', '^VIX', 'GLD']
+        self.factors = ['XLF', 'VFH', 'IYF', 'KRE', '^GSPC', '^VIX', '^TNX', 'FAS', 'DIA', 'GLD']
+        self.rotation_pairs = {
+            "Growth vs Value": ("VUG", "VTV"),
+            "Large vs Small Cap": ("SPY", "IWM"),
+            "Tech vs Market": ("XLK", "SPY"),
+            "Financials vs Market": ("XLF", "SPY"),
+            "Banking vs Financials": ("KBE", "XLF"),
+            "Regional vs Banks": ("KRE", "KBE")
+        }
         self.factor_data = None
         self.pca_matrix_count = 0
         self.selected_factors = {}
@@ -27,40 +38,121 @@ class PCAFactorStrategy:
 
     def download_data(self):
         nominal_start = pd.to_datetime(self.start_date)
-        earliest_data_start = nominal_start - pd.offsets.BDay(self.lookback + 15 + 20)
+        earliest_data_start = nominal_start - offsets.BDay(self.lookback + 15 + 20)
+
+        # Download stock data
         raw_data = yf.download(self.stocks, start=earliest_data_start, end=self.end_date, auto_adjust=True)
         if isinstance(raw_data.columns, pd.MultiIndex):
             self.data = raw_data['Close']
         else:
             self.data = raw_data
         self.data = self.data.dropna(axis=0, how='any')
+
+        # Download individual factor data
         raw_factor_data = yf.download(self.factors, start=earliest_data_start, end=self.end_date, auto_adjust=True)
         if isinstance(raw_factor_data.columns, pd.MultiIndex):
             self.factor_data = raw_factor_data['Close']
         else:
             self.factor_data = raw_factor_data
         self.factor_data = self.factor_data.dropna(axis=1, how='all').dropna(axis=0, how='any')
+
+        # Download rotation pair data
+        all_rotation_tickers = []
+        for pair in self.rotation_pairs.values():
+            all_rotation_tickers.extend(pair)
+        all_rotation_tickers = list(set(all_rotation_tickers))  # Remove duplicates
+
+        raw_rotation_data = yf.download(all_rotation_tickers, start=earliest_data_start, end=self.end_date,
+                                        auto_adjust=True)
+        if isinstance(raw_rotation_data.columns, pd.MultiIndex):
+            self.rotation_data = raw_rotation_data['Close']
+        else:
+            self.rotation_data = raw_rotation_data
+        self.rotation_data = self.rotation_data.dropna(axis=1, how='all').dropna(axis=0, how='any')
+
+        # Compute rotation factors and add to factor data
+        rotation_factors = self.compute_rotation_factors()
+        if not rotation_factors.empty:
+            # Align dates between factor_data and rotation_factors
+            common_dates = self.factor_data.index.intersection(rotation_factors.index)
+            self.factor_data = self.factor_data.loc[common_dates]
+            rotation_factors = rotation_factors.loc[common_dates]
+
+            # Combine factor data with rotation factors
+            self.factor_data = pd.concat([self.factor_data, rotation_factors], axis=1)
+
         if self.factor_data.empty or len(self.factor_data.columns) == 0:
             raise ValueError("No valid factor data available")
+
+        # Update factors list to include rotation factors
         self.factors = list(self.factor_data.columns)
+
+        # Setup rebalance dates
         all_dates = self.data.index
         self.rebalance_dates = all_dates[all_dates.weekday == 4]
-        first_possible_rebalance = all_dates[all_dates >= (nominal_start + pd.offsets.BDay(self.lookback))][0]
+        first_possible_rebalance = all_dates[all_dates >= (nominal_start + offsets.BDay(self.lookback))][0]
         self.rebalance_dates = self.rebalance_dates[self.rebalance_dates >= first_possible_rebalance]
         rebalance_diffs = self.rebalance_dates[1:] - self.rebalance_dates[:-1]
         rebalance_days = [diff.days for diff in rebalance_diffs]
-        print(f"Stock data shape: {self.data.shape}, Date range: {self.data.index[0].date()} to {self.data.index[-1].date()}")
+
+        print(
+            f"Stock data shape: {self.data.shape}, Date range: {self.data.index[0].date()} to {self.data.index[-1].date()}")
         print(f"Factor data shape: {self.factor_data.shape}, Available factors: {self.factors}")
+        print(f"Rotation factors added: {list(self.rotation_pairs.keys())}")
         print(f"Rebalance dates: {len(self.rebalance_dates)}, Mean days between: {np.mean(rebalance_days):.2f}")
 
+    def compute_rotation_factors(self):
+        """
+        Compute rotation factors as the difference in log returns between paired assets.
+        Returns a DataFrame with rotation factors as daily log return differences.
+        """
+        if not hasattr(self, 'rotation_data') or self.rotation_data.empty:
+            print("Warning: No rotation data available")
+            return pd.DataFrame()
+
+        rotation_factors = pd.DataFrame(index=self.rotation_data.index)
+
+        # Compute log returns for all rotation assets
+        rotation_returns = self.compute_log_returns(self.rotation_data)
+
+        # Compute rotation factors as difference in log returns
+        for factor_name, (asset1, asset2) in self.rotation_pairs.items():
+            if asset1 in rotation_returns.columns and asset2 in rotation_returns.columns:
+                # Rotation factor = log return of first asset - log return of second asset
+                # Positive values indicate first asset outperforming second asset
+                rotation_factors[factor_name] = rotation_returns[asset1] - rotation_returns[asset2]
+            else:
+                missing_assets = [asset for asset in [asset1, asset2] if asset not in rotation_returns.columns]
+                print(f"Warning: Cannot compute {factor_name} factor. Missing assets: {missing_assets}")
+
+        # Drop any NaN values
+        rotation_factors = rotation_factors.dropna()
+
+        print(f"Computed rotation factors: {list(rotation_factors.columns)}")
+        print(f"Rotation factors date range: {rotation_factors.index[0].date()} to {rotation_factors.index[-1].date()}")
+        print(f"Rotation factors shape: {rotation_factors.shape}")
+
+        return rotation_factors
+
     def compute_log_returns(self, prices):
-        returns = np.log(prices / prices.shift(1)).dropna()
+        """
+        Compute log returns with proper handling of edge cases to avoid warnings.
+        """
+        # Replace any non-positive values with NaN before taking log
+        prices_clean = prices.where(prices > 0)
+
+        # Compute log returns
+        returns = np.log(prices_clean / prices_clean.shift(1)).dropna()
+
+        # Replace any infinite values with NaN
+        returns = returns.replace([np.inf, -np.inf], np.nan)
+
         return returns
 
     def standardize_returns(self, returns):
         scaler = StandardScaler()
         std_returns = pd.DataFrame(scaler.fit_transform(returns), index=returns.index, columns=returns.columns)
-        return std_returns
+        return std_returns, scaler
 
     def compute_pca(self, returns):
         cov_matrix = returns.cov()
@@ -97,105 +189,186 @@ class PCAFactorStrategy:
             pc_series = pc_series.dropna()
         return pc_series
 
-    def compute_factor_changes(self, factor_prices, rebalance_date):
-        if factor_prices.empty or len(factor_prices) < self.lookback:
+    def compute_factor_changes(self, factor_prices, start_date, end_date):
+        """
+        Updated to handle both regular factors and rotation factors.
+        Note: Rotation factors are already in daily change format from compute_rotation_factors(),
+        while regular factors need to be converted to log returns.
+        """
+        if factor_prices.empty:
             return pd.DataFrame()
+
         try:
-            idx = factor_prices.index.get_loc(rebalance_date)
-            lookback_start = factor_prices.index[max(0, idx - self.lookback + 1)]
-            prices = factor_prices.loc[lookback_start:rebalance_date]
-            returns = self.compute_log_returns(prices)
-            return returns
+            prices = factor_prices.loc[start_date:end_date]
+            if len(prices) < 2:
+                return pd.DataFrame()
+
+            # Identify which columns are rotation factors (already in return format)
+            rotation_factor_names = list(self.rotation_pairs.keys())
+            regular_factors = [col for col in prices.columns if col not in rotation_factor_names]
+            rotation_factors = [col for col in prices.columns if col in rotation_factor_names]
+
+            result = pd.DataFrame(index=prices.index[1:])  # Skip first row for regular factors
+
+            # Process regular factors (convert to log returns)
+            if regular_factors:
+                regular_prices = prices[regular_factors]
+                regular_returns = self.compute_log_returns(regular_prices)
+                result = pd.concat([result, regular_returns], axis=1)
+
+            # Process rotation factors (already in return format, just slice the date range)
+            if rotation_factors:
+                rotation_data = prices[rotation_factors].loc[result.index]  # Align with regular factors index
+                result = pd.concat([result, rotation_data], axis=1)
+
+            return result
         except KeyError:
             return pd.DataFrame()
 
-    def factor_regression(self, pc_series, factor_changes, rebalance_date):
+    def factor_regression(self, pc_series, factor_changes, rebalance_date, std_returns, V, scaler):
         if factor_changes.empty or rebalance_date not in pc_series.index or rebalance_date not in factor_changes.index:
             return {}
-        common_dates = pc_series.index.intersection(factor_changes.index)
-        pc_series_full = pc_series.loc[common_dates]
-        factor_changes_full = factor_changes.loc[common_dates]
-        if len(common_dates) < 50:
-            return {}
+
+        lookback = self.LR_lookback
         try:
-            rebalance_idx = pc_series.index.get_loc(rebalance_date)
-            start_idx = max(0, rebalance_idx - 4)
-            period_dates = pc_series.index[start_idx:rebalance_idx + 1]
-            pc_series_period = pc_series.loc[period_dates]
-            factor_changes_period = factor_changes.loc[factor_changes.index.intersection(period_dates)]
-            common_period_dates = pc_series_period.index.intersection(factor_changes_period.index)
-            pc_series_period = pc_series_period.loc[common_period_dates]
-            factor_changes_period = factor_changes_period.loc[common_period_dates]
-            if len(common_period_dates) < 3:
+            rebalance_idx = factor_changes.index.get_loc(rebalance_date)
+            start_idx = max(0, rebalance_idx - lookback + 1)
+            period_dates = factor_changes.index[start_idx:rebalance_idx + 1]
+            common_dates = pc_series.index.intersection(period_dates)
+            if len(common_dates) < 20:
                 return {}
+            pc_series_window = pc_series.loc[common_dates]
+            factor_changes_window = factor_changes.loc[common_dates]
         except (KeyError, IndexError):
             return {}
 
         results = {}
         self.selected_factors = {}
-        for pc in pc_series_full.columns:
-            y_full = pc_series_full[pc].to_numpy()
-            X_full = factor_changes_full.to_numpy()
-            if np.any(np.isnan(y_full)) or np.any(np.isnan(X_full)):
+
+        # Use LASSO with CV for each PC
+        for pc in pc_series_window.columns:
+            y = pc_series_window[pc].to_numpy()
+            X = factor_changes_window.to_numpy()
+            if np.any(np.isnan(y)) or np.any(np.isnan(X)):
                 self.r2_history[pc].append((rebalance_date, 0.0))
                 self.r2_training_history[pc].append((rebalance_date, 0.0))
                 continue
-            scaler_X = StandardScaler()
-            scaler_y = StandardScaler()
-            X_scaled = scaler_X.fit_transform(X_full)
-            y_scaled = scaler_y.fit_transform(y_full.reshape(-1, 1)).flatten()
-            correlations = pd.Series(np.abs(np.corrcoef(X_scaled.T, y_scaled)[:-1, -1]), index=self.factors)
-            best_subset = []
-            sorted_factors = correlations[correlations > 0.05].sort_values(ascending=False)
-            if len(sorted_factors) == 0:
-                self.r2_history[pc].append((rebalance_date, 0.0))
-                self.r2_training_history[pc].append((rebalance_date, 0.0))
-                continue
-            best_subset.append(sorted_factors.index[0])
-            if len(sorted_factors) > 1:
-                for f in sorted_factors.index[1:]:
-                    if all(abs(factor_changes_full[f].corr(factor_changes_full[bf])) < 0.75 for bf in best_subset):
-                        best_subset.append(f)
-                        break
-            X_subset_full = factor_changes_full[best_subset].to_numpy()
-            if np.any(np.isnan(X_subset_full)):
-                self.r2_history[pc].append((rebalance_date, 0.0))
-                self.r2_training_history[pc].append((rebalance_date, 0.0))
-                continue
-            model = LinearRegression()
-            model.fit(X_subset_full, y_full)
-            r2_training = model.score(X_subset_full, y_full)
-            adjusted_r2_training = 1 - (1 - r2_training) * (len(y_full) - 1) / (len(y_full) - X_subset_full.shape[1] - 1)
-            y_period = pc_series_period[pc].to_numpy()
-            X_period = factor_changes_period[best_subset].to_numpy()
-            if len(X_period) == len(y_period) and len(y_period) >= 3:
-                r2_rebalancing = model.score(X_period, y_period)
-                adjusted_r2_rebalancing = 1 - (1 - r2_rebalancing) * (len(y_period) - 1) / (len(y_period) - X_period.shape[1] - 1)
-                results[pc] = {
-                    'alpha': model.intercept_,
-                    'beta': dict(zip(best_subset, model.coef_)),
-                    'r2_training': adjusted_r2_training,
-                    'r2_rebalancing': adjusted_r2_rebalancing,
-                    'factors': best_subset
-                }
-                self.selected_factors[pc] = best_subset
-                self.r2_history[pc].append((rebalance_date, adjusted_r2_rebalancing))
-                self.r2_training_history[pc].append((rebalance_date, adjusted_r2_training))
+
+            # LASSO with cross-validation (alphas grid) - increased max_iter and tol for convergence
+            lasso = LassoCV(
+                cv=5,
+                alphas=np.logspace(-4, 0, 30),
+                max_iter=10000,  # Increased from 5000
+                tol=1e-4,  # Added explicit tolerance
+                random_state=42  # Added for reproducibility
+            )
+            lasso.fit(X, y)
+            best_r2_training = lasso.score(X, y)
+
+            # Adjusted R²
+            n_training = len(y)
+            p = np.sum(lasso.coef_ != 0)
+            adjusted_r2_training = 1 - (1 - best_r2_training) * (n_training - 1) / (
+                    n_training - p - 1) if n_training > p + 1 and p > 0 else best_r2_training
+
+            # Future prediction R² (next 5 days)
+            r2_prediction = 0.0
+            try:
+                future_dates = self.data.index[self.data.index > rebalance_date][:5]
+                if len(future_dates) >= 3:
+                    future_end_date = future_dates[-1]
+                    future_stock_prices = self.data.loc[rebalance_date:future_end_date]
+                    future_returns = self.compute_log_returns(future_stock_prices)
+                    if not future_returns.empty and len(future_returns) >= 3:
+                        future_std_returns = pd.DataFrame(scaler.transform(future_returns),
+                                                          index=future_returns.index,
+                                                          columns=future_returns.columns)
+                        pc_future = self.compute_pc_series(future_std_returns, V)
+                        future_factor_prices = self.factor_data.loc[rebalance_date:future_end_date]
+                        future_factor_changes = self.compute_factor_changes(future_factor_prices, rebalance_date,
+                                                                            future_end_date)
+                        common_future_dates = pc_future.index.intersection(future_factor_changes.index)
+                        if len(common_future_dates) >= 3:
+                            y_pred = pc_future.loc[common_future_dates, pc].to_numpy()
+                            X_pred = future_factor_changes.loc[common_future_dates].to_numpy()
+                            if not (np.any(np.isnan(y_pred)) or np.any(np.isnan(X_pred))):
+                                r2_prediction = lasso.score(X_pred, y_pred)
+            except Exception:
+                r2_prediction = 0.0
+
+            # Save only non-zero coefficients
+            nonzero_idx = np.where(lasso.coef_ != 0)[0]
+            best_factors = [self.factors[i] for i in nonzero_idx]
+            betas = {self.factors[i]: lasso.coef_[i] for i in nonzero_idx}
+
+            results[pc] = {
+                'alpha': lasso.intercept_,
+                'beta': betas,
+                'r2_training': adjusted_r2_training,
+                'r2_rebalancing': r2_prediction,
+                'factors': best_factors
+            }
+
+            self.selected_factors[pc] = best_factors
+            self.r2_training_history[pc].append((rebalance_date, adjusted_r2_training))
+            self.r2_history[pc].append((rebalance_date, r2_prediction))
+
         return results
 
-    def validate_step2(self):
+    def compute_predictions(self, pc_series, factor_changes, regression_results, rebalance_date, V, u_centrality):
+        if not regression_results:
+            return None, None, None, None, None
+
+        k = V.shape[1]
+        delta_pc_pred_vec = np.zeros(k)
+        sigma_pc_vec = pc_series.std().values
+
+        for pc_idx, pc in enumerate(pc_series.columns):
+            if pc in regression_results:
+                res = regression_results[pc]
+                best_factors = res['factors']
+                if not best_factors:
+                    delta_pc_pred_vec[pc_idx] = 0.0
+                    continue
+                # Use the latest delta factors (on rebalance_date)
+                try:
+                    X_current = factor_changes.loc[rebalance_date, best_factors].to_numpy()
+                    delta_pc_pred = res['alpha'] + np.dot(list(res['beta'].values()), X_current)
+                    delta_pc_pred_vec[pc_idx] = delta_pc_pred
+                except KeyError:
+                    delta_pc_pred_vec[pc_idx] = 0.0
+
+        # Scale for weekly (5 days)
+        delta_pc_pred_vec *= 5
+
+        # Predicted PCT change for PCs (weekly)
+        predicted_pct_vec = delta_pc_pred_vec * sigma_pc_vec
+
+        # Predicted stock returns (weekly)
+        r_hat = V @ predicted_pct_vec
+
+        # Weighted with centrality
+        r_hat_weighted = r_hat * u_centrality
+
+        return sigma_pc_vec, delta_pc_pred_vec, predicted_pct_vec, r_hat, r_hat_weighted
+
+    def validate_step3(self):
         validation_results = []
         for rebalance_date in self.rebalance_dates:
             idx = self.data.index.get_loc(rebalance_date)
             lookback_start = self.data.index[max(0, idx - self.lookback + 1)]
             prices = self.data.loc[lookback_start:rebalance_date]
             returns = self.compute_log_returns(prices)
-            std_returns = self.standardize_returns(returns)
+            std_returns, scaler = self.standardize_returns(returns)
             V, eigenvalues, explained_var = self.compute_pca(std_returns)
             C, u_centrality = self.compute_centrality_matrix(std_returns)
             pc_series = self.compute_pc_series(std_returns, V)
-            factor_changes = self.compute_factor_changes(self.factor_data, rebalance_date)
-            regression_results = self.factor_regression(pc_series, factor_changes, rebalance_date)
+            factor_changes = self.compute_factor_changes(self.factor_data, lookback_start, rebalance_date)
+            regression_results = self.factor_regression(pc_series, factor_changes, rebalance_date, std_returns, V,
+                                                        scaler)
+            sigma_pc_vec, delta_pc_pred_vec, predicted_pct_vec, r_hat, r_hat_weighted = self.compute_predictions(
+                pc_series, factor_changes, regression_results, rebalance_date, V, u_centrality
+            )
             validation_results.append({
                 'date': rebalance_date,
                 'returns_shape': returns.shape,
@@ -207,76 +380,120 @@ class PCAFactorStrategy:
                 'centrality_mean': np.mean(u_centrality),
                 'centrality_std': np.std(u_centrality),
                 'pc_series_shape': pc_series.shape,
-                'regression_results': regression_results
+                'regression_results': regression_results,
+                'sigma_pc_vec': sigma_pc_vec.tolist() if sigma_pc_vec is not None else None,
+                'delta_pc_pred_vec': delta_pc_pred_vec.tolist() if delta_pc_pred_vec is not None else None,
+                'predicted_pct_vec': predicted_pct_vec.tolist() if predicted_pct_vec is not None else None,
+                'r_hat_mean': np.mean(r_hat) if r_hat is not None else None,
+                'r_hat_std': np.std(r_hat) if r_hat is not None else None,
+                'r_hat_min': np.min(r_hat) if r_hat is not None else None,
+                'r_hat_max': np.max(r_hat) if r_hat is not None else None,
+                'r_hat_weighted_mean': np.mean(r_hat_weighted) if r_hat_weighted is not None else None,
+                'r_hat_weighted_std': np.std(r_hat_weighted) if r_hat_weighted is not None else None,
+                'r_hat_weighted_min': np.min(r_hat_weighted) if r_hat_weighted is not None else None,
+                'r_hat_weighted_max': np.max(r_hat_weighted) if r_hat_weighted is not None else None,
             })
 
         print("\nValidation Summary:")
         print(f"Total PCA matrices: {self.pca_matrix_count}")
         print(f"Total rebalance periods: {len(validation_results)}")
+        print(f"Linear Regression lookback period: {self.LR_lookback} days")
         print("\nLast 5 Rebalance Periods:")
         for result in validation_results[-5:]:
             print(f"\nDate: {result['date'].date()}")
             print(f"Returns Shape: {result['returns_shape']}")
             print(f"Std Returns Mean: {result['std_returns_mean']:.6f}, Std: {result['std_returns_std']:.6f}")
-            print(f"PC Sector Movement: " + ", ".join(f"PC_{i+1}: {var*100:.2f}%" for i, var in enumerate(result['pca_explained_var'])))
+            print(f"PC Sector Movement: " + ", ".join(
+                f"PC_{i + 1}: {var * 100:.2f}%" for i, var in enumerate(result['pca_explained_var'])))
             print(f"PCA Orthogonal: {result['pca_orthogonal']}")
             print(f"Centrality Mean: {result['centrality_mean']:.6f}, Std: {result['centrality_std']:.6f}")
             print(f"PC Series Shape: {result['pc_series_shape']}")
             for pc, res in result['regression_results'].items():
                 print(f"{pc}:")
-                print(f"  Eq: PC = {res['alpha']:.6f} + " + " + ".join(f"{coef:.6f}*{f}" for f, coef in res['beta'].items()))
+                print(f"  Eq: PC = {res['alpha']:.6f} + " + " + ".join(
+                    f"{coef:.6f}*{f}" for f, coef in res['beta'].items()))
                 print(f"  Factors: {res['factors']}")
-                print(f"  R² (252-day): {res['r2_training']:.6f}, R² (5-day): {res['r2_rebalancing']:.6f}")
+                print(
+                    f"  R² (Training {self.LR_lookback}-day): {res['r2_training']:.6f}, R² (Prediction 5-day): {res['r2_rebalancing']:.6f}")
+            if result['sigma_pc_vec'] is not None:
+                print(f"Historic PC Std: " + ", ".join(
+                    f"PC_{i + 1}: {val:.6f}" for i, val in enumerate(result['sigma_pc_vec'])))
+                print(f"Delta PC Pred (weekly scaled): " + ", ".join(
+                    f"PC_{i + 1}: {val:.6f}" for i, val in enumerate(result['delta_pc_pred_vec'])))
+                print(f"Predicted PCT Vec (weekly): " + ", ".join(
+                    f"PC_{i + 1}: {val:.6f}" for i, val in enumerate(result['predicted_pct_vec'])))
+                print(
+                    f"r_hat (weekly) - Mean: {result['r_hat_mean']:.6f}, Std: {result['r_hat_std']:.6f}, Min: {result['r_hat_min']:.6f}, Max: {result['r_hat_max']:.6f}")
+                print(
+                    f"r_hat_weighted (weekly) - Mean: {result['r_hat_weighted_mean']:.6f}, Std: {result['r_hat_weighted_std']:.6f}, Min: {result['r_hat_weighted_min']:.6f}, Max: {result['r_hat_weighted_max']:.6f}")
 
         if any(self.r2_history.values()):
             print("\nR² Summary (Top 3 PCs):")
-            for pc in [f'PC_{i+1}' for i in range(min(3, len(self.r2_history)))]:
+            for pc in [f'PC_{i + 1}' for i in range(min(3, len(self.r2_history)))]:
                 if self.r2_history[pc]:
                     training_r2s = [r2 for _, r2 in self.r2_training_history[pc]]
-                    rebalancing_r2s = [r2 for _, r2 in self.r2_history[pc]]
+                    prediction_r2s = [r2 for _, r2 in self.r2_history[pc]]
                     print(f"{pc}:")
-                    print(f"  Training R² Mean: {np.mean(training_r2s):.4f}, Std: {np.std(training_r2s):.4f}")
-                    print(f"  Rebalancing R² Mean: {np.mean(rebalancing_r2s):.4f}, Std: {np.std(rebalancing_r2s):.4f}")
-                    print(f"  R² Correlation: {np.corrcoef(training_r2s, rebalancing_r2s)[0,1]:.4f}")
+                    print(
+                        f"  Training R² ({self.LR_lookback}-day) Mean: {np.mean(training_r2s):.4f}, Std: {np.std(training_r2s):.4f}")
+                    print(
+                        f"  Prediction R² (5-day) Mean: {np.mean(prediction_r2s):.4f}, Std: {np.std(prediction_r2s):.4f}")
+                    if len(training_r2s) > 1 and len(prediction_r2s) > 1:
+                        print(
+                            f"  Training vs Prediction R² Correlation: {np.corrcoef(training_r2s, prediction_r2s)[0, 1]:.4f}")
 
-        # Enhanced plotting from Document 2
+        # New code to print percentage of sector movement for PC1-PC5 as the last output
+        print("\nPercentage of Sector Movement Represented by PCs (Across All Rebalance Periods):")
+        all_explained_vars = np.array([result['pca_explained_var'] for result in validation_results])
+        mean_explained_vars = np.mean(all_explained_vars, axis=0)
+        for i, var in enumerate(mean_explained_vars[:5]):  # Limit to PC1-PC5
+            print(f"PC_{i + 1}: {var * 100:.2f}%")
+
+        # Plotting remains unchanged
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10))
+
+        # Plot 1: Training R² (regression line fit on LR_lookback period)
         plotted_training = False
-        for pc in [f'PC_{i+1}' for i in range(min(3, len(self.r2_training_history)))]:
+        for pc in [f'PC_{i + 1}' for i in range(min(3, len(self.r2_training_history)))]:
             if self.r2_training_history[pc]:
                 dates, r2s = zip(*self.r2_training_history[pc])
                 ax1.plot(dates, r2s, marker='o', label=f'Training R² {pc}', linewidth=2, markersize=4)
                 plotted_training = True
         if plotted_training:
-            ax1.set_title('Training R² (252-day period): Model Fit Quality', fontsize=14, fontweight='bold')
+            ax1.set_title(f'Training R² ({self.LR_lookback}-day period): Regression Model Fit Quality', fontsize=14,
+                          fontweight='bold')
             ax1.set_xlabel('Rebalance Date')
-            ax1.set_ylabel('Adjusted R² (252-day training)')
+            ax1.set_ylabel(f'R² (regression fit on {self.LR_lookback}-day training period)')
             ax1.legend()
             ax1.grid(True, alpha=0.3)
             ax1.tick_params(axis='x', rotation=45)
 
-        plotted_rebalancing = False
-        for pc in [f'PC_{i+1}' for i in range(min(3, len(self.r2_history)))]:
+        # Plot 2: Prediction R² (regression line performance on next 5 days)
+        plotted_prediction = False
+        for pc in [f'PC_{i + 1}' for i in range(min(3, len(self.r2_history)))]:
             if self.r2_history[pc]:
                 dates, r2s = zip(*self.r2_history[pc])
-                ax2.plot(dates, r2s, marker='s', label=f'Rebalancing R² {pc}', linewidth=2, markersize=4)
-                plotted_rebalancing = True
-        if plotted_rebalancing:
-            ax2.set_title('Rebalancing R² (5-day period): Prediction Quality', fontsize=14, fontweight='bold')
+                ax2.plot(dates, r2s, marker='s', label=f'Prediction R² {pc}', linewidth=2, markersize=4)
+                plotted_prediction = True
+        if plotted_prediction:
+            ax2.set_title('Prediction R² (5-day period): Regression Model Prediction Quality', fontsize=14,
+                          fontweight='bold')
             ax2.set_xlabel('Rebalance Date')
-            ax2.set_ylabel('Adjusted R² (5-day rebalancing)')
+            ax2.set_ylabel('R² (regression predictions on next 5 days)')
+            ax2.set_ylim(-0.5, 1)  # Set y-axis limits from -0.5 to 1
             ax2.legend()
             ax2.grid(True, alpha=0.3)
             ax2.tick_params(axis='x', rotation=45)
 
-        if plotted_training or plotted_rebalancing:
+        if plotted_training or plotted_prediction:
             plt.tight_layout()
             plt.show()
 
 if __name__ == "__main__":
-    stocks = ['GE', 'CAT', 'RTX', 'UNP', 'HON', 'BA', 'DE', 'UPS', 'LMT', 'ETN', 'PH', 'ITW', 'GD', 'NOC', 'MMM']
-    start_date = '2021-01-01'
+    stocks = ['JPM', 'BAC', 'WFC', 'C', 'GS', 'MS', 'V', 'MA', 'AXP', 'PNC', 'TFC', 'USB', 'ALL', 'MET', 'PRU']
+    start_date = '2015-01-01'
     end_date = '2025-08-22'
-    strategy = PCAFactorStrategy(stocks, start_date, end_date)
+    strategy = PCAFactorStrategy(stocks, start_date, end_date, LR_lookback=90)  # You can easily change this value
     strategy.download_data()
-    strategy.validate_step2()
+    strategy.validate_step3()
+
