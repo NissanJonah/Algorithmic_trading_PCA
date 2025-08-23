@@ -229,49 +229,130 @@ class PCAFactorStrategy:
         if factor_changes.empty or rebalance_date not in pc_series.index or rebalance_date not in factor_changes.index:
             return {}
 
-        lookback = self.LR_lookback
+        long_lookback = 90
+        short_lookback = 30
+
+        # Get past long_lookback days of data for factor selection
         try:
             rebalance_idx = factor_changes.index.get_loc(rebalance_date)
-            start_idx = max(0, rebalance_idx - lookback + 1)
-            period_dates = factor_changes.index[start_idx:rebalance_idx + 1]
-            common_dates = pc_series.index.intersection(period_dates)
-            if len(common_dates) < 20:
+            start_idx_long = max(0, rebalance_idx - long_lookback + 1)
+            period_dates_long = factor_changes.index[start_idx_long:rebalance_idx + 1]
+            common_dates_long = pc_series.index.intersection(period_dates_long)
+
+            if len(common_dates_long) < 30:  # Minimum data points required
                 return {}
-            pc_series_window = pc_series.loc[common_dates]
-            factor_changes_window = factor_changes.loc[common_dates]
+
+            pc_series_long = pc_series.loc[common_dates_long]
+            factor_changes_long = factor_changes.loc[common_dates_long]
+        except (KeyError, IndexError):
+            return {}
+
+        # Get past short_lookback days of data for model fitting
+        try:
+            start_idx_short = max(0, rebalance_idx - short_lookback + 1)
+            period_dates_short = factor_changes.index[start_idx_short:rebalance_idx + 1]
+            common_dates_short = pc_series.index.intersection(period_dates_short)
+
+            if len(common_dates_short) < 10:  # Minimum data points required
+                return {}
+
+            pc_series_short = pc_series.loc[common_dates_short]
+            factor_changes_short = factor_changes.loc[common_dates_short]
         except (KeyError, IndexError):
             return {}
 
         results = {}
         self.selected_factors = {}
 
-        # Use LASSO with CV for each PC
-        for pc in pc_series_window.columns:
-            y = pc_series_window[pc].to_numpy()
-            X = factor_changes_window.to_numpy()
-            if np.any(np.isnan(y)) or np.any(np.isnan(X)):
+        for pc_idx, pc in enumerate(pc_series_long.columns):
+            y_long = pc_series_long[pc].to_numpy()
+            X_long_full = factor_changes_long.to_numpy()
+            y_short = pc_series_short[pc].to_numpy()
+            X_short_full = factor_changes_short.to_numpy()
+
+            # Skip if there are NaNs
+            if np.any(np.isnan(y_long)) or np.any(np.isnan(X_long_full)) or \
+                    np.any(np.isnan(y_short)) or np.any(np.isnan(X_short_full)):
                 self.r2_history[pc].append((rebalance_date, 0.0))
                 self.r2_training_history[pc].append((rebalance_date, 0.0))
                 continue
 
-            # LASSO with cross-validation (alphas grid) - increased max_iter and tol for convergence
-            lasso = LassoCV(
-                cv=5,
-                alphas=np.logspace(-4, 0, 30),
-                max_iter=10000,  # Increased from 5000
-                tol=1e-4,  # Added explicit tolerance
-                random_state=42  # Added for reproducibility
-            )
-            lasso.fit(X, y)
-            best_r2_training = lasso.score(X, y)
+            # Step 1: Rank all factors by absolute R² with the PC using long period
+            factor_r2_scores = []
+            for i, factor_name in enumerate(self.factors):
+                X_single = X_long_full[:, i].reshape(-1, 1)
+                model = LinearRegression()
+                model.fit(X_single, y_long)
+                r2 = model.score(X_single, y_long)
+                factor_r2_scores.append((factor_name, abs(r2), i))
 
-            # Adjusted R²
-            n_training = len(y)
-            p = np.sum(lasso.coef_ != 0)
-            adjusted_r2_training = 1 - (1 - best_r2_training) * (n_training - 1) / (
-                    n_training - p - 1) if n_training > p + 1 and p > 0 else best_r2_training
+            # Sort by absolute R² descending
+            factor_r2_scores.sort(key=lambda x: x[1], reverse=True)
 
-            # Future prediction R² (next 5 days)
+            # Step 2: Start with the best single factor
+            if factor_r2_scores[0][1] < 0.01:  # Minimum threshold
+                self.r2_history[pc].append((rebalance_date, 0.0))
+                self.r2_training_history[pc].append((rebalance_date, 0.0))
+                continue
+
+            best_factors = [factor_r2_scores[0][0]]
+            best_factor_indices = [factor_r2_scores[0][2]]
+
+            # Fit initial model on long period
+            X_best_long = X_long_full[:, best_factor_indices]
+            model_long = LinearRegression()
+            model_long.fit(X_best_long, y_long)
+            best_r2_long = model_long.score(X_best_long, y_long)
+
+            # Step 3: Try adding next two highest R² factors
+            candidates = factor_r2_scores[1:3]  # Next 2 best factors
+
+            for factor_name, _, factor_idx in candidates:
+                if len(best_factor_indices) >= 3:  # Limit to 3 factors
+                    break
+
+                test_indices = best_factor_indices + [factor_idx]
+                X_test_long = X_long_full[:, test_indices]
+
+                # Check multicollinearity
+                test_factors_df_long = factor_changes_long.iloc[:, test_indices]
+                corr_matrix = test_factors_df_long.corr()
+                max_corr = 0
+                for i in range(len(test_indices)):
+                    for j in range(i + 1, len(test_indices)):
+                        max_corr = max(max_corr, abs(corr_matrix.iloc[i, j]))
+                if max_corr > 0.85:  # Skip if too correlated
+                    continue
+
+                # Fit model with additional factor
+                test_model = LinearRegression()
+                test_model.fit(X_test_long, y_long)
+                test_r2 = test_model.score(X_test_long, y_long)
+
+                # Update if R² improves
+                if test_r2 > best_r2_long:
+                    best_factors.append(factor_name)
+                    best_factor_indices.append(factor_idx)
+                    best_r2_long = test_r2
+
+            # Fit final model on short period
+            if not best_factors:
+                self.r2_history[pc].append((rebalance_date, 0.0))
+                self.r2_training_history[pc].append((rebalance_date, 0.0))
+                continue
+
+            X_short_best = X_short_full[:, best_factor_indices]
+            best_model = LinearRegression()
+            best_model.fit(X_short_best, y_short)
+
+            # Adjusted R² for training period
+            n_training = len(y_short)
+            p = len(best_factor_indices)
+            best_r2_training = best_model.score(X_short_best, y_short)
+            adjusted_r2_training = 1 - (1 - best_r2_training) * (n_training - 1) / (n_training - p - 1) \
+                if n_training > p + 1 else best_r2_training
+
+            # Calculate R² for next 5-day prediction period
             r2_prediction = 0.0
             try:
                 future_dates = self.data.index[self.data.index > rebalance_date][:5]
@@ -279,39 +360,40 @@ class PCAFactorStrategy:
                     future_end_date = future_dates[-1]
                     future_stock_prices = self.data.loc[rebalance_date:future_end_date]
                     future_returns = self.compute_log_returns(future_stock_prices)
+
                     if not future_returns.empty and len(future_returns) >= 3:
-                        future_std_returns = pd.DataFrame(scaler.transform(future_returns),
-                                                          index=future_returns.index,
-                                                          columns=future_returns.columns)
+                        future_std_returns = pd.DataFrame(
+                            scaler.transform(future_returns),
+                            index=future_returns.index,
+                            columns=future_returns.columns
+                        )
+
                         pc_future = self.compute_pc_series(future_std_returns, V)
-                        future_factor_prices = self.factor_data.loc[rebalance_date:future_end_date]
-                        future_factor_changes = self.compute_factor_changes(future_factor_prices, rebalance_date,
+                        future_factor_changes = self.compute_factor_changes(self.factor_data, rebalance_date,
                                                                             future_end_date)
-                        common_future_dates = pc_future.index.intersection(future_factor_changes.index)
-                        if len(common_future_dates) >= 3:
-                            y_pred = pc_future.loc[common_future_dates, pc].to_numpy()
-                            X_pred = future_factor_changes.loc[common_future_dates].to_numpy()
-                            if not (np.any(np.isnan(y_pred)) or np.any(np.isnan(X_pred))):
-                                r2_prediction = lasso.score(X_pred, y_pred)
-            except Exception:
+
+                        if not future_factor_changes.empty and len(future_factor_changes) >= 3:
+                            common_future_dates = pc_future.index.intersection(future_factor_changes.index)
+                            if len(common_future_dates) >= 3:
+                                y_prediction = pc_future.loc[common_future_dates, pc].to_numpy()
+                                X_prediction = future_factor_changes.loc[common_future_dates, best_factors].to_numpy()
+                                if not (np.any(np.isnan(y_prediction)) or np.any(np.isnan(X_prediction))):
+                                    r2_prediction = best_model.score(X_prediction, y_prediction)
+            except (KeyError, IndexError, ValueError):
                 r2_prediction = 0.0
 
-            # Save only non-zero coefficients
-            nonzero_idx = np.where(lasso.coef_ != 0)[0]
-            best_factors = [self.factors[i] for i in nonzero_idx]
-            betas = {self.factors[i]: lasso.coef_[i] for i in nonzero_idx}
-
+            # Store results
             results[pc] = {
-                'alpha': lasso.intercept_,
-                'beta': betas,
+                'alpha': best_model.intercept_,
+                'beta': dict(zip(best_factors, best_model.coef_)),
                 'r2_training': adjusted_r2_training,
                 'r2_rebalancing': r2_prediction,
                 'factors': best_factors
             }
 
             self.selected_factors[pc] = best_factors
-            self.r2_training_history[pc].append((rebalance_date, adjusted_r2_training))
             self.r2_history[pc].append((rebalance_date, r2_prediction))
+            self.r2_training_history[pc].append((rebalance_date, adjusted_r2_training))
 
         return results
 
