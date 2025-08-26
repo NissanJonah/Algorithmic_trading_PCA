@@ -12,6 +12,8 @@ import warnings
 from scipy.optimize import lsq_linear
 import statsmodels.api as sm
 
+from Value_vs_Growth_Strategies.New_curr_strat import analyze_prediction_vs_actual_detailed
+
 warnings.filterwarnings('ignore')
 
 
@@ -38,6 +40,7 @@ class UltimateDetailedStrategy:
         self.centrality_matrix = None
         self.u_centrality = None
         self.previous_weights_backtest = None
+        self.current_positions = None
 
         # Results storage
         self.portfolio_history = []
@@ -52,25 +55,37 @@ class UltimateDetailedStrategy:
     ###########################################################################
     # DATA LOADING AND PREPARATION
     ###########################################################################
-
     def load_full_data(self, stock_symbols, start_date, end_date, factors_dict=None):
-        """Load full dataset from 252 days before start_date until end_date"""
         print("Loading full stock and factor data...")
         self.stocks = stock_symbols
-
-        # Calculate actual start date
         start_date_dt = pd.to_datetime(start_date)
         extended_start_date = start_date_dt - pd.Timedelta(days=360)
-
-        # Load stock price data
         stock_data = yf.download(stock_symbols, start=extended_start_date, end=end_date, auto_adjust=True)
         prices = stock_data['Close']
         if isinstance(prices, pd.Series):
             prices = prices.to_frame(stock_symbols[0])
-        self.P_full = prices.dropna()
-        print(f"Loaded full price data shape: {self.P_full.shape}")
 
-        # Load factor data
+        # Validate price data
+        prices = prices.dropna(how='all')  # Drop rows where all prices are NaN
+        valid_stocks = []
+        for stock in stock_symbols:
+            if stock in prices.columns:
+                stock_prices = prices[stock]
+                if stock_prices.isna().sum() / len(stock_prices) > 0.5:  # More than 50% missing
+                    print(f"Warning: Dropping {stock} due to excessive missing data")
+                    continue
+                if (stock_prices <= 0).any():  # Check for non-positive prices
+                    print(f"Warning: Dropping {stock} due to zero or negative prices")
+                    continue
+                valid_stocks.append(stock)
+            else:
+                print(f"Warning: No data for {stock}")
+        prices = prices[valid_stocks]
+        self.P_full = prices
+        print(f"Loaded full price data shape: {self.P_full.shape}, stocks: {valid_stocks}")
+        self.stocks = valid_stocks  # Update stock list
+
+        # Factor data handling (similar validation)
         if factors_dict:
             factor_symbols = list(factors_dict.keys())
             print(f"Loading full factor data for {len(factor_symbols)} symbols...")
@@ -78,18 +93,25 @@ class UltimateDetailedStrategy:
             factors_prices = factor_data['Close']
             if isinstance(factors_prices, pd.Series):
                 factors_prices = factors_prices.to_frame(factor_symbols[0])
-
-            factors_prices = factors_prices.dropna(axis=1, how='all')
-            if factors_prices.empty:
-                print("Warning: No valid factor data loaded. Skipping factor data.")
-                self.factors_data_full = None
-            else:
-                self.factors_data_full = factors_prices.dropna()
-                print(f"Loaded full factor data shape: {self.factors_data_full.shape}")
+            factors_prices = factors_prices.dropna(how='all')
+            valid_factors = []
+            for factor in factor_symbols:
+                if factor in factors_prices.columns:
+                    factor_prices = factors_prices[factor]
+                    if factor_prices.isna().sum() / len(factor_prices) > 0.5:
+                        print(f"Warning: Dropping factor {factor} due to excessive missing data")
+                        continue
+                    if (factor_prices <= 0).any():
+                        print(f"Warning: Dropping factor {factor} due to zero or negative prices")
+                        continue
+                    valid_factors.append(factor)
+            factors_prices = factors_prices[valid_factors]
+            self.factors_data_full = factors_prices if not factors_prices.empty else None
+            print(
+                f"Loaded full factor data shape: {self.factors_data_full.shape if self.factors_data_full is not None else 'None'}")
         else:
             self.factors_data_full = None
             print("No factor data provided.")
-
         self.backtest_start_date = start_date
 
     def set_current_window(self, current_date):
@@ -113,36 +135,51 @@ class UltimateDetailedStrategy:
 
     def prepare_returns_matrix(self, standardize=False):
         """Construct returns matrix R of shape (T, N) for current window"""
-        self.R = np.log(self.P / self.P.shift(1)).dropna()
-
+        if len(self.P) < 2:
+            raise ValueError(f"Insufficient price data: only {len(self.P)} days available")
+        returns = np.log(self.P / self.P.shift(1))
+        # Replace寻
+        valid_columns = [col for col in returns.columns if
+                         not returns[col].isna().all() and not (returns[col] == np.inf).any() and not (
+                                     returns[col] == -np.inf).any()]
+        self.R = returns[valid_columns].dropna()
+        if self.R.empty:
+            raise ValueError("No valid returns data after cleaning")
+        print(f"Returns matrix shape: {self.R.shape}, stocks: {valid_columns}")
         if standardize:
             scaler = StandardScaler()
             self.R = pd.DataFrame(scaler.fit_transform(self.R),
                                   index=self.R.index, columns=self.R.columns)
-
         return self.R
 
     ###########################################################################
     # CORE STRATEGY COMPONENTS
     ###########################################################################
-
     def compute_covariance_and_pca(self, n_components=None):
         """Covariance and PCA for current window"""
         T, N = self.R.shape
+        if T < 2 or N < 1:
+            raise ValueError(f"Invalid returns matrix shape: {self.R.shape}")
         self.Sigma = np.cov(self.R.T, ddof=1)
-
+        if np.any(np.isnan(self.Sigma)) or np.any(np.isinf(self.Sigma)):
+            print("Warning: Covariance matrix contains NaN or Inf values")
+            # Option 1: Remove problematic stocks
+            valid_cols = ~np.any(np.isnan(self.R) | np.isinf(self.R), axis=0)
+            if not np.any(valid_cols):
+                raise ValueError("No valid stocks remain after removing NaN/Inf")
+            self.R = self.R.iloc[:, valid_cols]
+            self.stocks = [self.stocks[i] for i in range(len(self.stocks)) if valid_cols[i]]
+            self.Sigma = np.cov(self.R.T, ddof=1)
+            print(f"Reduced to {len(self.stocks)} stocks after cleaning")
         eigenvalues, eigenvectors = linalg.eigh(self.Sigma)
         idx = np.argsort(eigenvalues)[::-1]
         eigenvalues = eigenvalues[idx]
         eigenvectors = eigenvectors[:, idx]
-
         if n_components is None:
             n_components = min(N, 10)
-
         self.V = eigenvectors[:, :n_components]
         self.eigenvalues = eigenvalues[:n_components]
         self.PC_day = self.R.values @ self.V
-
         return self.V, self.PC_day
 
     def factor_pc_regression(self, min_r_squared=0.15, max_correlation=0.9, max_vif=5):
@@ -339,29 +376,129 @@ class UltimateDetailedStrategy:
         return self.r_hat
 
     def compute_centrality_weighting(self, method='correlation'):
-        """Centrality Weighting - recalculated for current window"""
+        """Fixed centrality weighting - handles None values properly"""
+        import numpy as np
+        from numpy import linalg
+
+        # Check if r_hat exists and is not None
+        if not hasattr(self, 'r_hat') or self.r_hat is None:
+            print("Warning: r_hat is None, cannot compute centrality weighting")
+            # Create default centrality weights (all ones)
+            N = len(self.stocks)
+            self.u_centrality = np.ones(N)
+            self.r_hat_weighted = np.zeros(N)  # Return zeros if no predictions
+            return self.r_hat_weighted
+
+        # Check if r_hat has valid data
+        if np.all(np.isnan(self.r_hat)) or np.all(self.r_hat == 0):
+            print("Warning: r_hat contains only NaN or zeros")
+            N = len(self.r_hat)
+            self.u_centrality = np.ones(N)
+            self.r_hat_weighted = self.r_hat.copy()  # Just pass through
+            return self.r_hat_weighted
+
         if method == 'correlation':
             self.centrality_matrix = np.corrcoef(self.R.T)
         else:
             self.centrality_matrix = self.Sigma
 
-        eigenvalues, eigenvectors = linalg.eigh(self.centrality_matrix)
-        max_eigenvalue_idx = np.argmax(eigenvalues)
-        self.u_centrality = np.abs(eigenvectors[:, max_eigenvalue_idx])
+        # Check for valid centrality matrix
+        if np.any(np.isnan(self.centrality_matrix)) or np.any(np.isinf(self.centrality_matrix)):
+            print("Warning: Centrality matrix contains NaN/Inf values")
+            N = len(self.r_hat)
+            self.u_centrality = np.ones(N)
+            self.r_hat_weighted = self.r_hat.copy()
+            return self.r_hat_weighted
 
-        self.u_centrality = self.u_centrality - np.mean(self.u_centrality) + 1
-        self.u_centrality = self.u_centrality / np.std(self.u_centrality, ddof=1)
+        try:
+            eigenvalues, eigenvectors = linalg.eigh(self.centrality_matrix)
+            max_eigenvalue_idx = np.argmax(eigenvalues)
+            self.u_centrality = np.abs(eigenvectors[:, max_eigenvalue_idx])
+        except Exception as e:
+            print(f"Warning: Eigenvalue decomposition failed: {e}")
+            N = len(self.r_hat)
+            self.u_centrality = np.ones(N)
+            self.r_hat_weighted = self.r_hat.copy()
+            return self.r_hat_weighted
+
+        # Ensure non-negative
         self.u_centrality = np.maximum(self.u_centrality, 0)
 
-        self.r_hat_weighted = self.r_hat * self.u_centrality
+        # Normalize to mean=1 and std=0.13 (very small deviation)
+        current_mean = np.mean(self.u_centrality)
+        current_std = np.std(self.u_centrality, ddof=1)
 
-        return self.r_hat_weighted
+        if current_mean > 0 and current_std > 0:  # Avoid division by zero
+            # Center to mean=1
+            self.u_centrality = self.u_centrality - current_mean + 1
+            # Scale to std=0.13 (very conservative)
+            self.u_centrality = self.u_centrality / current_std * 0.13
+            # Adjust mean back to 1
+            final_mean = np.mean(self.u_centrality)
+            self.u_centrality = self.u_centrality + (1 - final_mean)
 
+            # Compress range to approximately [0.7, 1.3]
+            # Desired range [0.7, 1.3] has width 0.6, centered at 1
+            # Scale deviations from mean to fit within ±0.3
+            deviations = self.u_centrality - 1
+            current_range = np.max(np.abs(deviations))
+            if current_range > 0:
+                # Scale deviations to have max deviation of 0.3 (for range [0.7, 1.3])
+                scale_factor = 0.3 / current_range
+                self.u_centrality = 1 + deviations * scale_factor
+                # Re-normalize to std=0.13
+                current_std = np.std(self.u_centrality, ddof=1)
+                if current_std > 0:
+                    self.u_centrality = 1 + (self.u_centrality - 1) / current_std * 0.13
+                # Ensure mean=1
+                final_mean = np.mean(self.u_centrality)
+                self.u_centrality = self.u_centrality + (1 - final_mean)
+        else:
+            # Fallback: if we can't normalize properly, just set to all 1s
+            self.u_centrality = np.ones_like(self.u_centrality)
+
+        print(f"u_centrality mean: {np.mean(self.u_centrality):.4f}")
+        print(f"u_centrality std: {np.std(self.u_centrality, ddof=1):.4f}")
+        print(f"u_centrality range: [{np.min(self.u_centrality):.4f}, {np.max(self.u_centrality):.4f}]")
+
+        # Safe multiplication with proper error handling
+        try:
+            # Ensure both arrays are valid and same length
+            if len(self.r_hat) != len(self.u_centrality):
+                print(f"Warning: Length mismatch - r_hat: {len(self.r_hat)}, u_centrality: {len(self.u_centrality)}")
+                # Resize u_centrality to match r_hat
+                if len(self.r_hat) > len(self.u_centrality):
+                    # Extend u_centrality with ones
+                    extension = np.ones(len(self.r_hat) - len(self.u_centrality))
+                    self.u_centrality = np.concatenate([self.u_centrality, extension])
+                else:
+                    # Truncate u_centrality
+                    self.u_centrality = self.u_centrality[:len(self.r_hat)]
+
+            # Perform the multiplication
+            self.r_hat_weighted = self.r_hat * self.u_centrality
+
+            # Check result
+            if np.any(np.isnan(self.r_hat_weighted)) or np.any(np.isinf(self.r_hat_weighted)):
+                print("Warning: r_hat_weighted contains NaN/Inf values after multiplication")
+                # Fallback to unweighted
+                self.r_hat_weighted = self.r_hat.copy()
+
+            return self.r_hat_weighted
+
+        except Exception as e:
+            print(f"Error in centrality weighting multiplication: {e}")
+            print(f"r_hat type: {type(self.r_hat)}, shape: {getattr(self.r_hat, 'shape', 'N/A')}")
+            print(f"u_centrality type: {type(self.u_centrality)}, shape: {getattr(self.u_centrality, 'shape', 'N/A')}")
+
+            # Fallback: return unweighted predictions
+            self.r_hat_weighted = self.r_hat.copy()
+            return self.r_hat_weighted
     ###########################################################################
     # PORTFOLIO OPTIMIZATION
     ###########################################################################
     def optimize_portfolio(self, current_prices, stock_betas=None):
-        """Fixed optimization to ensure proper market-neutral 65/35 long-short portfolio"""
+        """Fixed optimization to ensure proper 65/35 long-short portfolio (beta-neutral, not strictly dollar-neutral)"""
         N = len(self.r_hat_weighted)
         C_total = self.C_0
 
@@ -378,13 +515,7 @@ class UltimateDetailedStrategy:
 
         constraints = []
 
-        # Market neutral constraint (net exposure = 0)
-        def market_neutral_constraint(v):
-            return np.sum(v)  # Should equal 0
-
-        constraints.append({'type': 'eq', 'fun': market_neutral_constraint})
-
-        # Total capital utilization constraint (exactly $10,000)
+        # Total capital utilization constraint (exactly $10,000 gross exposure)
         def total_allocation_constraint(v):
             return np.sum(np.abs(v)) - C_total  # Should equal 0
 
@@ -414,25 +545,29 @@ class UltimateDetailedStrategy:
 
         # Portfolio beta constraint (if betas provided)
         if stock_betas is not None:
-            def portfolio_beta_constraint(v):
-                portfolio_beta = np.abs(np.dot(v, stock_betas) / C_total)
-                return 0.15 - portfolio_beta  # More relaxed beta constraint
+            def portfolio_beta_lower(v):
+                portfolio_beta = np.dot(v, stock_betas) / C_total
+                return portfolio_beta + 0.15
 
-            constraints.append({'type': 'ineq', 'fun': portfolio_beta_constraint})
+            def portfolio_beta_upper(v):
+                portfolio_beta = np.dot(v, stock_betas) / C_total
+                return 0.15 - portfolio_beta
+
+            constraints.append({'type': 'ineq', 'fun': portfolio_beta_lower})
+            constraints.append({'type': 'ineq', 'fun': portfolio_beta_upper})
 
         # Individual position bounds (more relaxed)
         bounds = []
         for i in range(N):
-            # Allow both long and short positions for all stocks
             bounds.append((-0.20 * C_total, 0.20 * C_total))  # Max 20% in any position
 
-        # Improved initial guess that ensures market neutrality with 65/35 split
+        # Improved initial guess with 65/35 split (net positive)
         v0 = np.zeros(N)
 
         # Sort stocks by expected returns
-        sorted_indices = np.argsort(r_hat_scaled)[::-1]  # Descending order
+        sorted_indices = np.argsort(r_hat_scaled)[::-1]
 
-        # Allocate top half to long positions, bottom half to short
+        # Allocate top half to long, bottom half to short
         n_long = len(sorted_indices) // 2
         n_short = len(sorted_indices) - n_long
 
@@ -447,11 +582,10 @@ class UltimateDetailedStrategy:
         if len(short_indices) > 0:
             v0[short_indices] = -0.35 * C_total / len(short_indices)
 
-        # Adjust for beta neutrality if needed
+        # Adjust for beta if needed
         if stock_betas is not None:
             portfolio_beta = np.dot(v0, stock_betas) / C_total
             if abs(portfolio_beta) > 0.1:
-                # Simple beta adjustment
                 beta_adjustment = -portfolio_beta / np.mean(stock_betas ** 2) if np.mean(stock_betas ** 2) > 0 else 0
                 v0 += beta_adjustment * stock_betas * C_total / N
 
@@ -472,6 +606,101 @@ class UltimateDetailedStrategy:
 
         self.share_quantities = self.optimal_weights / current_prices
         return self.optimal_weights
+
+    def _least_squares_fallback(self, r_hat_scaled, bounds, stock_betas, C_total):
+        """Enhanced least squares fallback for 65/35 split without dollar neutrality"""
+        N = len(r_hat_scaled)
+
+        # Sort by expected returns
+        sorted_indices = np.argsort(r_hat_scaled)[::-1]
+
+        # Create target
+        target = np.zeros(N)
+
+        n_long = N // 2
+        long_indices = sorted_indices[:n_long]
+        short_indices = sorted_indices[n_long:]
+
+        # Weight long
+        if len(long_indices) > 0:
+            long_returns = r_hat_scaled[long_indices]
+            long_returns_positive = np.maximum(long_returns, 0.001)
+            long_weights = long_returns_positive / np.sum(long_returns_positive)
+            target[long_indices] = long_weights * 0.65 * C_total
+
+        # Weight short
+        if len(short_indices) > 0:
+            short_returns = r_hat_scaled[short_indices]
+            short_returns_negative = np.minimum(short_returns, -0.001)
+            short_weights = np.abs(short_returns_negative) / np.sum(np.abs(short_returns_negative))
+            target[short_indices] = -short_weights * 0.35 * C_total
+
+        # Ensure total capital utilization
+        current_total = np.sum(np.abs(target))
+        if current_total > 0:
+            target *= C_total / current_total
+
+        # Apply beta adjustment if needed
+        if stock_betas is not None:
+            target_beta = np.dot(target, stock_betas) / C_total
+            if abs(target_beta) > 0.15:
+                beta_adj = -target_beta / np.sum(stock_betas ** 2) * stock_betas * C_total if np.sum(stock_betas ** 2) > 0 else 0
+                target += beta_adj
+
+                # Re-normalize after adjustment
+                current_total = np.sum(np.abs(target))
+                if current_total > 0:
+                    target *= C_total / current_total
+
+        # Apply bounds
+        lb = np.array([b[0] for b in bounds])
+        ub = np.array([b[1] for b in bounds])
+        target = np.clip(target, lb, ub)
+
+        # Final adjustment for capital utilization (no neutrality adjustment)
+        total_after_bounds = np.sum(np.abs(target))
+        if total_after_bounds > 0 and abs(total_after_bounds - C_total) > 1e-6:
+            target *= C_total / total_after_bounds
+
+        return target
+
+    def validate_optimization_results(self):
+        """Enhanced validation that checks all constraints for 65/35 allocation"""
+        print(f"\n=== OPTIMIZATION VALIDATION ===")
+        print(f"Capital: ${self.C_0:,.0f}")
+
+        long_exposure = np.sum(self.optimal_weights[self.optimal_weights > 0])
+        short_exposure = np.abs(np.sum(self.optimal_weights[self.optimal_weights < 0]))
+        net_exposure = np.sum(self.optimal_weights)
+        total_exposure = np.sum(np.abs(self.optimal_weights))
+
+        print(f"Total long exposure: ${long_exposure:,.0f}")
+        print(f"Total short exposure: ${short_exposure:,.0f}")
+        print(f"Net exposure: ${net_exposure:,.0f}")
+        print(f"Capital utilization: {total_exposure / self.C_0:.1%}")
+        print(f"Long exposure: {long_exposure / self.C_0:.1%}")
+        print(f"Short exposure: {short_exposure / self.C_0:.1%}")
+        print(f"Net position: {net_exposure / self.C_0:.1%}")
+
+        # Check if constraints are satisfied
+        issues = []
+        if abs(total_exposure - self.C_0) > 100:  # Allow $100 deviation
+            issues.append(f"Capital utilization off: ${total_exposure:.0f} vs ${self.C_0}")
+        if long_exposure < 0.60 * self.C_0:
+            issues.append(f"Long exposure too low: {long_exposure / self.C_0:.1%}")
+        if long_exposure > 0.70 * self.C_0:
+            issues.append(f"Long exposure too high: {long_exposure / self.C_0:.1%}")
+        if short_exposure < 0.30 * self.C_0:
+            issues.append(f"Short exposure too low: {short_exposure / self.C_0:.1%}")
+        if short_exposure > 0.40 * self.C_0:
+            issues.append(f"Short exposure too high: {short_exposure / self.C_0:.1%}")
+
+        if issues:
+            print("⚠️ CONSTRAINT VIOLATIONS:")
+            for issue in issues:
+                print(f"  • {issue}")
+        else:
+            print("✅ All constraints satisfied")
 
     def analyze_strategy_attribution(self):
         """Analyze where P&L is coming from"""
@@ -497,100 +726,37 @@ class UltimateDetailedStrategy:
         print(f"Net P&L: ${long_pnl + short_pnl - cost_drag:.2f}")
 
     def calculate_forward_returns(self, current_date, forward_days=4):
-        """Calculate actual returns for the forward period (next 5 trading days)"""
-        # Find the next trading days after current_date
+        """Calculate actual returns for the next 4 trading days"""
+        current_date = pd.to_datetime(current_date)
         future_dates = self.P_full[self.P_full.index > current_date].index
 
         if len(future_dates) < forward_days:
             print(
                 f"Warning: Insufficient future data for {current_date}. Need {forward_days} days, have {len(future_dates)}")
-            return None, None  # Not enough future data
+            return None, None
 
         try:
             next_rebalance_date = future_dates[forward_days - 1]
-
-            # Get prices at current date and next rebalance date
             current_prices = self.P_full.loc[current_date]
             future_prices = self.P_full.loc[next_rebalance_date]
 
-            # Calculate returns
-            forward_returns = (future_prices / current_prices - 1).values
+            # Calculate arithmetic returns
+            forward_returns = (future_prices / current_prices - 1)
 
-            return forward_returns, next_rebalance_date
+            # Validate returns
+            forward_returns = forward_returns.replace([np.inf, -np.inf], np.nan)
+            if forward_returns.isna().all():
+                print(f"Warning: No valid returns for {current_date} to {next_rebalance_date}")
+                return None, None
+
+            return forward_returns.values, next_rebalance_date
 
         except KeyError as e:
             print(f"KeyError in calculate_forward_returns for {current_date}: {e}")
-            print(f"Available dates in P_full: {self.P_full.index[-5:]}")
             return None, None
         except Exception as e:
             print(f"Error in calculate_forward_returns for {current_date}: {e}")
             return None, None
-
-    def _least_squares_fallback(self, r_hat_scaled, bounds, stock_betas, C_total):
-        """Enhanced least squares fallback that ensures market neutrality with 65/35 split"""
-        N = len(r_hat_scaled)
-
-        # Sort by expected returns
-        sorted_indices = np.argsort(r_hat_scaled)[::-1]
-
-        # Create market neutral target
-        target = np.zeros(N)
-
-        # Split into long and short based on expected returns
-        n_long = N // 2
-        long_indices = sorted_indices[:n_long]
-        short_indices = sorted_indices[n_long:]
-
-        # Weight by expected returns within each group
-        if len(long_indices) > 0:
-            long_returns = r_hat_scaled[long_indices]
-            long_returns_positive = np.maximum(long_returns, 0.001)  # Ensure positive
-            long_weights = long_returns_positive / np.sum(long_returns_positive)
-            target[long_indices] = long_weights * 0.65 * C_total
-
-        if len(short_indices) > 0:
-            short_returns = r_hat_scaled[short_indices]
-            short_returns_negative = np.minimum(short_returns, -0.001)  # Ensure negative
-            short_weights = np.abs(short_returns_negative) / np.sum(np.abs(short_returns_negative))
-            target[short_indices] = -short_weights * 0.35 * C_total
-
-        # Ensure exact market neutrality
-        net_exposure = np.sum(target)
-        if abs(net_exposure) > 1e-6:
-            # Adjust all positions proportionally to achieve neutrality
-            adjustment = -net_exposure / N
-            target += adjustment
-
-        # Ensure total capital utilization
-        current_total = np.sum(np.abs(target))
-        if current_total > 0:
-            target *= C_total / current_total
-
-        # Apply beta adjustment if needed
-        if stock_betas is not None:
-            target_beta = np.dot(target, stock_betas) / C_total
-            if abs(target_beta) > 0.15:
-                # Beta adjustment while maintaining market neutrality
-                beta_adj = -target_beta / np.sum(stock_betas ** 2) * stock_betas * C_total
-                beta_adj_neutral = beta_adj - np.mean(beta_adj)  # Remove mean to maintain neutrality
-                target += beta_adj_neutral
-
-        # Apply bounds
-        lb = np.array([b[0] for b in bounds])
-        ub = np.array([b[1] for b in bounds])
-        target = np.clip(target, lb, ub)
-
-        # Final adjustment to maintain capital and neutrality constraints
-        net_after_bounds = np.sum(target)
-        total_after_bounds = np.sum(np.abs(target))
-
-        if abs(net_after_bounds) > 1e-6:
-            target -= net_after_bounds / N
-
-        if total_after_bounds > 0 and abs(total_after_bounds - C_total) > 1e-6:
-            target *= C_total / total_after_bounds
-
-        return target
 
     def validate_optimization_results(self):
         """Enhanced validation that checks all constraints for 65/35 allocation"""
@@ -779,9 +945,9 @@ class UltimateDetailedStrategy:
 
         portfolio_values = [self.C_0]
         rebalance_dates = []
-        current_positions = None  # Track shares held
+        self.current_positions = None  # Ensure initialized
         previous_prices = None
-        self.previous_weights_backtest = None  # Initialize for backtest
+        self.previous_weights_backtest = None
 
         for i in range(0, len(backtest_dates), rebalance_freq):
             current_date = backtest_dates[i]
@@ -792,20 +958,22 @@ class UltimateDetailedStrategy:
 
             # Calculate P&L from previous positions if they exist
             position_pnl = 0
-            if current_positions is not None and previous_prices is not None:
+            if self.current_positions is not None and previous_prices is not None:
                 try:
-                    # Calculate price returns for the period (current prices vs previous prices)
                     price_returns = (current_prices / previous_prices) - 1
+                    position_pnl = np.sum(self.current_positions * previous_prices * price_returns)
+                    self.C_0 += position_pnl
 
-                    # Calculate P&L from existing positions (shares * previous_price * return)
-                    position_pnl = np.sum(current_positions * previous_prices * price_returns)
-
-                    if i < 5:  # Only print first few for debugging
+                    gross_portfolio_value = portfolio_values[-1] + position_pnl
+                    if i < 5:
                         print(f"Period {len(portfolio_values)}: Previous value: ${portfolio_values[-1]:.2f}")
                         print(f"Position P&L: ${position_pnl:.2f}")
+                        print(f"Gross value before trades: ${gross_portfolio_value:.2f}")
                 except Exception as e:
                     print(f"Error calculating P&L for {current_date}: {e}")
-                    position_pnl = 0
+                    gross_portfolio_value = portfolio_values[-1]
+            else:
+                gross_portfolio_value = portfolio_values[-1]
 
             # Calculate forward returns for the NEXT period (for performance evaluation)
             actual_forward_returns, next_rebalance_date = self.calculate_forward_returns(current_date, rebalance_freq)
@@ -831,11 +999,11 @@ class UltimateDetailedStrategy:
                     trade_record['transaction_cost'] = transaction_cost
 
                     # Update portfolio value after transaction costs and P&L
-                    new_portfolio_value = portfolio_values[-1] + position_pnl - transaction_cost
+                    new_portfolio_value = gross_portfolio_value - transaction_cost
                     portfolio_values.append(new_portfolio_value)
 
                     # Update for next iteration
-                    current_positions = self.share_quantities.copy()
+                    self.current_positions = self.share_quantities.copy()  # Update positions
                     previous_prices = current_prices.copy()
                     self.previous_weights = self.optimal_weights.copy()
 
@@ -851,23 +1019,23 @@ class UltimateDetailedStrategy:
                         if i < 5:  # Debug output
                             print(f"Transaction cost: ${transaction_cost:.2f}")
                             print(f"New portfolio value: ${new_portfolio_value:.2f}")
-                            print(f"Current positions value: ${np.sum(current_positions * current_prices):.2f}")
+                            print(f"Current positions value: ${np.sum(self.current_positions * current_prices):.2f}")
                             print("---")
 
                 else:
                     # No trade executed, maintain current positions
                     new_portfolio_value = portfolio_values[-1] + position_pnl
                     portfolio_values.append(new_portfolio_value)
-                    if current_positions is None:
-                        current_positions = np.zeros(len(self.stocks))
+                    if self.current_positions is None:
+                        self.current_positions = np.zeros(len(self.stocks))
 
             except Exception as e:
                 print(f"Error at {current_date}: {e}")
                 new_portfolio_value = portfolio_values[-1] + position_pnl
                 portfolio_values.append(new_portfolio_value)
                 # Maintain existing positions on error
-                if current_positions is None:
-                    current_positions = np.zeros(len(self.stocks))
+                if self.current_positions is None:
+                    self.current_positions = np.zeros(len(self.stocks))
 
         # Calculate performance metrics
         if len(portfolio_values) > 1:
@@ -903,8 +1071,12 @@ class UltimateDetailedStrategy:
             'total_return': total_return,
             'annualized_return': annualized_return
         }
+
     def debug_prediction_alignment(self, current_date):
-        """Debug function to verify prediction and actual returns are aligned"""
+        current_date = pd.to_datetime(current_date)
+        if current_date < self.P_full.index[0] or current_date > self.P_full.index[-1]:
+            raise ValueError(
+                f"Debug date {current_date} is outside data range {self.P_full.index[0]} to {self.P_full.index[-1]}")
         print(f"\n=== DEBUG: Prediction Alignment for {current_date} ===")
 
         # Set current window and make predictions
@@ -2131,11 +2303,11 @@ def run_strategy_example():
     ]
 
     # Load data for the full period 2018-2024
-    strategy.load_full_data(stock_symbols, '2018-01-01', '2024-01-01',
+    strategy.load_full_data(stock_symbols, '2023-05-01', '2024-01-01',
                             {symbol: symbol for symbol in factor_symbols})
 
     # Run backtest for the full period
-    backtest_results = strategy.backtest_strategy('2018-01-01', '2023-12-31', rebalance_freq=4)
+    backtest_results = strategy.backtest_strategy('2023-05-01', '2024-01-01', rebalance_freq=4)
 
     # Calculate and print performance metrics only
     performance = strategy.compute_profitability_metrics()
@@ -2212,142 +2384,495 @@ def analyze_factor_importance(strategy):
     return factor_importance, overall_importance
 
 
-def analyze_prediction_vs_actual_detailed(strategy):
-    """Create detailed scatter plot of predicted vs actual returns with proper statistics"""
-    predicted_all = []
-    actual_all = []
-    stock_names = []
-    dates = []
+def debug_prediction_data_flow(strategy, trade_index=0):
+    """Debug the data flow from prediction to actual returns for a specific trade"""
+    print(f"\n" + "=" * 70)
+    print(f"DEBUGGING PREDICTION DATA FLOW - Trade {trade_index + 1}")
+    print("=" * 70)
 
-    print("Collecting prediction vs actual data...")
-
-    for i, trade in enumerate(strategy.portfolio_history):
-        if 'actual_returns' in trade and 'expected_returns' in trade:
-            pred_returns = trade['expected_returns']
-            actual_returns = trade['actual_returns']
-
-            for j, stock in enumerate(strategy.stocks):
-                if j < len(pred_returns) and j < len(actual_returns):
-                    predicted_all.append(pred_returns[j])
-                    actual_all.append(actual_returns[j])
-                    stock_names.append(stock)
-                    dates.append(trade['timestamp'])
-
-    if len(predicted_all) == 0:
-        print("No prediction data available")
+    if trade_index >= len(strategy.portfolio_history):
+        print(f"Trade index {trade_index} not available. Max index: {len(strategy.portfolio_history) - 1}")
         return None
 
-    predicted_all = np.array(predicted_all)
-    actual_all = np.array(actual_all)
+    trade = strategy.portfolio_history[trade_index]
+    trade_date = trade['timestamp']
 
-    pred_mean = np.mean(np.abs(predicted_all))
-    actual_mean = np.mean(np.abs(actual_all))
+    print(f"Trade Date: {trade_date}")
+    print(f"Stocks: {strategy.stocks}")
 
-    print(f"Raw predicted returns - Mean absolute: {pred_mean:.6f}")
-    print(f"Raw actual returns - Mean absolute: {actual_mean:.6f}")
+    # Check what's stored in the trade
+    print(f"\nTRADE RECORD CONTENTS:")
+    for key, value in trade.items():
+        if isinstance(value, np.ndarray):
+            print(f"  {key}: shape {value.shape}, range [{np.min(value):.6f}, {np.max(value):.6f}]")
+        elif isinstance(value, (int, float)):
+            print(f"  {key}: {value}")
+        else:
+            print(f"  {key}: {type(value)}")
 
-    # Both should now be 5-day period returns - no additional scaling needed
-    print("Both predicted and actual returns are 5-day period returns")
+    # Check if we can recreate the prediction process
+    print(f"\nRECREATING PREDICTION PROCESS:")
 
-    percentile_5 = np.percentile(predicted_all, 5)
-    percentile_95 = np.percentile(predicted_all, 95)
-    actual_5 = np.percentile(actual_all, 5)
-    actual_95 = np.percentile(actual_all, 95)
+    try:
+        # Set the window to the trade date
+        strategy.set_current_window(trade_date)
+        print(f"  Window set to: {strategy.P.index[0]} to {strategy.P.index[-1]}")
 
-    mask = ((predicted_all >= percentile_5) & (predicted_all <= percentile_95) &
-            (actual_all >= actual_5) & (actual_all <= actual_95))
+        # Recreate the prediction process
+        strategy.prepare_returns_matrix(standardize=False)
+        print(f"  Returns matrix shape: {strategy.R.shape}")
 
-    pred_clean = predicted_all[mask]
-    actual_clean = actual_all[mask]
+        strategy.compute_covariance_and_pca(n_components=5)
+        print(f"  PCA computed, V shape: {strategy.V.shape}")
 
-    print(f"Using {len(pred_clean)} data points after outlier removal")
+        regressions = strategy.factor_pc_regression()
+        print(f"  Factor regressions: {len(regressions) if regressions else 0} PCs")
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+        strategy.compute_historic_pc_std()
+        print(f"  PC std computed, shape: {strategy.sigma_PC.shape}")
 
-    ax1.scatter(pred_clean, actual_clean, alpha=0.3, s=20, c='blue')
+        current_factor_changes = strategy.calculate_current_factor_changes(lookback_days=4)
+        print(f"  Current factor changes: {len(current_factor_changes)} factors")
 
-    correlation = np.corrcoef(pred_clean, actual_clean)[0, 1]
+        strategy.predict_pc_movement(current_factor_changes)
+        print(f"  PC predictions: {strategy.delta_PC_pred}")
 
-    min_val = min(np.min(pred_clean), np.min(actual_clean))
-    max_val = max(np.max(pred_clean), np.max(actual_clean))
-    perfect_line_range = [min_val, max_val]
-    ax1.plot(perfect_line_range, perfect_line_range, 'r--',
-             linewidth=2, label='Perfect Prediction (y=x)', alpha=0.8)
+        strategy.predict_stock_returns()
+        print(f"  Stock return predictions shape: {strategy.r_hat.shape}")
+        print(f"  Stock return predictions range: [{np.min(strategy.r_hat):.6f}, {np.max(strategy.r_hat):.6f}]")
 
+        strategy.compute_centrality_weighting()
+        print(f"  Weighted predictions shape: {strategy.r_hat_weighted.shape}")
+        print(
+            f"  Weighted predictions range: [{np.min(strategy.r_hat_weighted):.6f}, {np.max(strategy.r_hat_weighted):.6f}]")
+
+        # Compare with stored values
+        if 'expected_returns' in trade:
+            stored_predictions = trade['expected_returns']
+            print(f"\n  COMPARISON:")
+            print(
+                f"    Recreated predictions range: [{np.min(strategy.r_hat_weighted):.6f}, {np.max(strategy.r_hat_weighted):.6f}]")
+            print(f"    Stored predictions range: [{np.min(stored_predictions):.6f}, {np.max(stored_predictions):.6f}]")
+
+            if len(strategy.r_hat_weighted) == len(stored_predictions):
+                diff = np.abs(strategy.r_hat_weighted - stored_predictions)
+                print(f"    Max difference: {np.max(diff):.8f}")
+                if np.max(diff) < 1e-6:
+                    print("    ✅ Recreated predictions match stored predictions")
+                else:
+                    print("    ⚠️  Recreated predictions differ from stored predictions")
+            else:
+                print(
+                    f"    ❌ Length mismatch: recreated {len(strategy.r_hat_weighted)}, stored {len(stored_predictions)}")
+
+    except Exception as e:
+        print(f"  ❌ Error recreating predictions: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # Check the actual returns calculation
+    print(f"\nACTUAL RETURNS ANALYSIS:")
+    if 'actual_returns' in trade:
+        actual_returns = trade['actual_returns']
+        print(f"  Stored actual returns shape: {actual_returns.shape}")
+        print(f"  Stored actual returns range: [{np.min(actual_returns):.6f}, {np.max(actual_returns):.6f}]")
+
+        # Try to recreate the forward returns calculation
+        forward_returns, next_date = strategy.calculate_forward_returns(trade_date, 4)
+        if forward_returns is not None:
+            print(f"  Recreated forward returns shape: {forward_returns.shape}")
+            print(f"  Recreated forward returns range: [{np.min(forward_returns):.6f}, {np.max(forward_returns):.6f}]")
+            print(f"  Forward period: {trade_date} to {next_date}")
+
+            if len(forward_returns) == len(actual_returns):
+                diff = np.abs(forward_returns - actual_returns)
+                print(f"  Max difference: {np.max(diff):.8f}")
+                if np.max(diff) < 1e-6:
+                    print("  ✅ Recreated actuals match stored actuals")
+                else:
+                    print("  ⚠️  Recreated actuals differ from stored actuals")
+            else:
+                print(f"  ❌ Length mismatch: recreated {len(forward_returns)}, stored {len(actual_returns)}")
+        else:
+            print("  ❌ Could not recreate forward returns")
+    else:
+        print("  ❌ No actual returns stored in trade")
+
+    return trade
+
+
+def run_fixed_returns_analysis(strategy):
+    """Run the FIXED returns analysis on your strategy object"""
+    print("Running FIXED prediction vs actual analysis...")
+
+    # First debug a specific trade
+    debug_results = debug_prediction_data_flow(strategy, trade_index=0)
+
+    # Then run the full analysis
+    results = analyze_prediction_vs_actual_detailed(strategy)
+
+    return results
+
+
+def analyze_prediction_vs_actual_detailed(strategy):
+    """Fixed prediction vs actual analysis with proper data alignment and scaling"""
+    print("\n" + "=" * 70)
+    print("FIXED PREDICTION vs ACTUAL ANALYSIS")
+    print("=" * 70)
+
+    if not strategy.portfolio_history:
+        print("No portfolio history available")
+        return None
+
+    # Collect all prediction-actual pairs with proper validation
+    all_predictions = []
+    all_actuals = []
+    all_dates = []
+    all_stocks = []
+
+    print("Validating prediction-actual pairs...")
+
+    valid_trades = 0
+    total_trades = len(strategy.portfolio_history)
+
+    for i, trade in enumerate(strategy.portfolio_history):
+        trade_date = trade['timestamp']
+
+        # Check if both prediction and actual data exist
+        if 'expected_returns' not in trade or 'actual_returns' not in trade:
+            print(f"Skipping trade {i + 1}/{total_trades} on {trade_date}: Missing prediction or actual data")
+            continue
+
+        expected_returns = trade['expected_returns']
+        actual_returns = trade['actual_returns']
+
+        # Validate data quality
+        if expected_returns is None or actual_returns is None:
+            print(f"Skipping trade {i + 1}/{total_trades} on {trade_date}: None values")
+            continue
+
+        if len(expected_returns) != len(actual_returns):
+            print(
+                f"Skipping trade {i + 1}/{total_trades} on {trade_date}: Length mismatch - pred: {len(expected_returns)}, actual: {len(actual_returns)}")
+            continue
+
+        if len(expected_returns) != len(strategy.stocks):
+            print(
+                f"Skipping trade {i + 1}/{total_trades} on {trade_date}: Expected {len(strategy.stocks)} stocks, got {len(expected_returns)}")
+            continue
+
+        # Check for NaN values
+        pred_valid = ~np.isnan(expected_returns)
+        actual_valid = ~np.isnan(actual_returns)
+        both_valid = pred_valid & actual_valid
+
+        if not np.any(both_valid):
+            print(f"Skipping trade {i + 1}/{total_trades} on {trade_date}: All NaN values")
+            continue
+
+        # Only use stocks with valid data for both prediction and actual
+        for j in range(len(expected_returns)):
+            if both_valid[j]:
+                all_predictions.append(expected_returns[j])
+                all_actuals.append(actual_returns[j])
+                all_dates.append(trade_date)
+                all_stocks.append(strategy.stocks[j] if j < len(strategy.stocks) else f'Stock_{j}')
+
+        valid_trades += 1
+
+        # Debug first few trades
+        if i < 3:
+            print(f"Trade {i + 1} on {trade_date}:")
+            print(f"  Valid pairs: {np.sum(both_valid)}/{len(both_valid)}")
+            print(
+                f"  Pred range: [{np.min(expected_returns[both_valid]):.6f}, {np.max(expected_returns[both_valid]):.6f}]")
+            print(
+                f"  Actual range: [{np.min(actual_returns[both_valid]):.6f}, {np.max(actual_returns[both_valid]):.6f}]")
+
+    if len(all_predictions) == 0:
+        print("❌ No valid prediction-actual pairs found!")
+        return None
+
+    # Convert to numpy arrays
+    predictions = np.array(all_predictions)
+    actuals = np.array(all_actuals)
+
+    print(f"\n✅ Found {len(predictions)} valid prediction-actual pairs from {valid_trades}/{total_trades} trades")
+
+    # Data quality summary
+    print(f"\nDATA SUMMARY:")
+    print(f"  Predictions - Mean: {np.mean(predictions):.6f}, Std: {np.std(predictions):.6f}")
+    print(f"  Actuals - Mean: {np.mean(actuals):.6f}, Std: {np.std(actuals):.6f}")
+    print(f"  Predictions - Range: [{np.min(predictions):.6f}, {np.max(predictions):.6f}]")
+    print(f"  Actuals - Range: [{np.min(actuals):.6f}, {np.max(actuals):.6f}]")
+
+    # Check for scaling issues
+    pred_scale = np.mean(np.abs(predictions))
+    actual_scale = np.mean(np.abs(actuals))
+    scale_ratio = pred_scale / actual_scale if actual_scale > 0 else np.inf
+
+    print(f"  Scale ratio (pred/actual): {scale_ratio:.2f}")
+    if scale_ratio > 10 or scale_ratio < 0.1:
+        print(f"  ⚠️  Large scale difference detected!")
+
+    # Remove extreme outliers (beyond 3 standard deviations)
+    pred_mean, pred_std = np.mean(predictions), np.std(predictions)
+    actual_mean, actual_std = np.mean(actuals), np.std(actuals)
+
+    pred_outliers = np.abs(predictions - pred_mean) > 3 * pred_std
+    actual_outliers = np.abs(actuals - actual_mean) > 3 * actual_std
+    outliers = pred_outliers | actual_outliers
+
+    clean_predictions = predictions[~outliers]
+    clean_actuals = actuals[~outliers]
+
+    print(
+        f"  Outliers removed: {np.sum(outliers)}/{len(predictions)} ({100 * np.sum(outliers) / len(predictions):.1f}%)")
+    print(f"  Clean dataset: {len(clean_predictions)} pairs")
+
+    if len(clean_predictions) < 50:
+        print("❌ Insufficient clean data for analysis")
+        return None
+
+    # Calculate statistics
+    correlation = np.corrcoef(clean_predictions, clean_actuals)[0, 1]
+
+    # Linear regression
     lr = LinearRegression()
-    pred_clean_reshaped = pred_clean.reshape(-1, 1)
-    lr.fit(pred_clean_reshaped, actual_clean)
-
-    r_squared = lr.score(pred_clean_reshaped, actual_clean)
+    clean_pred_reshaped = clean_predictions.reshape(-1, 1)
+    lr.fit(clean_pred_reshaped, clean_actuals)
+    r_squared = lr.score(clean_pred_reshaped, clean_actuals)
     slope = lr.coef_[0]
     intercept = lr.intercept_
 
-    best_fit_y = lr.predict(np.array(perfect_line_range).reshape(-1, 1))
-    ax1.plot(perfect_line_range, best_fit_y, 'g-',
-             linewidth=2, label=f'Best Fit (slope={slope:.2f})', alpha=0.8)
+    # Error metrics
+    errors = clean_actuals - clean_predictions
+    mae = np.mean(np.abs(errors))
+    mse = np.mean(errors ** 2)
+    rmse = np.sqrt(mse)
+
+    print(f"\nSTATISTICS:")
+    print(f"  Correlation: {correlation:.4f}")
+    print(f"  R-squared: {r_squared:.4f}")
+    print(f"  Regression slope: {slope:.4f} (ideal: 1.0)")
+    print(f"  Regression intercept: {intercept:.6f} (ideal: 0.0)")
+    print(f"  Mean Absolute Error: {mae:.6f}")
+    print(f"  Root Mean Square Error: {rmse:.6f}")
+    print(f"  Mean bias (actual - predicted): {np.mean(errors):.6f}")
+
+    # Create comprehensive plots
+    fig = plt.figure(figsize=(20, 12))
+
+    # Main scatter plot with proper scaling
+    ax1 = plt.subplot(2, 3, 1)
+
+    # Use a sample for visualization if dataset is too large
+    if len(clean_predictions) > 5000:
+        sample_idx = np.random.choice(len(clean_predictions), 5000, replace=False)
+        plot_pred = clean_predictions[sample_idx]
+        plot_actual = clean_actuals[sample_idx]
+        sample_text = f" (Sample of {len(plot_pred)})"
+    else:
+        plot_pred = clean_predictions
+        plot_actual = clean_actuals
+        sample_text = ""
+
+    ax1.scatter(plot_pred, plot_actual, alpha=0.4, s=15, color='blue', edgecolors='none')
+
+    # Perfect prediction line (y = x)
+    min_val = min(np.min(plot_pred), np.min(plot_actual))
+    max_val = max(np.max(plot_pred), np.max(plot_actual))
+    perfect_line = [min_val, max_val]
+    ax1.plot(perfect_line, perfect_line, 'r--', linewidth=2, label='Perfect Prediction', alpha=0.8)
+
+    # Best fit line
+    best_fit_pred = np.linspace(min_val, max_val, 100)
+    best_fit_actual = slope * best_fit_pred + intercept
+    ax1.plot(best_fit_pred, best_fit_actual, 'g-', linewidth=2,
+             label=f'Best Fit (slope={slope:.3f})', alpha=0.8)
 
     ax1.set_xlabel('Predicted Returns')
     ax1.set_ylabel('Actual Returns')
-    ax1.set_title(f'Predicted vs Actual Returns\nCorr: {correlation:.3f}, R²: {r_squared:.3f}')
+    ax1.set_title(f'Predicted vs Actual Returns{sample_text}')
     ax1.legend()
     ax1.grid(True, alpha=0.3)
     ax1.set_aspect('equal', adjustable='box')
 
-    stats_text = f'N = {len(pred_clean)}\nCorrelation = {correlation:.3f}\nR² = {r_squared:.3f}\nSlope = {slope:.3f}\nIntercept = {intercept:.6f}'
-    ax1.text(0.05, 0.95, stats_text, transform=ax1.transAxes,
-             verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+    # Add statistics text box
+    stats_text = f'N = {len(clean_predictions)}\nCorr = {correlation:.3f}\nR² = {r_squared:.3f}\nSlope = {slope:.3f}\nMAE = {mae:.5f}'
+    ax1.text(0.05, 0.95, stats_text, transform=ax1.transAxes, verticalalignment='top',
+             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
 
-    errors = actual_clean - pred_clean
-    ax2.hist(errors, bins=50, alpha=0.7, color='purple', edgecolor='black')
+    # Error distribution
+    ax2 = plt.subplot(2, 3, 2)
+    ax2.hist(errors, bins=50, alpha=0.7, color='purple', edgecolor='black', density=True)
     ax2.axvline(x=0, color='red', linestyle='--', linewidth=2, label='Zero Error')
     ax2.axvline(x=np.mean(errors), color='orange', linestyle='-', linewidth=2,
-                label=f'Mean Error: {np.mean(errors):.6f}')
-
+                label=f'Mean: {np.mean(errors):.5f}')
     ax2.set_xlabel('Prediction Error (Actual - Predicted)')
-    ax2.set_ylabel('Frequency')
-    ax2.set_title('Distribution of Prediction Errors')
+    ax2.set_ylabel('Density')
+    ax2.set_title('Error Distribution')
     ax2.legend()
     ax2.grid(True, alpha=0.3)
+
+    # Time series of correlation by period
+    ax3 = plt.subplot(2, 3, 3)
+
+    # Calculate correlation by period
+    period_corrs = []
+    period_dates = []
+
+    for trade in strategy.portfolio_history:
+        if 'expected_returns' in trade and 'actual_returns' in trade:
+            exp_ret = trade['expected_returns']
+            act_ret = trade['actual_returns']
+
+            if exp_ret is not None and act_ret is not None and len(exp_ret) == len(act_ret):
+                valid_mask = ~(np.isnan(exp_ret) | np.isnan(act_ret))
+                if np.sum(valid_mask) > 5:  # Need at least 5 valid pairs
+                    period_corr = np.corrcoef(exp_ret[valid_mask], act_ret[valid_mask])[0, 1]
+                    if not np.isnan(period_corr):
+                        period_corrs.append(period_corr)
+                        period_dates.append(trade['timestamp'])
+
+    if period_corrs:
+        ax3.plot(period_dates, period_corrs, marker='o', alpha=0.7, markersize=4)
+        ax3.axhline(y=0, color='black', linestyle='-', alpha=0.5)
+        ax3.axhline(y=np.mean(period_corrs), color='red', linestyle='--', alpha=0.7,
+                    label=f'Mean: {np.mean(period_corrs):.3f}')
+        ax3.set_title('Prediction Accuracy Over Time')
+        ax3.set_ylabel('Period Correlation')
+        ax3.legend()
+        ax3.grid(True, alpha=0.3)
+    else:
+        ax3.text(0.5, 0.5, 'No period correlation data', ha='center', va='center', transform=ax3.transAxes)
+        ax3.set_title('Period Correlation (No Data)')
+
+    # Residuals vs predicted
+    ax4 = plt.subplot(2, 3, 4)
+    residuals = clean_actuals - (slope * clean_predictions + intercept)
+    ax4.scatter(clean_predictions, residuals, alpha=0.4, s=15, color='red', edgecolors='none')
+    ax4.axhline(y=0, color='black', linestyle='-', linewidth=1)
+    ax4.set_xlabel('Predicted Returns')
+    ax4.set_ylabel('Residuals')
+    ax4.set_title('Residuals vs Predicted')
+    ax4.grid(True, alpha=0.3)
+
+    # Q-Q plot for normality of residuals
+    ax5 = plt.subplot(2, 3, 5)
+    from scipy import stats
+    stats.probplot(residuals, dist="norm", plot=ax5)
+    ax5.set_title('Q-Q Plot: Residuals vs Normal')
+    ax5.grid(True, alpha=0.3)
+
+    # Prediction accuracy by stock (top stocks by frequency)
+    ax6 = plt.subplot(2, 3, 6)
+
+    # Count predictions per stock
+    stock_counts = {}
+    stock_corrs = {}
+
+    unique_dates = list(set(all_dates))
+    for date in unique_dates[:min(10, len(unique_dates))]:  # Limit to avoid overcrowding
+        date_mask = np.array(all_dates) == date
+        if np.sum(date_mask) == 0:
+            continue
+
+        date_predictions = predictions[date_mask]
+        date_actuals = actuals[date_mask]
+        date_stocks = [all_stocks[i] for i in range(len(all_dates)) if all_dates[i] == date]
+
+        if len(date_predictions) > 3:  # Need minimum data for correlation
+            for stock in set(date_stocks):
+                stock_mask = np.array(date_stocks) == stock
+                if np.sum(stock_mask) >= 1:
+                    if stock not in stock_counts:
+                        stock_counts[stock] = 0
+                        stock_corrs[stock] = []
+                    stock_counts[stock] += np.sum(stock_mask)
+
+    if stock_counts:
+        top_stocks = sorted(stock_counts.keys(), key=lambda x: stock_counts[x], reverse=True)[:15]
+        stock_freq = [stock_counts[stock] for stock in top_stocks]
+
+        bars = ax6.bar(range(len(top_stocks)), stock_freq, alpha=0.7)
+        ax6.set_xlabel('Stock')
+        ax6.set_ylabel('Prediction Frequency')
+        ax6.set_title('Prediction Frequency by Stock (Top 15)')
+        ax6.set_xticks(range(len(top_stocks)))
+        ax6.set_xticklabels(top_stocks, rotation=45)
+        ax6.grid(True, alpha=0.3)
+    else:
+        ax6.text(0.5, 0.5, 'No stock frequency data', ha='center', va='center', transform=ax6.transAxes)
+        ax6.set_title('Stock Frequency (No Data)')
 
     plt.tight_layout()
     plt.show()
 
-    print(f"\n=== PREDICTION ACCURACY STATISTICS ===")
-    print(f"Total data points: {len(predicted_all)}")
-    print(f"After outlier removal: {len(pred_clean)}")
-    print(f"Correlation: {correlation:.4f}")
-    print(f"R-squared: {r_squared:.4f}")
-    print(f"Best fit slope: {slope:.4f} (should be ~1.0 for perfect prediction)")
-    print(f"Best fit intercept: {intercept:.6f} (should be ~0.0 for unbiased prediction)")
-    print(f"Mean prediction error: {np.mean(errors):.6f}")
-    print(f"Std of prediction errors: {np.std(errors):.6f}")
-    print(f"Mean absolute error: {np.mean(np.abs(errors)):.6f}")
+    # Interpretation and diagnostics
+    print(f"\n" + "=" * 50)
+    print("INTERPRETATION & DIAGNOSTICS")
+    print("=" * 50)
 
-    print(f"\n=== INTERPRETATION ===")
     if abs(correlation) < 0.05:
-        print("⚠️  Very weak correlation - predictions are essentially random")
+        print("❌ VERY WEAK correlation - predictions are essentially random")
+        print("   • Check if prediction and actual returns are properly aligned")
+        print("   • Verify the prediction model is working correctly")
+        print("   • Consider if the prediction horizon matches the actual returns period")
     elif abs(correlation) < 0.15:
-        print("⚠️  Weak correlation - limited predictive power")
+        print("⚠️  WEAK correlation - limited predictive power")
+        print("   • Predictions show some signal but may not be economically significant")
+        print("   • Consider improving the prediction model")
     elif abs(correlation) < 0.3:
-        print("✓ Moderate correlation - some predictive signal")
+        print("✓ MODERATE correlation - decent predictive signal")
+        print("   • Predictions contain useful information")
+        print("   • Strategy may be profitable after costs")
     else:
-        print("✓ Strong correlation - good predictive signal")
+        print("✅ STRONG correlation - good predictive signal")
+        print("   • High-quality predictions")
+        print("   • Strategy likely to be profitable")
 
+    # Scale analysis
+    if scale_ratio > 5:
+        print(f"⚠️  Predictions are {scale_ratio:.1f}x larger than actuals - possible scaling issue")
+    elif scale_ratio < 0.2:
+        print(f"⚠️  Predictions are {1 / scale_ratio:.1f}x smaller than actuals - possible scaling issue")
+    else:
+        print(f"✓ Prediction scale is reasonable ({scale_ratio:.2f}x actual scale)")
+
+    # Slope analysis
     if abs(slope - 1.0) > 0.5:
-        print("⚠️  Slope far from 1.0 - predictions may be on wrong scale")
+        print(f"⚠️  Regression slope ({slope:.3f}) far from 1.0 - predictions may be miscalibrated")
+        print("   • Slope > 1: Predictions are too conservative")
+        print("   • Slope < 1: Predictions are too aggressive")
+    else:
+        print(f"✓ Regression slope ({slope:.3f}) close to 1.0 - good calibration")
 
-    if abs(intercept) > np.std(actual_clean) * 0.1:
-        print("⚠️  Large intercept - predictions may be biased")
+    # Bias analysis
+    bias_threshold = np.std(clean_actuals) * 0.05  # 5% of actual std
+    if abs(np.mean(errors)) > bias_threshold:
+        if np.mean(errors) > 0:
+            print(f"⚠️  Positive bias detected - predictions systematically underestimate")
+        else:
+            print(f"⚠️  Negative bias detected - predictions systematically overestimate")
+    else:
+        print("✓ No significant bias detected")
 
     return {
         'correlation': correlation,
         'r_squared': r_squared,
         'slope': slope,
         'intercept': intercept,
-        'mean_error': np.mean(errors),
-        'n_points': len(pred_clean)
+        'mae': mae,
+        'rmse': rmse,
+        'bias': np.mean(errors),
+        'n_pairs': len(clean_predictions),
+        'scale_ratio': scale_ratio,
+        'predictions': clean_predictions,
+        'actuals': clean_actuals,
+        'errors': errors,
+        'period_correlations': period_corrs if 'period_corrs' in locals() else []
     }
-
 
 def fix_return_calculations(strategy):
     """Fix the return calculation methodology in the strategy"""
@@ -2393,44 +2918,22 @@ def run_returns_analysis(strategy):
 
     return results
 
-
 if __name__ == "__main__":
     strategy = run_strategy_example()
-
-    # Call the debug function for a specific date
-    # Put this AFTER your backtest but BEFORE any other analysis
     print("\n" + "=" * 60)
     print("DEBUGGING PREDICTION ALIGNMENT")
     print("=" * 60)
-    strategy.debug_prediction_alignment(pd.to_datetime('2020-01-15'))
-
-    # Then call the rebalancing period analysis
+    strategy.debug_prediction_alignment(pd.to_datetime('2023-06-01'))  # Use a date within the data range
     print("\n" + "=" * 60)
     print("REBALANCING PERIOD ANALYSIS")
     print("=" * 60)
     strategy.calculate_avg_rebalancing_period()
-    #
-    # print("Analyzing IN-SAMPLE strategy:")
-    # results_in_sample = run_returns_analysis(strategy)
-    #
-    # print("\nAnalyzing OUT-OF-SAMPLE strategy:")
-    # results_out_sample = run_returns_analysis(strategy_oos)
-    #
-    # if hasattr(strategy, 'V') and strategy.V is not None:
-    #     print("\n" + "=" * 50)
-    #     print("ADDITIONAL ANALYSIS")
-    #     print("=" * 50)
-    #
-    #     analyze_pc_loadings(strategy, pc_index=0)
-    #     analyze_factor_importance(strategy)
-    #
-    # print("\n=== Rolling Window Strategy Implementation Complete ===")
-    # print("All components now use a rolling 252-day window:")
-    # print("✅ Full dataset loaded with extended historical data")
-    # print("✅ Each rebalancing recalculates PCA matrix V")
-    # print("✅ Each rebalancing recalculates covariance matrix Σ")
-    # print("✅ Each rebalancing recalculates centrality matrix C")
-    # print("✅ Each rebalancing recalculates factor-PC regressions")
-    # print("✅ Each rebalancing uses fresh 252-day window")
-    # print("✅ Weekly progression: +5 trading days forward, -5 trading days back")
-    # print("✅ All matrix definitions and calculations preserved exactly")
+    print("Analyzing IN-SAMPLE strategy:")
+    results_in_sample = run_returns_analysis(strategy)
+    if hasattr(strategy, 'V') and strategy.V is not None:
+        print("\n" + "=" * 50)
+        print("ADDITIONAL ANALYSIS")
+        print("=" * 50)
+        analyze_pc_loadings(strategy, pc_index=0)
+        analyze_factor_importance(strategy)
+    print("\n=== Rolling Window Strategy Implementation Complete ===")

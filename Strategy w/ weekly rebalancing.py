@@ -472,9 +472,9 @@ class UltimateDetailedStrategy:
     # PORTFOLIO OPTIMIZATION
     ###########################################################################
     def optimize_portfolio(self, current_prices, stock_betas=None):
-        """Fixed optimization to ensure proper market-neutral 65/35 long-short portfolio"""
+        """Optimized portfolio allocation using updated portfolio value (self.C_0)"""
         N = len(self.r_hat_weighted)
-        C_total = self.C_0
+        C_total = self.C_0  # Use current portfolio value
 
         if len(current_prices) != N or np.any(np.isnan(current_prices)) or np.any(np.isinf(current_prices)) or np.any(
                 current_prices <= 0):
@@ -495,7 +495,7 @@ class UltimateDetailedStrategy:
 
         constraints.append({'type': 'eq', 'fun': market_neutral_constraint})
 
-        # Total capital utilization constraint (exactly $10,000)
+        # Total capital utilization constraint (exactly C_total)
         def total_allocation_constraint(v):
             return np.sum(np.abs(v)) - C_total  # Should equal 0
 
@@ -534,7 +534,6 @@ class UltimateDetailedStrategy:
         # Individual position bounds (more relaxed)
         bounds = []
         for i in range(N):
-            # Allow both long and short positions for all stocks
             bounds.append((-0.20 * C_total, 0.20 * C_total))  # Max 20% in any position
 
         # Improved initial guess that ensures market neutrality with 65/35 split
@@ -562,7 +561,6 @@ class UltimateDetailedStrategy:
         if stock_betas is not None:
             portfolio_beta = np.dot(v0, stock_betas) / C_total
             if abs(portfolio_beta) > 0.1:
-                # Simple beta adjustment
                 beta_adjustment = -portfolio_beta / np.mean(stock_betas ** 2) if np.mean(stock_betas ** 2) > 0 else 0
                 v0 += beta_adjustment * stock_betas * C_total / N
 
@@ -702,6 +700,7 @@ class UltimateDetailedStrategy:
     def validate_optimization_results(self):
         """Enhanced validation that checks all constraints for 65/35 allocation"""
         print(f"\n=== OPTIMIZATION VALIDATION ===")
+
         print(f"Capital: ${self.C_0:,.0f}")
 
         long_exposure = np.sum(self.optimal_weights[self.optimal_weights > 0])
@@ -818,51 +817,35 @@ class UltimateDetailedStrategy:
         return trade_record
 
     def record_performance_metrics(self, actual_returns):
-        """Fixed performance metrics recording"""
+        """FIXED performance metrics recording with correct P&L calculation"""
         if actual_returns is None:
             return {'return': 0, 'gross_exposure': 0, 'net_exposure': 0}
 
-        # Ensure we have current positions (shares)
-        if not hasattr(self, 'share_quantities') or self.share_quantities is None:
-            print("Warning: No share quantities available")
+        # Ensure we have current positions (dollar amounts, not shares)
+        if not hasattr(self, 'optimal_weights') or self.optimal_weights is None:
+            print("Warning: No optimal weights available")
             return {'return': 0, 'gross_exposure': 0, 'net_exposure': 0}
 
-        # Get current prices (last prices from P)
-        if self.P is None or len(self.P) == 0:
-            print("Warning: No price data available")
-            return {'return': 0, 'gross_exposure': 0, 'net_exposure': 0}
-
-        current_prices = self.P.iloc[-1].values
-
-        # Calculate period return using position values
         try:
-            # Position values = shares * prices
-            position_values = self.share_quantities * current_prices
+            # FIXED: P&L = weights * actual_returns (both are dollar amounts)
+            period_pnl = np.sum(self.optimal_weights * actual_returns)
 
-            # P&L = position_values * actual_returns
-            position_pnl = position_values * actual_returns
-            period_return = np.sum(position_pnl)
-
-            # Update capital
-            self.C_0 += period_return
-
-            # Calculate exposures
-            gross_exposure = np.sum(np.abs(position_values))
-            net_exposure = np.sum(position_values)
+            # Calculate exposures using current weights
+            gross_exposure = np.sum(np.abs(self.optimal_weights))
+            net_exposure = np.sum(self.optimal_weights)
 
             # Store in the last portfolio history entry
             if len(self.portfolio_history) > 0:
                 last_trade = self.portfolio_history[-1]
                 last_trade['actual_returns'] = actual_returns.copy()
-                last_trade['period_pnl'] = period_return
-                last_trade['portfolio_value_after'] = self.C_0
+                last_trade['period_pnl'] = period_pnl
 
             return {
-                'return': period_return,
-                'realized_pnl': period_return,  # Add this for Monte Carlo
+                'return': period_pnl,
+                'realized_pnl': period_pnl,
                 'gross_exposure': gross_exposure,
                 'net_exposure': net_exposure,
-                'portfolio_value': self.C_0
+                'portfolio_value': self.C_0  # Don't update here, update in backtest
             }
 
         except Exception as e:
@@ -906,6 +889,7 @@ class UltimateDetailedStrategy:
     def validate_optimization_results(self):
         """Validate that optimization results make sense"""
         print(f"\n=== OPTIMIZATION VALIDATION ===")
+        print(f"Date: {self.P.index[-1]}")
         print(f"Capital: ${self.C_0:,.0f}")
         print(f"Total long exposure: ${np.sum(self.optimal_weights[self.optimal_weights > 0]):,.0f}")
         print(f"Total short exposure: ${np.abs(np.sum(self.optimal_weights[self.optimal_weights < 0])):,.0f}")
@@ -921,7 +905,7 @@ class UltimateDetailedStrategy:
         print(f"Market neutrality (should be ~0): {np.sum(self.optimal_weights) / self.C_0:.1%}")
 
     def backtest_strategy(self, start_date, end_date, rebalance_freq=4):
-        """Fixed backtesting with proper performance tracking"""
+        """Backtest with proper portfolio value compounding"""
         print(f"\n=== Backtesting Strategy from {start_date} to {end_date} ===")
 
         start_dt = pd.to_datetime(start_date)
@@ -933,54 +917,25 @@ class UltimateDetailedStrategy:
             print("No data available for backtesting period")
             return None
 
+        # Initialize tracking variables
+        initial_capital = 10000
+        self.C_0 = initial_capital
         portfolio_values = [self.C_0]
         rebalance_dates = []
-        self.current_positions = np.zeros(len(self.stocks))
-        previous_prices = None
         self.previous_weights_backtest = None
+
+        print(f"Starting backtest with ${initial_capital:,.0f}")
 
         for i in range(0, len(backtest_dates), rebalance_freq):
             current_date = backtest_dates[i]
             rebalance_dates.append(current_date)
 
-            try:
-                current_prices = self.P_full.loc[current_date].values
-            except KeyError:
-                print(f"Error: No price data for {current_date}")
-                portfolio_values.append(portfolio_values[-1])
-                continue
-
-            # Calculate P&L from previous positions
-            if self.current_positions is not None and previous_prices is not None:
-                try:
-                    price_returns = (current_prices / previous_prices) - 1
-                    position_pnl = np.sum(self.current_positions * previous_prices * price_returns)
-                    self.C_0 += position_pnl
-
-                    gross_portfolio_value = portfolio_values[-1] + position_pnl
-                    if i < 5:
-                        print(f"Period {len(portfolio_values)}: Previous value: ${portfolio_values[-1]:.2f}")
-                        print(f"Position P&L: ${position_pnl:.2f}")
-                        print(f"Gross value before trades: ${gross_portfolio_value:.2f}")
-                except Exception as e:
-                    print(f"Error calculating P&L for {current_date}: {e}")
-                    gross_portfolio_value = portfolio_values[-1]
-            else:
-                gross_portfolio_value = portfolio_values[-1]
-
-            # Calculate actual returns for the PREVIOUS period (for performance tracking)
-            actual_returns = None
-            if i > 0:  # Skip first period
-                prev_date = backtest_dates[max(0, i - rebalance_freq)]
-                try:
-                    prev_prices = self.P_full.loc[prev_date].values
-                    actual_returns = (current_prices / prev_prices) - 1
-                except:
-                    actual_returns = None
+            # Calculate forward returns for the NEXT period
+            forward_returns, next_date = self.calculate_forward_returns(current_date, forward_days=rebalance_freq)
 
             try:
-                # Execute the rebalancing strategy
-                trade_record, metrics = self.weekly_rebalancing_step(current_date, actual_returns)
+                # Execute rebalancing for current date
+                trade_record, metrics = self.weekly_rebalancing_step(current_date, None)
 
                 if trade_record is not None:
                     # Calculate transaction costs
@@ -990,35 +945,28 @@ class UltimateDetailedStrategy:
                         turnover = np.sum(np.abs(self.optimal_weights))
 
                     transaction_cost = turnover * self.transaction_costs
-                    self.previous_weights_backtest = self.optimal_weights.copy()
-                    trade_record['transaction_cost'] = transaction_cost
 
-                    # Update portfolio value after transaction costs
-                    new_portfolio_value = gross_portfolio_value - transaction_cost
-                    portfolio_values.append(new_portfolio_value)
+                    # Update portfolio value with P&L and transaction costs
+                    if forward_returns is not None:
+                        period_pnl = np.sum(self.optimal_weights * forward_returns)
+                        self.C_0 += period_pnl - transaction_cost
 
-                    # Update metrics with proper portfolio value
-                    if metrics is not None:
-                        metrics['portfolio_value'] = new_portfolio_value
-                        metrics['gross_pnl'] = position_pnl if 'position_pnl' in locals() else 0
-                        metrics['realized_pnl'] = new_portfolio_value - portfolio_values[-2] if len(
-                            portfolio_values) > 1 else 0
+                        # Store the actual performance
+                        trade_record['actual_returns'] = forward_returns.copy()
+                        trade_record['period_pnl'] = period_pnl
+                        trade_record['transaction_cost'] = transaction_cost
 
-                        # Store in performance_metrics
-                        self.performance_metrics[current_date] = metrics
-
-                        if i < 5:
-                            print(f"Transaction cost: ${transaction_cost:.2f}")
-                            print(f"New portfolio value: ${new_portfolio_value:.2f}")
-                            print(f"Current positions value: ${np.sum(self.current_positions * current_prices):.2f}")
+                        if i < 5:  # Debug first few periods
+                            print(f"Period {len(portfolio_values)}: Prev value: ${portfolio_values[-1]:.2f}")
+                            print(f"  Transaction cost: ${transaction_cost:.2f}")
+                            print(f"  Period P&L: ${period_pnl:.2f}")
+                            print(f"  New value: ${self.C_0:.2f}")
                             print("---")
 
-                    # Update for next iteration
-                    previous_prices = current_prices.copy()
-                    self.previous_weights = self.optimal_weights.copy()
+                    portfolio_values.append(self.C_0)
+                    self.previous_weights_backtest = self.optimal_weights.copy()
 
                 else:
-                    # No trade executed, maintain current positions
                     portfolio_values.append(portfolio_values[-1])
 
             except Exception as e:
@@ -1027,10 +975,9 @@ class UltimateDetailedStrategy:
 
         # Calculate performance metrics
         if len(portfolio_values) > 1:
-            total_return = (portfolio_values[-1] / portfolio_values[0]) - 1
-            num_periods = len(portfolio_values) - 1
+            total_return = (portfolio_values[-1] / initial_capital) - 1
             trading_days = (backtest_dates[-1] - backtest_dates[0]).days
-            annualized_return = (1 + total_return) ** (252 / trading_days) - 1
+            annualized_return = (1 + total_return) ** (252 / trading_days) - 1 if trading_days > 0 else 0
         else:
             total_return = 0
             annualized_return = 0
@@ -1040,12 +987,20 @@ class UltimateDetailedStrategy:
         print(f"Final Portfolio Value: ${portfolio_values[-1]:.2f}")
         print(f"Number of rebalancing periods: {len(rebalance_dates)}")
 
+        # Store portfolio values for other methods
+        self.portfolio_values_from_backtest = portfolio_values
+
         # Plot results
         import matplotlib.pyplot as plt
         plt.figure(figsize=(12, 6))
-        plt.plot(rebalance_dates[:len(portfolio_values) - 1], portfolio_values[1:],
-                 marker='o', label='Strategy Portfolio Value')
-        plt.axhline(y=self.C_0, color='r', linestyle='--', label='Initial Capital')
+        # Ensure plot_dates and portfolio_values have the same length
+        plot_dates = [self.P_full.index[0]] + rebalance_dates  # Include initial date
+        if len(plot_dates) > len(portfolio_values):
+            plot_dates = plot_dates[:len(portfolio_values)]
+        elif len(portfolio_values) > len(plot_dates):
+            portfolio_values = portfolio_values[:len(plot_dates)]
+        plt.plot(plot_dates, portfolio_values, marker='o', label='Strategy Portfolio Value')
+        plt.axhline(y=initial_capital, color='r', linestyle='--', label='Initial Capital ($10,000)')
         plt.title('Strategy Backtest Performance')
         plt.xlabel('Date')
         plt.ylabel('Portfolio Value ($)')
@@ -1064,45 +1019,40 @@ class UltimateDetailedStrategy:
     ###########################################################################
     # PERFORMANCE ANALYSIS AND METRICS
     ###########################################################################
-
     def compute_profitability_metrics(self, risk_free_rate=0.02, periods_per_year=52):
-        """Fixed profitability metrics for rebalancing strategy"""
+        """Compute profitability metrics using compounded portfolio values"""
         if not self.portfolio_history:
             return {}
 
-        period_pnls = []
-        gross_pnls = []
-        transaction_costs = []
-        portfolio_values = [self.C_0]
+        # Use portfolio values from backtest
+        if hasattr(self, 'portfolio_values_from_backtest'):
+            portfolio_values = self.portfolio_values_from_backtest
+        else:
+            # Fallback to reconstructing portfolio values
+            portfolio_values = [10000]
+            current_value = 10000
+            for trade in self.portfolio_history:
+                if 'period_pnl' in trade and 'transaction_cost' in trade:
+                    period_pnl = trade['period_pnl']
+                    transaction_cost = trade['transaction_cost']
+                    current_value += period_pnl - transaction_cost
+                    portfolio_values.append(current_value)
 
-        for trade in self.portfolio_history:
-            ts = trade['timestamp']
-            metrics = self.performance_metrics.get(ts, {})
-
-            net_pnl = metrics.get('realized_pnl', 0)
-            gross_pnl = metrics.get('gross_pnl', 0)
-            cost = trade['transaction_cost']
-
-            period_pnls.append(net_pnl)
-            gross_pnls.append(gross_pnl)
-            transaction_costs.append(cost)
-
-            new_portfolio_value = portfolio_values[-1] + net_pnl
-            portfolio_values.append(new_portfolio_value)
-
-        if not period_pnls:
-            return {}
-
-        initial_capital = self.C_0
+        initial_capital = portfolio_values[0]
         final_portfolio_value = portfolio_values[-1]
-        total_return = (final_portfolio_value - initial_capital) / initial_capital
 
+        # Calculate period returns
         period_returns = []
         for i in range(1, len(portfolio_values)):
             period_return = (portfolio_values[i] - portfolio_values[i - 1]) / portfolio_values[i - 1]
             period_returns.append(period_return)
 
+        if not period_returns:
+            return {}
+
         period_returns = np.array(period_returns)
+        total_return = (final_portfolio_value - initial_capital) / initial_capital
+
         mean_return = np.mean(period_returns)
         std_return = np.std(period_returns, ddof=1)
 
@@ -1118,24 +1068,20 @@ class UltimateDetailedStrategy:
         drawdowns = (running_max - portfolio_values_array) / running_max
         max_drawdown = np.max(drawdowns)
 
-        num_periods = len(period_pnls)
+        num_periods = len(period_returns)
         annualized_return = (1 + total_return) ** (periods_per_year / num_periods) - 1 if num_periods > 0 else 0
 
         calmar = annualized_return / max_drawdown if max_drawdown > 0 else np.inf
 
-        winning_periods = [pnl for pnl in period_pnls if pnl > 0]
-        losing_periods = [pnl for pnl in period_pnls if pnl < 0]
+        winning_periods = [ret for ret in period_returns if ret > 0]
+        losing_periods = [ret for ret in period_returns if ret < 0]
 
         avg_win = np.mean(winning_periods) if winning_periods else 0
         avg_loss = np.abs(np.mean(losing_periods)) if losing_periods else 0
-        win_rate = len(winning_periods) / len(period_pnls) if period_pnls else 0
+        win_rate = len(winning_periods) / len(period_returns) if period_returns.size > 0 else 0
         profit_factor = sum(winning_periods) / sum(np.abs(losing_periods)) if losing_periods else np.inf
 
-        position_win_rates = self._calculate_position_win_rates()
-
-        total_gross_pnl = sum(gross_pnls)
-        total_transaction_costs = sum(transaction_costs)
-        cost_drag = total_transaction_costs / abs(total_gross_pnl) if total_gross_pnl != 0 else 0
+        total_transaction_costs = sum(trade.get('transaction_cost', 0) for trade in self.portfolio_history)
 
         results = {
             'total_return': total_return,
@@ -1150,14 +1096,11 @@ class UltimateDetailedStrategy:
             'profit_factor': profit_factor,
             'num_periods': num_periods,
             'total_transaction_costs': total_transaction_costs,
-            'transaction_cost_drag': cost_drag,
             'final_portfolio_value': final_portfolio_value,
         }
 
-        results.update(position_win_rates)
-
         print(f"\n=== CORRECTED Profitability Metrics ===")
-        print(f"Initial Capital: ${self.C_0:,.0f}")
+        print(f"Initial Capital: ${initial_capital:,.0f}")
         print(f"Final Portfolio Value: ${final_portfolio_value:,.0f}")
         print(f"Total Return: {total_return:.2%}")
         print(f"Annualized Return: {annualized_return:.2%}")
@@ -1165,7 +1108,6 @@ class UltimateDetailedStrategy:
         print(f"Sharpe Ratio: {sharpe:.2f}")
         print(f"Max Drawdown: {max_drawdown:.1%}")
         print(f"Total Transaction Costs: ${total_transaction_costs:,.0f}")
-        print(f"Transaction Cost Drag: {cost_drag:.1%}")
 
         return results
 
@@ -2197,7 +2139,6 @@ def run_enhanced_validation_example(strategy):
 
     return strategy
 
-
 def plot_portfolio_composition(strategy):
     """Plot portfolio composition over time with different colors for each stock"""
     if not strategy.portfolio_history:
@@ -2211,6 +2152,7 @@ def plot_portfolio_composition(strategy):
 
     # Convert to percentages of total portfolio value
     portfolio_values = np.sum(np.abs(weights_history), axis=1)
+    portfolio_values = np.where(portfolio_values == 0, 1, portfolio_values)  # Avoid division by zero
     weights_pct = weights_history / portfolio_values[:, np.newaxis] * 100
 
     # Create stacked area plot
@@ -2360,21 +2302,22 @@ def analyze_factor_importance(strategy):
         print(f"{factor}: {importance:.4f}")
 
     return factor_importance, overall_importance
-
 def analyze_prediction_vs_actual_detailed(self):
-    """Create detailed scatter plot of predicted vs actual returns with debugging"""
+    """Create detailed scatter plot of predicted vs actual returns with corrected 5-day scaling"""
     predicted_all = []
     actual_all = []
     stock_names = []
     dates = []
 
-    print("Collecting prediction vs actual data...")
+    print("Collecting prediction vs actual data (5-day returns)...")
 
     for i, trade in enumerate(self.portfolio_history):
         if 'actual_returns' in trade and 'expected_returns' in trade:
             pred_returns = trade['expected_returns']
             actual_returns = trade['actual_returns']
 
+            # Verify scaling: actual_returns should already be 5-day returns from calculate_forward_returns
+            # pred_returns should be r_hat_weighted, scaled to 5-day in predict_stock_returns
             for j, stock in enumerate(self.stocks):
                 if j < len(pred_returns) and j < len(actual_returns):
                     predicted_all.append(pred_returns[j])
@@ -2389,7 +2332,7 @@ def analyze_prediction_vs_actual_detailed(self):
     predicted_all = np.array(predicted_all)
     actual_all = np.array(actual_all)
 
-    # Debugging: Print statistics to verify scale
+    # Debugging: Print statistics to verify 5-day scaling
     print("\n=== DEBUG: Scale Comparison (Before Outlier Removal) ===")
     pred_mean = np.mean(np.abs(predicted_all))
     actual_mean = np.mean(np.abs(actual_all))
@@ -2409,9 +2352,9 @@ def analyze_prediction_vs_actual_detailed(self):
     print(f"  Range: [{actual_range[0]:.6f}, {actual_range[1]:.6f}]")
     print(f"Scale Ratio (Pred Mean / Actual Mean): {scale_ratio:.3f}")
     if scale_ratio > 2 or scale_ratio < 0.5:
-        print("⚠️ Warning: Predicted and actual returns may not be on the same scale (ratio far from 1.0)")
+        print("⚠️ Warning: Predicted and actual returns may not be on the same scale")
 
-    # Remove outliers using percentiles
+    # Remove outliers
     percentile_5 = np.percentile(predicted_all, 5)
     percentile_95 = np.percentile(predicted_all, 95)
     actual_5 = np.percentile(actual_all, 5)
@@ -2443,7 +2386,7 @@ def analyze_prediction_vs_actual_detailed(self):
     print(f"  Range: [{actual_clean_range[0]:.6f}, {actual_clean_range[1]:.6f}]")
     print(f"Scale Ratio (Pred Mean / Actual Mean, Clean): {clean_scale_ratio:.3f}")
     if clean_scale_ratio > 2 or clean_scale_ratio < 0.5:
-        print("⚠️ Warning: Cleaned predicted and actual returns may not be on the same scale (ratio far from 1.0)")
+        print("⚠️ Warning: Cleaned predicted and actual returns may not be on the same scale")
 
     print(f"Using {len(pred_clean)} data points after outlier removal")
 

@@ -139,7 +139,10 @@ class PCAFactorStrategy:
         self.rebalance_dates = self.rebalance_dates[self.rebalance_dates >= first_possible_rebalance]
         rebalance_diffs = self.rebalance_dates[1:] - self.rebalance_dates[:-1]
         rebalance_days = [diff.days for diff in rebalance_diffs]
-
+        self.weekly_data = self.data.resample('W-FRI').last()  # Weekly Friday close prices
+        self.weekly_factor_data = self.factor_data.resample('W-FRI').last()  # Weekly Friday factor prices
+        print(f"Weekly stock data shape: {self.weekly_data.shape}")
+        print(f"Weekly factor data shape: {self.weekly_factor_data.shape}")
         print(
             f"Stock data shape: {self.data.shape}, Date range: {self.data.index[0].date()} to {self.data.index[-1].date()}")
         print(f"Factor data shape: {self.factor_data.shape}, Total factors: {len(self.factors)}")
@@ -232,12 +235,12 @@ class PCAFactorStrategy:
 
         return rotation_factors
 
-    def compute_log_returns(self, prices):
+    def compute_log_returns(self, weekly_prices):
         """
         Compute log returns with proper handling of edge cases to avoid warnings.
         """
         # Replace any non-positive values with NaN before taking log
-        prices_clean = prices.where(prices > 0)
+        prices_clean = weekly_prices.where(weekly_prices > 0)
 
         # Compute log returns
         returns = np.log(prices_clean / prices_clean.shift(1)).dropna()
@@ -295,6 +298,21 @@ class PCAFactorStrategy:
             pc_series = pc_series.dropna()
         return pc_series
 
+    def compute_weekly_log_returns(self, weekly_prices):
+        """
+        Compute weekly log returns with proper handling of edge cases.
+        """
+        # Replace any non-positive values with NaN before taking log
+        prices_clean = weekly_prices.where(weekly_prices > 0)
+
+        # Compute log returns
+        returns = np.log(prices_clean / prices_clean.shift(1)).dropna()
+
+        # Replace any infinite values with NaN
+        returns = returns.replace([np.inf, -np.inf], np.nan)
+
+        return returns
+
     def compute_factor_changes(self, factor_prices, start_date, end_date):
         """
         Updated to handle both regular factors and ALL computed factor categories.
@@ -333,8 +351,7 @@ class PCAFactorStrategy:
 
     def factor_regression(self, pc_series, factor_changes, rebalance_date, std_returns, V, scaler):
         """
-        Updated to train regression models to predict weekly PC movements using weekly factor changes.
-        Key fix: Properly store the scaler for each PC regression.
+        FIXED: Train regression models to predict weekly PC movements with proper validation alignment.
         """
         if factor_changes.empty or rebalance_date not in pc_series.index or rebalance_date not in factor_changes.index:
             print(f"Skipping regression for {rebalance_date}: Missing data")
@@ -346,7 +363,7 @@ class PCAFactorStrategy:
             start_idx = max(0, rebalance_idx - lookback + 1)
             period_dates = factor_changes.index[start_idx:rebalance_idx + 1]
             common_dates = pc_series.index.intersection(period_dates)
-            if len(common_dates) < max(6, lookback // 2):  # Need minimum weekly samples
+            if len(common_dates) < max(6, lookback // 2):
                 print(
                     f"Skipping regression for {rebalance_date}: Insufficient data ({len(common_dates)} < {max(6, lookback // 2)})")
                 return {}
@@ -360,24 +377,24 @@ class PCAFactorStrategy:
         self.selected_factors = {}
 
         pc_settings = {
-            'PC_1': {'alphas': np.logspace(-5, -1, 40), 'cv': min(5, len(common_dates) // 2), 'max_iter': 50000,
+            'PC_1': {'alphas': np.logspace(-6, -2, 50), 'cv': min(8, len(common_dates) // 2), 'max_iter': 100000,
+                     'tol': 1e-5},
+            'PC_2': {'alphas': np.logspace(-5, -1, 40), 'cv': min(7, len(common_dates) // 2), 'max_iter': 80000,
                      'tol': 1e-4},
-            'PC_2': {'alphas': np.logspace(-4, 0, 30), 'cv': min(5, len(common_dates) // 2), 'max_iter': 30000,
-                     'tol': 1e-3},
-            'PC_3': {'alphas': np.logspace(-3, 1, 30), 'cv': min(5, len(common_dates) // 2), 'max_iter': 30000,
-                     'tol': 1e-3},
-            'PC_4': {'alphas': np.logspace(-3, 1, 30), 'cv': min(5, len(common_dates) // 2), 'max_iter': 30000,
-                     'tol': 1e-3},
-            'PC_5': {'alphas': np.logspace(-3, 1, 30), 'cv': min(5, len(common_dates) // 2), 'max_iter': 30000,
-                     'tol': 1e-3}
+            'PC_3': {'alphas': np.logspace(-4, 0, 35), 'cv': min(6, len(common_dates) // 2), 'max_iter': 60000,
+                     'tol': 1e-4},
+            'PC_4': {'alphas': np.logspace(-4, 0, 35), 'cv': min(6, len(common_dates) // 2), 'max_iter': 60000,
+                     'tol': 1e-4},
+            'PC_5': {'alphas': np.logspace(-4, 0, 35), 'cv': min(6, len(common_dates) // 2), 'max_iter': 60000,
+                     'tol': 1e-4}
         }
 
         for pc in pc_series_window.columns:
             settings = pc_settings.get(pc, {
-                'alphas': np.logspace(-4, 0, 30),
-                'cv': min(5, len(common_dates) // 2),
-                'max_iter': 30000,
-                'tol': 1e-3
+                'alphas': np.logspace(-5, -1, 40),
+                'cv': min(6, len(common_dates) // 2),
+                'max_iter': 80000,
+                'tol': 1e-4
             })
 
             # CREATE WEEKLY TARGETS: For each week, what was PC movement over next week?
@@ -387,29 +404,20 @@ class PCAFactorStrategy:
 
             for i, date in enumerate(pc_series_window.index[:-1]):  # Skip last date (no future data)
                 try:
-                    # Get PC value at current week
                     current_pc = pc_series_window.loc[date, pc]
-
-                    # Get PC value next week
                     future_dates = pc_series_window.index[pc_series_window.index > date]
                     if len(future_dates) >= 1:
                         future_date = future_dates[0]  # Next week
                         future_pc = pc_series_window.loc[future_date, pc]
-
-                        # Weekly PC movement = future_pc - current_pc
                         weekly_movement = future_pc - current_pc
-
-                        # Get current weekly factor changes as features
                         current_factor_changes = factor_changes_window.loc[date].values
-
                         weekly_targets.append(weekly_movement)
                         current_factors.append(current_factor_changes)
                         valid_dates.append(date)
-
                 except (KeyError, IndexError):
                     continue
 
-            if len(weekly_targets) < max(6, lookback // 2):  # Need minimum samples
+            if len(weekly_targets) < max(6, lookback // 2):
                 print(f"Skipping regression for {pc}: Insufficient weekly samples ({len(weekly_targets)})")
                 self.r2_training_history[pc].append((rebalance_date, 0.0))
                 self.r2_history[pc].append((rebalance_date, 0.0))
@@ -425,15 +433,27 @@ class PCAFactorStrategy:
                 self.r2_history[pc].append((rebalance_date, 0.0))
                 continue
 
-            # Pre-filter features based on correlation with weekly targets
-            correlations = np.abs([np.corrcoef(X_raw[:, i], y)[0, 1] for i in range(X_raw.shape[1])
-                                   if not np.all(np.isnan(X_raw[:, i]))])
-            n_select = min(15, X_raw.shape[1], len(weekly_targets) // 2)  # Conservative feature selection
-            selected_features = np.argsort(correlations)[-n_select:]
+            # Feature selection and training (existing logic)
+            correlations = []
+            for i in range(X_raw.shape[1]):
+                if not np.all(np.isnan(X_raw[:, i])) and np.std(X_raw[:, i]) > 1e-8:
+                    corr = np.abs(np.corrcoef(X_raw[:, i], y)[0, 1])
+                    if not np.isnan(corr):
+                        correlations.append((corr, i))
+
+            if len(correlations) == 0:
+                print(f"Skipping regression for {pc}: No valid correlations")
+                self.r2_training_history[pc].append((rebalance_date, 0.0))
+                self.r2_history[pc].append((rebalance_date, 0.0))
+                continue
+
+            correlations.sort(reverse=True)
+            n_select = min(12, len(correlations), len(weekly_targets) // 3)
+            selected_features = [corr[1] for corr in correlations[:n_select]]
             X_selected = X_raw[:, selected_features]
             selected_factors = [self.factors[i] for i in selected_features]
 
-            # Standardize the selected features - CRITICAL: Store this scaler
+            # Train model
             scaler_X = StandardScaler()
             X = scaler_X.fit_transform(X_selected)
 
@@ -447,23 +467,19 @@ class PCAFactorStrategy:
             )
 
             try:
-                lasso.fit(X, y)  # Training on weekly targets
+                lasso.fit(X, y)
             except:
                 print(f"Fallback regression for {pc} on {rebalance_date}")
-                lasso.alphas_ = np.logspace(-6, 2, 50)
-                lasso.max_iter = 50000
-                lasso.tol = 1e-3
+                lasso = LassoCV(alphas=np.logspace(-6, 2, 50), cv=min(5, len(y) // 2),
+                                max_iter=100000, tol=1e-4, random_state=42)
                 lasso.fit(X, y)
 
             training_r2 = lasso.score(X, y)
-
-            # Adjusted R²
-            n_samples = len(y)
-            n_features = np.sum(lasso.coef_ != 0)
+            n_samples, n_features = len(y), np.sum(lasso.coef_ != 0)
             adjusted_r2 = 1 - (1 - training_r2) * (n_samples - 1) / (
-                    n_samples - n_features - 1) if n_samples > n_features + 1 else training_r2
+                        n_samples - n_features - 1) if n_samples > n_features + 1 else training_r2
 
-            # Get final non-zero coefficient factors
+            # Get final features
             nonzero_idx = np.where(lasso.coef_ != 0)[0]
             if len(nonzero_idx) == 0:
                 print(f"No non-zero coefficients for {pc} on {rebalance_date}")
@@ -471,82 +487,25 @@ class PCAFactorStrategy:
                 self.r2_history[pc].append((rebalance_date, 0.0))
                 continue
 
-            final_features = selected_features[nonzero_idx]
+            # FIX: Use list comprehension instead of array indexing
+            final_features = [selected_features[i] for i in nonzero_idx]
             final_factors = [self.factors[i] for i in final_features]
             X_final = X_selected[:, nonzero_idx]
 
-            # Re-fit scaler and model on final features - CRITICAL: This is what gets stored
+            # Re-fit on final features
             scaler_X_final = StandardScaler()
             X_final_scaled = scaler_X_final.fit_transform(X_final)
-
-            lasso_final = LassoCV(
-                alphas=settings['alphas'],
-                cv=settings['cv'],
-                max_iter=settings['max_iter'],
-                tol=settings['tol'],
-                random_state=42,
-                n_jobs=-1
-            )
+            lasso_final = LassoCV(alphas=settings['alphas'], cv=settings['cv'],
+                                  max_iter=settings['max_iter'], tol=settings['tol'],
+                                  random_state=42, n_jobs=-1)
             lasso_final.fit(X_final_scaled, y)
 
             betas = {final_factors[i]: lasso_final.coef_[i] for i in range(len(final_factors))}
 
-            # Compute out-of-sample prediction R² for validation (next few weeks)
-            prediction_r2 = 0.0
-            try:
-                future_weeks = self.weekly_data.index[self.weekly_data.index > rebalance_date][:4]  # Next 4 weeks
-                if len(future_weeks) >= 2:
-                    future_end_date = future_weeks[-1]
-                    future_stock_prices = self.weekly_data.loc[rebalance_date:future_end_date]
-                    future_returns = self.compute_weekly_log_returns(future_stock_prices)
-                    if not future_returns.empty and len(future_returns) >= 2:
-                        future_std_returns = pd.DataFrame(
-                            scaler.transform(future_returns),
-                            index=future_returns.index,
-                            columns=future_returns.columns
-                        )
-                        pc_future = self.compute_pc_series(future_std_returns, V)
+            # FIXED: Compute PROPER out-of-sample validation R²
+            prediction_r2 = self.compute_validation_r2(pc, lasso_final, scaler_X_final,
+                                                       final_factors, V, scaler, rebalance_date)
 
-                        if len(pc_future) >= 2:
-                            weekly_val_targets = []
-                            val_factors = []
-
-                            for i, date in enumerate(pc_future.index[:-1]):
-                                try:
-                                    current_pc = pc_future.loc[date, pc]
-                                    next_dates = pc_future.index[pc_future.index > date]
-                                    if len(next_dates) >= 1:
-                                        future_pc = pc_future.loc[next_dates[0], pc]
-                                        weekly_movement = future_pc - current_pc
-
-                                        # Get weekly factor data for this date
-                                        future_factor_prices = self.weekly_factor_data.loc[
-                                            rebalance_date:future_end_date]
-                                        future_factor_changes = self.compute_weekly_factor_changes(
-                                            future_factor_prices, rebalance_date, future_end_date
-                                        )
-
-                                        if date in future_factor_changes.index:
-                                            factor_vals = future_factor_changes.loc[date, final_factors].values
-                                            weekly_val_targets.append(weekly_movement)
-                                            val_factors.append(factor_vals)
-                                except:
-                                    continue
-
-                            if len(weekly_val_targets) >= 2:
-                                y_true = np.array(weekly_val_targets)
-                                X_pred = scaler_X_final.transform(np.array(val_factors))
-
-                                if not (np.any(np.isnan(y_true)) or np.any(np.isnan(X_pred))):
-                                    y_pred = lasso_final.predict(X_pred)
-                                    ss_res = np.sum((y_true - y_pred) ** 2)
-                                    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
-                                    prediction_r2 = 1 - (ss_res / ss_tot) if ss_tot > 1e-10 else 0.0
-                                    prediction_r2 = max(-0.5, min(1.0, prediction_r2))
-            except:
-                prediction_r2 = 0.0
-
-            # CRITICAL FIX: Store the final scaler that matches the final factors
             results[pc] = {
                 'alpha': lasso_final.intercept_,
                 'beta': betas,
@@ -554,7 +513,7 @@ class PCAFactorStrategy:
                 'r2_rebalancing': prediction_r2,
                 'factors': final_factors,
                 'model_type': 'lasso_weekly',
-                'scaler_X': scaler_X_final  # This is the key fix - store the right scaler
+                'scaler_X': scaler_X_final
             }
 
             self.selected_factors[pc] = final_factors
@@ -562,6 +521,323 @@ class PCAFactorStrategy:
             self.r2_history[pc].append((rebalance_date, prediction_r2))
 
         return results
+
+    def compute_validation_r2(self, pc_name, trained_model, scaler_X, final_factors, V, returns_scaler,
+                              train_rebalance_date):
+        """
+        FIXED: Compute proper validation R² by predicting PC movements on future periods
+        and comparing against actual PC movements in the SAME time periods.
+        """
+        try:
+            current_idx = list(self.rebalance_dates).index(train_rebalance_date)
+
+            # Get next 3-5 rebalance dates for validation
+            if current_idx >= len(self.rebalance_dates) - 2:
+                return 0.0  # Not enough future data
+
+            validation_dates = self.rebalance_dates[current_idx + 1:current_idx + 4]  # Next 3 weeks
+
+            predictions = []
+            actual_movements = []
+
+            for val_date in validation_dates:
+                try:
+                    # Get factor data for this validation date
+                    val_idx = self.weekly_data.index.get_loc(val_date)
+                    val_lookback_start = self.weekly_data.index[max(0, val_idx - self.lookback + 1)]
+
+                    # Compute factor changes for prediction
+                    val_factor_changes = self.compute_weekly_factor_changes(
+                        self.weekly_factor_data, val_lookback_start, val_date
+                    )
+
+                    if val_date not in val_factor_changes.index:
+                        continue
+
+                    # Get factor values and make prediction
+                    factor_vals = val_factor_changes.loc[val_date, final_factors].values
+                    if np.any(np.isnan(factor_vals)):
+                        continue
+
+                    X_pred = scaler_X.transform(factor_vals.reshape(1, -1))
+                    pc_movement_pred = trained_model.predict(X_pred)[0]
+
+                    # FIXED: Get ACTUAL PC movement for the SAME period
+                    # Compute PC series at validation date
+                    val_prices = self.weekly_data.loc[val_lookback_start:val_date]
+                    val_returns = self.compute_weekly_log_returns(val_prices)
+
+                    if len(val_returns) < 10:
+                        continue
+
+                    val_std_returns = pd.DataFrame(
+                        returns_scaler.transform(val_returns),
+                        index=val_returns.index,
+                        columns=val_returns.columns
+                    )
+                    val_pc_series = self.compute_pc_series(val_std_returns, V)
+
+                    # Get PC value at validation date
+                    if val_date not in val_pc_series.index:
+                        continue
+
+                    current_pc_val = val_pc_series.loc[val_date, pc_name]
+
+                    # Get NEXT week's PC value for actual movement
+                    next_val_idx = list(validation_dates).index(val_date) + current_idx + 2
+                    if next_val_idx < len(self.rebalance_dates):
+                        next_val_date = self.rebalance_dates[next_val_idx]
+
+                        # Compute PC at next date
+                        next_idx = self.weekly_data.index.get_loc(next_val_date)
+                        next_lookback_start = self.weekly_data.index[max(0, next_idx - self.lookback + 1)]
+
+                        next_prices = self.weekly_data.loc[next_lookback_start:next_val_date]
+                        next_returns = self.compute_weekly_log_returns(next_prices)
+
+                        if len(next_returns) >= 10:
+                            next_std_returns = pd.DataFrame(
+                                returns_scaler.transform(next_returns),
+                                index=next_returns.index,
+                                columns=next_returns.columns
+                            )
+                            next_pc_series = self.compute_pc_series(next_std_returns, V)
+
+                            if next_val_date in next_pc_series.index:
+                                next_pc_val = next_pc_series.loc[next_val_date, pc_name]
+                                actual_movement = next_pc_val - current_pc_val
+
+                                predictions.append(pc_movement_pred)
+                                actual_movements.append(actual_movement)
+
+                except Exception as e:
+                    continue
+
+            # Compute validation R²
+            if len(predictions) >= 3:
+                y_pred = np.array(predictions)
+                y_actual = np.array(actual_movements)
+
+                if np.std(y_actual) > 1e-8:  # Ensure variance in actual values
+                    ss_res = np.sum((y_actual - y_pred) ** 2)
+                    ss_tot = np.sum((y_actual - np.mean(y_actual)) ** 2)
+                    r2 = 1 - (ss_res / ss_tot)
+                    return max(-1.0, min(1.0, r2))  # Clamp between -1 and 1
+
+        except Exception as e:
+            print(f"Error in validation R² computation for {pc_name}: {e}")
+
+        return 0.0
+
+    def compute_actual_returns(self, rebalance_date):
+        """
+        FIXED: Compute actual weekly returns that match the prediction period exactly.
+        """
+        try:
+            # Find next rebalance date (exactly 1 week later)
+            current_idx = list(self.rebalance_dates).index(rebalance_date)
+            if current_idx < len(self.rebalance_dates) - 1:
+                next_rebalance_date = self.rebalance_dates[current_idx + 1]
+            else:
+                # Use next available weekly date
+                future_weeks = self.weekly_data.index[self.weekly_data.index > rebalance_date]
+                if len(future_weeks) == 0:
+                    return None, 0
+                next_rebalance_date = future_weeks[0]
+
+            # Ensure both dates exist in weekly data
+            if rebalance_date not in self.weekly_data.index or next_rebalance_date not in self.weekly_data.index:
+                print(f"ERROR - Date alignment issue: {rebalance_date.date()} or {next_rebalance_date.date()}")
+                return None, 0
+
+            # Compute weekly log returns
+            start_price = self.weekly_data.loc[rebalance_date]
+            end_price = self.weekly_data.loc[next_rebalance_date]
+
+            # Validate prices
+            if np.any(start_price <= 0) or np.any(end_price <= 0):
+                print("ERROR - Invalid price data")
+                return None, 0
+
+            actual_returns = np.log(end_price / start_price).values
+
+            # Check for valid returns
+            if np.any(np.isnan(actual_returns)) or np.any(np.isinf(actual_returns)):
+                print("ERROR - Invalid actual returns")
+                return None, 0
+
+            period_length = (next_rebalance_date - rebalance_date).days
+            return actual_returns, period_length
+
+        except Exception as e:
+            print(f"ERROR computing actual returns: {e}")
+            return None, 0
+    def compute_weekly_factor_changes(self, weekly_factor_prices, start_date, end_date):
+        """
+        Compute weekly factor changes for weekly data.
+        """
+        if weekly_factor_prices.empty:
+            return pd.DataFrame()
+
+        try:
+            prices = weekly_factor_prices.loc[start_date:end_date]
+            if len(prices) < 2:
+                return pd.DataFrame()
+
+            # Compute weekly log returns
+            weekly_returns = self.compute_weekly_log_returns(prices)
+            return weekly_returns
+
+        except KeyError:
+            return pd.DataFrame()
+
+    def plot_weekly_predictions_vs_actual(self):
+        """
+        Create two time series plots:
+        1. Predicted weekly returns for each rebalance date
+        2. Actual weekly returns for each rebalance date
+
+        Each point represents the average predicted/actual return across all stocks
+        for the week following that rebalance date.
+        """
+        print("=" * 60)
+        print("CREATING WEEKLY PREDICTIONS VS ACTUAL TIME SERIES PLOTS")
+        print("=" * 60)
+
+        predicted_weekly_returns = []
+        actual_weekly_returns = []
+        rebalance_dates_with_data = []
+
+        # Compute predictions and actual returns for each rebalance date
+        for i, rebalance_date in enumerate(self.rebalance_dates):
+            if i % 20 == 0:  # Progress indicator
+                print(f"Processing {i + 1}/{len(self.rebalance_dates)}: {rebalance_date.date()}")
+
+            try:
+                # Get data and compute all components (same as validation)
+                idx = self.weekly_data.index.get_loc(rebalance_date)
+                lookback_start = self.weekly_data.index[max(0, idx - self.lookback + 1)]
+                weekly_prices = self.weekly_data.loc[lookback_start:rebalance_date]
+                weekly_returns = self.compute_weekly_log_returns(weekly_prices)
+                std_returns, scaler = self.standardize_returns(weekly_returns)
+                V, eigenvalues, explained_var = self.compute_pca(std_returns)
+                C, u_centrality = self.compute_centrality_matrix(std_returns)
+                pc_series = self.compute_pc_series(std_returns, V)
+                factor_changes = self.compute_weekly_factor_changes(
+                    self.weekly_factor_data, lookback_start, rebalance_date
+                )
+                regression_results = self.factor_regression(
+                    pc_series, factor_changes, rebalance_date, std_returns, V, scaler
+                )
+
+                # Get predictions
+                sigma_pc_vec, delta_pc_pred_vec, pc_movement_weighted, r_hat, r_hat_weighted = self.compute_predictions(
+                    pc_series, factor_changes, regression_results, rebalance_date, V, u_centrality
+                )
+
+                # Get actual returns for the same period
+                actual_returns, actual_period = self.compute_actual_returns(rebalance_date)
+
+                if r_hat_weighted is not None and actual_returns is not None:
+                    # Store average returns across all stocks for this week
+                    predicted_avg = np.mean(r_hat_weighted)
+                    actual_avg = np.mean(actual_returns)
+
+                    predicted_weekly_returns.append(predicted_avg)
+                    actual_weekly_returns.append(actual_avg)
+                    rebalance_dates_with_data.append(rebalance_date)
+
+            except Exception as e:
+                print(f"Error processing {rebalance_date.date()}: {e}")
+                continue
+
+        if len(predicted_weekly_returns) == 0:
+            print("No data available for plotting.")
+            return
+
+        print(f"Successfully processed {len(predicted_weekly_returns)} rebalance periods")
+
+        # Create the plots
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 12))
+
+        # Plot 1: Predicted Weekly Returns
+        ax1.plot(rebalance_dates_with_data, predicted_weekly_returns,
+                 marker='o', linewidth=2, markersize=4, color='blue', alpha=0.7)
+        ax1.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+        ax1.set_title('Predicted Weekly Returns Over Time\n(Average Across All Stocks)',
+                      fontsize=14, fontweight='bold')
+        ax1.set_ylabel('Predicted Weekly Return')
+        ax1.grid(True, alpha=0.3)
+        ax1.tick_params(axis='x', rotation=45)
+
+        # Add some statistics to the plot
+        pred_mean = np.mean(predicted_weekly_returns)
+        pred_std = np.std(predicted_weekly_returns)
+        ax1.text(0.02, 0.98,
+                 f'Mean: {pred_mean:.4f}\nStd: {pred_std:.4f}\nRange: [{np.min(predicted_weekly_returns):.4f}, {np.max(predicted_weekly_returns):.4f}]',
+                 transform=ax1.transAxes, verticalalignment='top',
+                 bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+
+        # Plot 2: Actual Weekly Returns
+        ax2.plot(rebalance_dates_with_data, actual_weekly_returns,
+                 marker='s', linewidth=2, markersize=4, color='red', alpha=0.7)
+        ax2.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+        ax2.set_title('Actual Weekly Returns Over Time\n(Average Across All Stocks)',
+                      fontsize=14, fontweight='bold')
+        ax2.set_ylabel('Actual Weekly Return')
+        ax2.set_xlabel('Rebalance Date')
+        ax2.grid(True, alpha=0.3)
+        ax2.tick_params(axis='x', rotation=45)
+
+        # Add some statistics to the plot
+        actual_mean = np.mean(actual_weekly_returns)
+        actual_std = np.std(actual_weekly_returns)
+        ax2.text(0.02, 0.98,
+                 f'Mean: {actual_mean:.4f}\nStd: {actual_std:.4f}\nRange: [{np.min(actual_weekly_returns):.4f}, {np.max(actual_weekly_returns):.4f}]',
+                 transform=ax2.transAxes, verticalalignment='top',
+                 bbox=dict(boxstyle='round', facecolor='lightcoral', alpha=0.8))
+
+        plt.tight_layout()
+        plt.show()
+
+        # Print correlation and other metrics
+        correlation = np.corrcoef(predicted_weekly_returns, actual_weekly_returns)[0, 1]
+        mse = np.mean((np.array(predicted_weekly_returns) - np.array(actual_weekly_returns)) ** 2)
+        mae = np.mean(np.abs(np.array(predicted_weekly_returns) - np.array(actual_weekly_returns)))
+
+        print(f"\nWEEKLY PREDICTION PERFORMANCE SUMMARY:")
+        print(f"Correlation between predicted and actual: {correlation:.4f}")
+        print(f"Mean Squared Error: {mse:.6f}")
+        print(f"Mean Absolute Error: {mae:.6f}")
+        print(f"Predicted returns - Mean: {pred_mean:.4f}, Std: {pred_std:.4f}")
+        print(f"Actual returns - Mean: {actual_mean:.4f}, Std: {actual_std:.4f}")
+
+        # Create a combined plot for direct comparison
+        fig2, ax3 = plt.subplots(1, 1, figsize=(15, 8))
+        ax3.plot(rebalance_dates_with_data, predicted_weekly_returns,
+                 marker='o', linewidth=2, markersize=4, color='blue', alpha=0.7, label='Predicted')
+        ax3.plot(rebalance_dates_with_data, actual_weekly_returns,
+                 marker='s', linewidth=2, markersize=4, color='red', alpha=0.7, label='Actual')
+        ax3.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+        ax3.set_title(f'Weekly Predicted vs Actual Returns Comparison\nCorrelation: {correlation:.4f}',
+                      fontsize=14, fontweight='bold')
+        ax3.set_ylabel('Weekly Return')
+        ax3.set_xlabel('Rebalance Date')
+        ax3.legend()
+        ax3.grid(True, alpha=0.3)
+        ax3.tick_params(axis='x', rotation=45)
+
+        plt.tight_layout()
+        plt.show()
+
+        return {
+            'dates': rebalance_dates_with_data,
+            'predicted': predicted_weekly_returns,
+            'actual': actual_weekly_returns,
+            'correlation': correlation,
+            'mse': mse,
+            'mae': mae
+        }
 
     def validate_step3(self):
         validation_results = []
@@ -863,54 +1139,6 @@ class PCAFactorStrategy:
 
         return sigma_pc_vec, delta_pc_pred_week, predicted_pct_change_vec, r_hat_base, r_hat_weighted
 
-    def compute_actual_returns(self, rebalance_date):
-        """
-        Compute actual stock returns for the same period as predictions.
-        Returns cumulative log returns for each stock over the rebalance period.
-        """
-        try:
-            # Get period length (same as used in predictions)
-            current_idx = list(self.rebalance_dates).index(rebalance_date)
-            if current_idx < len(self.rebalance_dates) - 1:
-                next_rebalance_date = self.rebalance_dates[current_idx + 1]
-                period_length = (next_rebalance_date - rebalance_date).days
-                end_date = next_rebalance_date
-            else:
-                period_length = 5
-                # For the last rebalance, get approximately 5 trading days after
-                future_dates = self.data.index[self.data.index > rebalance_date]
-                if len(future_dates) == 0:
-                    return None, 0
-                # Try to get close to the period length in trading days
-                end_date = future_dates[min(period_length - 1, len(future_dates) - 1)]
-                period_length = (end_date - rebalance_date).days
-        except (ValueError, IndexError):
-            period_length = 5
-            future_dates = self.data.index[self.data.index > rebalance_date]
-            if len(future_dates) == 0:
-                return None, 0
-            end_date = future_dates[min(4, len(future_dates) - 1)]
-            period_length = (end_date - rebalance_date).days
-
-        print(f"\nDEBUG - Computing actual returns from {rebalance_date.date()} to {end_date.date()}")
-        print(f"DEBUG - Period length: {period_length} days")
-
-        try:
-            start_price = self.data.loc[rebalance_date]
-            end_price = self.data.loc[end_date]
-
-            # Compute cumulative log return: log(P_end / P_start)
-            actual_returns = np.log(end_price / start_price).values
-
-            print(f"DEBUG - Actual returns range: [{np.min(actual_returns):.6f}, {np.max(actual_returns):.6f}]")
-            print(f"DEBUG - Sample actual returns: {actual_returns[:5]}")
-
-            return actual_returns, period_length
-
-        except KeyError as e:
-            print(f"ERROR - Could not find price data: {e}")
-            return None, 0
-
     def validate_step4(self):
         """
         Validate step 4: Compute actual returns and create predicted vs actual comparison.
@@ -1077,4 +1305,5 @@ if __name__ == "__main__":
     strategy.download_data()
     strategy.validate_step3()
     strategy.validate_step4()
+    results = strategy.plot_weekly_predictions_vs_actual()
 
