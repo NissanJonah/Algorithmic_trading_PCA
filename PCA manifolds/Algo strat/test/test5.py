@@ -988,6 +988,250 @@ class PCAFactorStrategy:
             weights -= net_position / n
         return weights
 
+    def optimize_portfolio(self, rebalance_date):
+        """Optimize portfolio weights using linear programming to enforce full capital allocation."""
+        r_hat_weighted = self.compute_weighted_predicted_returns(rebalance_date)
+        if r_hat_weighted is None:
+            print(f"Warning: No predicted returns for {rebalance_date.date()}")
+            return None
+        betas = self.compute_betas(rebalance_date)
+        if betas is None:
+            print(f"Warning: No betas for {rebalance_date.date()}")
+            return None
+        prev_date = self.rebalance_dates[self.rebalance_dates < rebalance_date][-1] if rebalance_date != \
+                                                                                       self.rebalance_dates[0] else None
+        C_total = self.portfolio_values.get(prev_date, self.initial_capital)
+        n = len(self.stocks)
+        # Decision variables: v_i^+ and v_i^- (positive and negative components), total 2n variables
+        # v_i = v_i^+ - v_i^-, where v_i^+ >= 0, v_i^- >= 0
+        # Objective: maximize sum((v_i^+ - v_i^-) * r_hat_weighted_i)
+        c = np.concatenate([-r_hat_weighted, r_hat_weighted])  # -r_hat for v_i^+, +r_hat for v_i^-
+        # Constraints
+        A_eq = []
+        b_eq = []
+        A_ub = []
+        b_ub = []
+        bounds = [(0, None)] * (2 * n)  # v_i^+, v_i^- >= 0
+        # 1. Market neutrality: sum(v_i^+ - v_i^-) = 0
+        market_neutral = np.concatenate([np.ones(n), -np.ones(n)])
+        A_eq.append(market_neutral)
+        b_eq.append(0.0)
+        # 2. Full capital allocation: sum(v_i^+ + v_i^-) = C_total
+        capital_allocation = np.ones(2 * n)
+        A_eq.append(capital_allocation)
+        b_eq.append(C_total)
+        # 3. Short only negative returns: v_i^+ = 0 if r_hat < 0, v_i^- = 0 if r_hat >= 0
+        for i in range(n):
+            if r_hat_weighted[i] < 0:
+                bounds[i] = (0, 0)  # v_i^+ = 0 for short positions
+            else:
+                bounds[i + n] = (0, 0)  # v_i^- = 0 for long positions
+        # 4. Beta exposure constraint: |sum((v_i^+ - v_i^-) * beta_i)| <= 0.15 * C_total
+        beta_vec = np.concatenate([betas, -betas])
+        A_ub.append(beta_vec)
+        A_ub.append(-beta_vec)
+        b_ub.append(0.15 * C_total)
+        b_ub.append(0.15 * C_total)
+        # 5. Individual stock limits: |v_i^+ - v_i^-| <= 0.15 * C_total
+        for i in range(n):
+            # v_i^+ - v_i^- <= 0.15 * C_total
+            row = np.zeros(2 * n)
+            row[i] = 1
+            row[i + n] = -1
+            A_ub.append(row)
+            b_ub.append(0.15 * C_total)
+            # -(v_i^+ - v_i^-) <= 0.15 * C_total
+            A_ub.append(-row)
+            b_ub.append(0.15 * C_total)
+        # Convert to numpy arrays
+        A_eq = np.array(A_eq)
+        b_eq = np.array(b_eq)
+        A_ub = np.array(A_ub)
+        b_ub = np.array(b_ub)
+        # Track optimization method
+        if not hasattr(self, 'optimization_counts'):
+            self.optimization_counts = {'linprog_success': 0, 'least_squares_fallback': 0}
+        # Try linear programming
+        try:
+            res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method='highs')
+            if res.success:
+                x = res.x
+                weights = x[:n] - x[n:]  # v_i = v_i^+ - v_i^-
+                # Verify market neutrality and full allocation
+                if abs(np.sum(weights)) > 1e-6:
+                    print(f"Warning: Solution not market neutral at {rebalance_date.date()}. Adjusting weights.")
+                    weights -= np.sum(weights) / n
+                if abs(np.sum(np.abs(weights)) - C_total) > 1e-6:
+                    print(f"Warning: Solution does not fully allocate capital at {rebalance_date.date()}. Normalizing.")
+                    scale_factor = C_total / np.sum(np.abs(weights)) if np.sum(np.abs(weights)) > 0 else 1.0
+                    weights *= scale_factor
+                self.optimization_counts['linprog_success'] += 1
+                print(f"Optimization Debug: Used linprog successfully for {rebalance_date.date()}")
+                return weights
+        except Exception as e:
+            print(f"Linear programming failed for {rebalance_date.date()}: {e}")
+        # Fallback to simple allocation
+        print(f"Falling back to simplified allocation for {rebalance_date.date()}")
+        self.optimization_counts['least_squares_fallback'] += 1
+        weights = np.zeros(n)
+        long_indices = np.where(r_hat_weighted >= 0)[0]
+        short_indices = np.where(r_hat_weighted < 0)[0]
+        # Allocate 50% to long, 50% to short for market neutrality and full allocation
+        if len(long_indices) > 0:
+            long_weight = (0.5 * C_total) / max(len(long_indices), 1)
+            weights[long_indices] = long_weight
+        if len(short_indices) > 0:
+            short_weight = -(0.5 * C_total) / max(len(short_indices), 1)
+            weights[short_indices] = short_weight
+        # Ensure market neutrality
+        net_position = np.sum(weights)
+        if abs(net_position) > 1e-6:
+            weights -= net_position / n
+        # Ensure full capital allocation
+        if abs(np.sum(np.abs(weights)) - C_total) > 1e-6:
+            scale_factor = C_total / np.sum(np.abs(weights)) if np.sum(np.abs(weights)) > 0 else 1.0
+            weights *= scale_factor
+        return weights
+
+    def optimize_portfolio(self, rebalance_date):
+        """Optimize portfolio weights using linear programming with 50% long / 50% short allocation."""
+        r_hat_weighted = self.compute_weighted_predicted_returns(rebalance_date)
+        if r_hat_weighted is None:
+            print(f"Warning: No predicted returns for {rebalance_date.date()}")
+            return None
+        betas = self.compute_betas(rebalance_date)
+        if betas is None:
+            print(f"Warning: No betas for {rebalance_date.date()}")
+            return None
+        prev_date = self.rebalance_dates[self.rebalance_dates < rebalance_date][-1] if rebalance_date != \
+                                                                                       self.rebalance_dates[0] else None
+        C_total = self.portfolio_values.get(prev_date, self.initial_capital)
+        n = len(self.stocks)
+        # Decision variables: v_i^+ and v_i^- (positive and negative components), total 2n variables
+        # v_i = v_i^+ - v_i^-, where v_i^+ >= 0, v_i^- >= 0
+        # Objective: maximize sum((v_i^+ - v_i^-) * r_hat_weighted_i)
+        c = np.concatenate([-r_hat_weighted, r_hat_weighted])  # -r_hat for v_i^+, +r_hat for v_i^-
+        # Constraints
+        A_eq = []
+        b_eq = []
+        A_ub = []
+        b_ub = []
+        bounds = [(0, None)] * (2 * n)  # v_i^+, v_i^- >= 0
+        # 1. Market neutrality: sum(v_i^+ - v_i^-) = 0
+        market_neutral = np.concatenate([np.ones(n), -np.ones(n)])
+        A_eq.append(market_neutral)
+        b_eq.append(0.0)
+        # 2. Full capital allocation: sum(v_i^+ + v_i^-) = C_total
+        capital_allocation = np.ones(2 * n)
+        A_eq.append(capital_allocation)
+        b_eq.append(C_total)
+        # 3. Long allocation: sum(v_i^+) = 0.5 * C_total
+        long_allocation = np.concatenate([np.ones(n), np.zeros(n)])
+        A_eq.append(long_allocation)
+        b_eq.append(0.5 * C_total)
+        # 4. Short allocation: sum(v_i^-) = 0.5 * C_total
+        short_allocation = np.concatenate([np.zeros(n), np.ones(n)])
+        A_eq.append(short_allocation)
+        b_eq.append(0.5 * C_total)
+        # 5. Short only negative returns: v_i^+ = 0 if r_hat < 0, v_i^- = 0 if r_hat >= 0
+        for i in range(n):
+            if r_hat_weighted[i] < 0:
+                bounds[i] = (0, 0)  # v_i^+ = 0 for short positions
+            else:
+                bounds[i + n] = (0, 0)  # v_i^- = 0 for long positions
+        # 6. Beta exposure constraint: |sum((v_i^+ - v_i^-) * beta_i)| <= 0.1 * C_total
+        beta_vec = np.concatenate([betas, -betas])
+        A_ub.append(beta_vec)
+        A_ub.append(-beta_vec)
+        b_ub.append(0.1 * C_total)
+        b_ub.append(0.1 * C_total)
+        # 7. Individual stock limits: 0 ≤ v_i_long ≤ 0.15 * C_total, 0 ≤ |v_i_short| ≤ 0.12 * C_total
+        # Translated to: 0 ≤ v_i^+ ≤ 0.15 * C_total for longs, 0 ≤ v_i^- ≤ 0.12 * C_total for shorts
+        for i in range(n):
+            if r_hat_weighted[i] >= 0:
+                bounds[i] = (0, 0.15 * C_total)  # v_i^+ for longs
+            else:
+                bounds[i + n] = (0, 0.12 * C_total)  # v_i^- for shorts
+        # 8. Short concentration limit: v_i^- ≤ 0.25 * total_short_allocation for each short
+        total_short_allocation = 0.5 * C_total  # Based on 50% short
+        for i in range(n):
+            if r_hat_weighted[i] < 0:
+                row = np.zeros(2 * n)
+                row[i + n] = 1.0
+                A_ub.append(row)
+                b_ub.append(0.25 * total_short_allocation)
+        # Convert to numpy arrays
+        A_eq = np.array(A_eq)
+        b_eq = np.array(b_eq)
+        A_ub = np.array(A_ub)
+        b_ub = np.array(b_ub)
+        # Track optimization method
+        if not hasattr(self, 'optimization_counts'):
+            self.optimization_counts = {'linprog_success': 0, 'least_squares_fallback': 0}
+        # Try linear programming
+        try:
+            res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method='highs')
+            if res.success:
+                x = res.x
+                weights = x[:n] - x[n:]  # v_i = v_i^+ - v_i^-
+                # Verify constraints
+                if abs(np.sum(weights)) > 1e-6:
+                    print(f"Warning: Solution not market neutral at {rebalance_date.date()}. Adjusting weights.")
+                    weights -= np.sum(weights) / n
+                if abs(np.sum(np.abs(weights)) - C_total) > 1e-6:
+                    print(f"Warning: Solution does not fully allocate capital at {rebalance_date.date()}. Normalizing.")
+                    scale_factor = C_total / np.sum(np.abs(weights)) if np.sum(np.abs(weights)) > 0 else 1.0
+                    weights *= scale_factor
+                long_sum = np.sum(weights[weights > 0])
+                short_sum = np.abs(np.sum(weights[weights < 0]))
+                if abs(long_sum - 0.5 * C_total) > 1e-6 or abs(short_sum - 0.5 * C_total) > 1e-6:
+                    print(
+                        f"Warning: Long/short allocation off at {rebalance_date.date()}. Long: {long_sum:.2f}, Short: {short_sum:.2f}")
+                self.optimization_counts['linprog_success'] += 1
+                print(f"Optimization Debug: Used linprog successfully for {rebalance_date.date()}")
+                return weights
+        except Exception as e:
+            print(f"Linear programming failed for {rebalance_date.date()}: {e}")
+        # Fallback to simple allocation
+        print(f"Falling back to simplified allocation for {rebalance_date.date()}")
+        self.optimization_counts['least_squares_fallback'] += 1
+        weights = np.zeros(n)
+        long_indices = np.where(r_hat_weighted >= 0)[0]
+        short_indices = np.where(r_hat_weighted < 0)[0]
+        # Allocate 50% to long, 50% to short for market neutrality and full allocation
+        if len(long_indices) > 0:
+            long_weight = (0.5 * C_total) / max(len(long_indices), 1)
+            long_weight = min(long_weight, 0.15 * C_total)  # Enforce individual long limit
+            weights[long_indices] = long_weight
+        if len(short_indices) > 0:
+            short_weight = -(0.5 * C_total) / max(len(short_indices), 1)
+            short_weight = max(short_weight, -0.12 * C_total)  # Enforce individual short limit (negative)
+            weights[short_indices] = short_weight
+        # Enforce short concentration limit: clip if any |v_i_short| > 0.25 * total_short_allocation
+        total_short_allocation = 0.5 * C_total
+        weights[weights < 0] = np.maximum(weights[weights < 0], -0.25 * total_short_allocation)
+        # Ensure market neutrality
+        net_position = np.sum(weights)
+        if abs(net_position) > 1e-6:
+            weights -= net_position / n
+        # Ensure full capital allocation and 50/50 ratio
+        long_sum = np.sum(weights[weights > 0])
+        short_sum = np.abs(np.sum(weights[weights < 0]))
+        if long_sum > 0 and abs(long_sum - 0.5 * C_total) > 1e-6:
+            weights[weights > 0] *= (0.5 * C_total) / long_sum
+        if short_sum > 0 and abs(short_sum - 0.5 * C_total) > 1e-6:
+            weights[weights < 0] *= (0.5 * C_total) / short_sum
+        # Enforce beta exposure in fallback: if violated, proportionally reduce positions
+        beta_exposure = np.abs(np.dot(weights, betas))
+        if beta_exposure > 0.1 * C_total:
+            scale_factor = (0.1 * C_total) / beta_exposure
+            weights *= scale_factor
+        # Final market neutrality adjustment
+        net_position = np.sum(weights)
+        if abs(net_position) > 1e-6:
+            weights -= net_position / n
+        return weights
+
     def compute_portfolio_metrics(self, rebalance_date, weights, prev_weights=None):
         """Compute P&L, transaction costs, and portfolio metrics without P&L cap."""
         actual_returns = self.rebalance_data.get(rebalance_date, {}).get('actual_returns')
