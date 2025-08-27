@@ -222,6 +222,7 @@ class PCAFactorStrategy:
             for factor_name, missing in failed_factors:
                 print(f" {factor_name}: Missing {missing}")
         return all_factors
+
     def compute_pca_for_rebalance(self, rebalance_date):
         """Compute PCA loadings matrix for a rebalance date, retaining stock return scales."""
         if rebalance_date not in self.stock_data.index:
@@ -241,7 +242,7 @@ class PCAFactorStrategy:
         # Compute mean and std for rescaling
         returns_mean = returns.mean()
         returns_std = returns.std()
-        returns_std = returns_std.where(returns_std > 0, 1e-10) # Avoid division by zero
+        returns_std = returns_std.where(returns_std > 0, 1e-10)  # Avoid division by zero
         returns_standardized = (returns - returns_mean) / returns_std
         returns_standardized = returns_standardized.dropna(axis=1, how='any')
         cov_matrix = returns_standardized.T @ returns_standardized / (len(returns_standardized) - 1)
@@ -257,6 +258,7 @@ class PCAFactorStrategy:
             if np.sum(loadings[:, i]) < 0:
                 loadings[:, i] = -loadings[:, i]
         return loadings, explained_variance, stock_std
+
     def compute_centrality_for_rebalance(self, rebalance_date):
         """Compute centrality vector for a rebalance date."""
         if rebalance_date not in self.stock_data.index:
@@ -606,6 +608,7 @@ class PCAFactorStrategy:
         centrality_vector = self.rebalance_data.get(rebalance_date, {}).get('centrality_vector')
         if centrality_vector is not None:
             print(f" Centrality vector range: {centrality_vector.min():.4f}, {centrality_vector.max():.4f}")
+
     def compute_pc_std(self, rebalance_date):
         """Compute scaling factor based on PC-specific standard deviations."""
         weekly_prices = self.stock_data.resample(self.rebalance_frequency).last()
@@ -628,7 +631,9 @@ class PCAFactorStrategy:
         pc_returns = weekly_stock_returns @ pca_matrix
         # Compute standard deviation for each PC
         sigma = pc_returns.std(ddof=1).values
+        sigma = np.where(sigma == 0, 1e-10, sigma)  # Avoid division by zero
         return sigma
+
     def compute_predicted_pc_movement(self, rebalance_date):
         """Compute predicted PC movements."""
         results = self.regression_results.get(rebalance_date)
@@ -643,6 +648,7 @@ class PCAFactorStrategy:
             if pred_value is not None:
                 pred_pct_change_pc[pc_idx] = pred_value
         return pred_pct_change_pc
+
     def compute_predicted_stock_returns(self, rebalance_date):
         """Compute predicted stock returns using loadings and predicted PC movements."""
         pred_pct_change_pc = self.compute_predicted_pc_movement(rebalance_date)
