@@ -36,6 +36,23 @@ class PCAFactorStrategy:
         - min_regression_weeks: Minimum weeks required for regression (int, default 42)
         """
         self.stocks = ['JPM', 'BAC', 'WFC', 'C', 'GS', 'MS', 'V', 'MA', 'AXP', 'PNC', 'TFC', 'USB', 'ALL', 'MET', 'PRU']
+        # self.stocks = [
+        #     'ROKU',  # Roku
+        #     'PTON',  # Peloton
+        #     'ZM',  # Zoom
+        #     'TDOC',  # Teladoc
+        #     'AFRM',  # Affirm
+        #     'RBLX',  # Roblox
+        #     'COIN',  # Coinbase
+        #     'CVNA',  # Carvana
+        #     'OPEN',  # Opendoor
+        #     'SHOP',  # Shopify
+        #     'UPST',  # Upstart
+        #     'DOCU',  # DocuSign
+        #     'DOCN',  # DigitalOcean
+        #     'HOOD',  # Robinhood
+        #     'SNAP'  # Snap
+        # ]
         self.start_date = start_date
         self.end_date = end_date
         self.rebalance_frequency = rebalance_frequency
@@ -109,6 +126,23 @@ class PCAFactorStrategy:
             'PNC': 'Regional Banking', 'TFC': 'Regional Banking', 'USB': 'Regional Banking',
             'ALL': 'Insurance', 'MET': 'Insurance', 'PRU': 'Insurance'
         }
+        # self.sectors = {
+        #     'ROKU': 'Communication Services',  # Streaming media
+        #     'PTON': 'Consumer Discretionary',  # Fitness equipment
+        #     'ZM': 'Technology',  # Video conferencing
+        #     'TDOC': 'Healthcare',  # Telehealth
+        #     'AFRM': 'Financials',  # Buy now, pay later
+        #     'RBLX': 'Technology',  # Gaming platform
+        #     'COIN': 'Financials',  # Cryptocurrency exchange
+        #     'CVNA': 'Consumer Discretionary',  # Online car sales
+        #     'OPEN': 'Real Estate',  # Real estate tech
+        #     'SHOP': 'Technology',  # E-commerce platform
+        #     'UPST': 'Financials',  # AI lending platform
+        #     'DOCU': 'Technology',  # E-signature software
+        #     'DOCN': 'Technology',  # Cloud infrastructure
+        #     'HOOD': 'Financials',  # Trading platform
+        #     'SNAP': 'Communication Services'  # Social media
+        # }
 
     def download_data(self):
         """Download stock and factor data, compute weekly factor returns, and set rebalance dates."""
@@ -834,7 +868,7 @@ class PCAFactorStrategy:
         C_total = self.portfolio_values.get(prev_date, self.initial_capital)
         n = len(self.stocks)
         # Decision variables: v_i (long and short positions handled by positive/negative values)
-        c = -r_hat_weighted  # Objective: maximize sum(v_i * r_hat_weighted_i) => minimize -sum(v_i * r_hat_weighted_i)
+        c = -r_hat_weighted  # Objective: maximize sum(v_i * r_hat_weighted_i)
         # Constraints
         A_eq = []
         b_eq = []
@@ -854,23 +888,21 @@ class PCAFactorStrategy:
         b_eq.append(0.65 * C_total)
         # Sum of abs(short positions) = 0.35 * C_total
         short_eq = np.zeros(n)
-        short_eq[short_mask] = -1.0  # Negative because short positions are negative v_i
+        short_eq[short_mask] = -1.0
         A_eq.append(short_eq)
         b_eq.append(0.35 * C_total)
         # 3. Individual stock limits and short only negative returns
         for i in range(n):
             if r_hat_weighted[i] >= 0:
-                # Long positions: 0 <= v_i <= 0.15 * C_total
                 bounds.append((0, 0.15 * C_total))
             else:
-                # Short positions: -0.12 * C_total <= v_i <= 0
                 bounds.append((-0.12 * C_total, 0))
         # 4. Short concentration limit: |v_i_short| <= 0.3 * total_short_allocation
         total_short_allocation = 0.35 * C_total
         for i in range(n):
             if r_hat_weighted[i] < 0:
                 row = np.zeros(n)
-                row[i] = -1.0  # Negative because v_i_short is negative
+                row[i] = -1.0
                 A_ub.append(row)
                 b_ub.append(0.3 * total_short_allocation)
         # 5. Beta exposure constraint: |v · β| <= 0.15
@@ -896,6 +928,9 @@ class PCAFactorStrategy:
         b_eq = np.array(b_eq) if b_eq else None
         A_ub = np.array(A_ub) if A_ub else None
         b_ub = np.array(b_ub) if b_ub else None
+        # Track optimization method
+        if not hasattr(self, 'optimization_counts'):
+            self.optimization_counts = {'linprog_success': 0, 'least_squares_fallback': 0}
         # Try linear programming
         try:
             res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method='highs')
@@ -905,12 +940,15 @@ class PCAFactorStrategy:
                 if abs(np.sum(weights)) > 1e-6:
                     print(
                         f"Warning: Linear programming solution not market neutral at {rebalance_date.date()}. Adjusting weights.")
-                    weights -= np.sum(weights) / n  # Adjust to ensure sum(v_i) = 0
+                    weights -= np.sum(weights) / n
+                self.optimization_counts['linprog_success'] += 1
+                print(f"Optimization Debug: Used linprog successfully for {rebalance_date.date()}")
                 return weights
         except Exception as e:
             print(f"Linear programming failed for {rebalance_date.date()}: {e}")
         # Fallback to least squares optimization
         print(f"Falling back to least squares optimization for {rebalance_date.date()}")
+        self.optimization_counts['least_squares_fallback'] += 1
         weights = np.zeros(n)
         long_indices = np.where(r_hat_weighted >= 0)[0]
         short_indices = np.where(r_hat_weighted < 0)[0]
@@ -928,9 +966,9 @@ class PCAFactorStrategy:
         # Verify short only negative returns
         for i in range(n):
             if r_hat_weighted[i] >= 0 and weights[i] < 0:
-                weights[i] = 0  # Remove short positions for positive expected returns
+                weights[i] = 0
             elif r_hat_weighted[i] < 0 and weights[i] > 0:
-                weights[i] = 0  # Remove long positions for negative expected returns
+                weights[i] = 0
         # Re-normalize to maintain long/short allocation constraints
         long_sum = np.sum(weights[weights > 0])
         short_sum = np.abs(np.sum(weights[weights < 0]))
@@ -945,7 +983,7 @@ class PCAFactorStrategy:
         return weights
 
     def compute_portfolio_metrics(self, rebalance_date, weights, prev_weights=None):
-        """Compute P&L, transaction costs, and portfolio metrics."""
+        """Compute P&L, transaction costs, and portfolio metrics without P&L cap."""
         actual_returns = self.rebalance_data.get(rebalance_date, {}).get('actual_returns')
         if actual_returns is None or weights is None:
             print(f"Warning: No actual returns or weights for {rebalance_date.date()}")
@@ -957,10 +995,6 @@ class PCAFactorStrategy:
         actual_returns = actual_returns[:len(weights)]
         # Calculate P&L: weights (in dollars) * actual_returns (simple returns)
         pnl = np.sum(weights * actual_returns)
-        # Sanity check: limit P&L to realistic values (e.g., ±50% of C_total)
-        if abs(pnl) > 0.5 * C_total:
-            print(f"Warning: Unrealistic P&L at {rebalance_date.date()}: {pnl:.2f}. Capping P&L.")
-            pnl = max(min(pnl, 0.5 * C_total), -0.5 * C_total)
         # Calculate transaction costs
         turnover = 0.0
         if prev_weights is not None:
@@ -968,12 +1002,13 @@ class PCAFactorStrategy:
         transaction_costs = turnover * self.transaction_cost_rate
         # Net P&L
         net_pnl = pnl - transaction_costs
-        # Debugging: Print P&L components
-        print(
-            f"Debug: {rebalance_date.date()} - P&L: {pnl:.2f}, Transaction Costs: {transaction_costs:.2f}, Net P&L: {net_pnl:.2f}, Portfolio Value: {C_total + net_pnl:.2f}")
         # Long and short exposures
         long_exposure = np.sum(weights[weights > 0])
         short_exposure = np.abs(np.sum(weights[weights < 0]))
+        # Debugging: Print P&L components
+        print(
+            f"Debug: {rebalance_date.date()} - P&L: {pnl:.2f}, Transaction Costs: {transaction_costs:.2f}, "
+            f"Net P&L: {net_pnl:.2f}, Portfolio Value: {C_total + net_pnl:.2f}")
         return net_pnl, transaction_costs, long_exposure, short_exposure
 
     def compute_sharpe_ratio(self):
@@ -987,11 +1022,78 @@ class PCAFactorStrategy:
         std_return = np.std(weekly_returns, ddof=1)
         if std_return == 0:
             return None
-        # Annualize: 52 weeks per year
         annualized_return = mean_return * 52
         annualized_std = std_return * np.sqrt(52)
         sharpe_ratio = annualized_return / annualized_std
-        return sharpe_ratio
+        return sharpe_ratio, annualized_return, annualized_std
+
+    def compute_sortino_ratio(self):
+        """Compute annualized Sortino ratio using downside deviation."""
+        pnl_values = [self.pnl_history[date][0] for date in sorted(self.pnl_history.keys()) if
+                      self.pnl_history[date][0] is not None]
+        if len(pnl_values) < 2:
+            return None
+        weekly_returns = np.array(pnl_values) / self.initial_capital
+        mean_return = np.mean(weekly_returns)
+        downside_returns = weekly_returns[weekly_returns < 0]
+        if len(downside_returns) == 0:
+            return None
+        downside_std = np.std(downside_returns, ddof=1)
+        if downside_std == 0:
+            return None
+        annualized_return = mean_return * 52
+        annualized_downside_std = downside_std * np.sqrt(52)
+        sortino_ratio = annualized_return / annualized_downside_std
+        return sortino_ratio
+
+    def compute_max_drawdown(self):
+        """Compute maximum drawdown based on portfolio values with debugging output."""
+        dates = sorted(self.portfolio_values.keys())
+        if not dates:
+            print("No portfolio value data available for max drawdown calculation")
+            return None
+        portfolio_values = [self.portfolio_values[date] for date in dates]
+        portfolio_values = np.array(portfolio_values)
+        running_max = np.maximum.accumulate(portfolio_values)
+        drawdowns = (running_max - portfolio_values) / running_max
+        max_drawdown = np.max(drawdowns) if len(drawdowns) > 0 else 0.0
+        # Debugging output
+        if len(drawdowns) > 0:
+            max_drawdown_idx = np.argmax(drawdowns)
+            peak_date = dates[max_drawdown_idx]
+            peak_value = running_max[max_drawdown_idx]
+            trough_value = portfolio_values[max_drawdown_idx]
+            print(f"Max Drawdown Debug: Peak at {peak_date.date()} (${peak_value:.2f}), "
+                  f"Trough at {peak_date.date()} (${trough_value:.2f}), Drawdown = {max_drawdown * 100:.2f}%")
+        else:
+            print("Max Drawdown Debug: No drawdowns calculated (insufficient data)")
+        return max_drawdown
+
+    def compute_profit_factor(self):
+        """Compute profit factor (gross profits / gross losses)."""
+        pnl_values = [self.pnl_history[date][0] for date in sorted(self.pnl_history.keys()) if
+                      self.pnl_history[date][0] is not None]
+        if len(pnl_values) == 0:
+            return None
+        gross_profits = sum(p for p in pnl_values if p > 0)
+        gross_losses = abs(sum(p for p in pnl_values if p < 0))
+        if gross_losses == 0:
+            return None if gross_profits == 0 else float('inf')
+        return gross_profits / gross_losses
+
+    def compute_long_short_profits(self, rebalance_date):
+        """Compute P&L contributions from long and short positions for a rebalance date."""
+        actual_returns = self.rebalance_data.get(rebalance_date, {}).get('actual_returns')
+        weights = self.weights.get(rebalance_date)
+        if actual_returns is None or weights is None:
+            return None, None
+        actual_returns = actual_returns[:len(weights)]
+        long_mask = weights > 0
+        short_mask = weights < 0
+        long_pnl = np.sum(weights[long_mask] * actual_returns[long_mask]) if np.any(long_mask) else 0.0
+        short_pnl = np.sum(weights[short_mask] * actual_returns[short_mask]) if np.any(short_mask) else 0.0
+        return long_pnl, short_pnl
+
 
     def plot_profits_over_time(self):
         """Plot portfolio value (initial capital + cumulative P&L) over time."""
@@ -1316,12 +1418,14 @@ class PCAFactorStrategy:
             ax.tick_params(axis='x', rotation=45)
             plt.tight_layout()
             plt.show()
+
     def main(self):
-        """Main method with regression, optimization, and plotting."""
+        """Main method with regression, optimization, and detailed profitability report."""
         self.download_data()
-        # Initialize portfolio values for all rebalance dates
         self.portfolio_values = {date: self.initial_capital for date in self.rebalance_dates}
         prev_weights = None
+        long_pnls = []
+        short_pnls = []
         for rebalance_date in self.rebalance_dates:
             pca_matrix, explained_variance, stock_std = self.compute_pca_for_rebalance(rebalance_date)
             centrality_vector = self.compute_centrality_for_rebalance(rebalance_date)
@@ -1336,24 +1440,24 @@ class PCAFactorStrategy:
             regression_results = self.train_regression_models(rebalance_date)
             if regression_results:
                 self.regression_results[rebalance_date] = regression_results
-            # Portfolio optimization
             weights = self.optimize_portfolio(rebalance_date)
             if weights is not None:
                 self.weights[rebalance_date] = weights
-                # Compute portfolio metrics
                 net_pnl, transaction_costs, long_exposure, short_exposure = self.compute_portfolio_metrics(
                     rebalance_date, weights, prev_weights
                 )
                 self.pnl_history[rebalance_date] = (net_pnl, transaction_costs, long_exposure, short_exposure)
-                # Update portfolio value for the next rebalance date
                 if net_pnl is not None and rebalance_date != self.rebalance_dates[-1]:
                     next_date_idx = self.rebalance_dates.get_loc(rebalance_date) + 1
                     next_date = self.rebalance_dates[next_date_idx]
                     current_value = self.portfolio_values.get(rebalance_date, self.initial_capital)
                     self.portfolio_values[next_date] = current_value + net_pnl
-                    # Debugging: Print portfolio value update
                     print(
                         f"Debug: Updated portfolio value for {next_date.date()}: {self.portfolio_values[next_date]:.2f}")
+                long_pnl, short_pnl = self.compute_long_short_profits(rebalance_date)
+                if long_pnl is not None:
+                    long_pnls.append(long_pnl)
+                    short_pnls.append(short_pnl)
                 prev_weights = weights
             self.debug_scaling(rebalance_date)
         self.compute_actuals_future()
@@ -1364,9 +1468,102 @@ class PCAFactorStrategy:
         self.plot_profits_over_time()
         self.plot_portfolio_composition()
         self.plot_beta_exposure()
-        #self.debug_and_validate_last_two_days()
         self.plot_returns_boxplots()
         self.plot_stock_returns_and_composition(num_plots=6)
+
+        # Detailed Profitability Report
+        print("\n=== Detailed Portfolio Performance Report ===")
+        print(f"Date Range: {self.rebalance_dates[0].date()} to {self.rebalance_dates[-1].date()}")
+        print(f"Rebalance Frequency: {self.rebalance_frequency}")
+        print(f"Number of Rebalance Periods: {len(self.rebalance_dates)}")
+        print(f"Initial Capital: ${self.initial_capital:.2f}")
+
+        # P&L Metrics
+        cumulative_pnl = sum(pnl[0] for pnl in self.pnl_history.values() if pnl[0] is not None)
+        print(f"\nCumulative P&L: ${cumulative_pnl:.2f}")
+        avg_weekly_pnl = cumulative_pnl / len(self.pnl_history) if self.pnl_history else 0.0
+        print(f"Average Weekly P&L: ${avg_weekly_pnl:.2f}")
+
+        # Long and Short P&L
+        avg_long_pnl = np.mean(long_pnls) if long_pnls else 0.0
+        avg_short_pnl = np.mean(short_pnls) if short_pnls else 0.0
+        print(f"Average Weekly Long P&L: ${avg_long_pnl:.2f}")
+        print(f"Average Weekly Short P&L: ${avg_short_pnl:.2f}")
+        total_long_pnl = sum(long_pnls) if long_pnls else 0.0
+        total_short_pnl = sum(short_pnls) if short_pnls else 0.0
+        print(f"Total Long P&L: ${total_long_pnl:.2f}")
+        print(f"Total Short P&L: ${total_short_pnl:.2f}")
+
+        # Transaction Costs and Turnover
+        total_transaction_costs = sum(pnl[1] for pnl in self.pnl_history.values() if pnl[1] is not None)
+        print(f"Total Transaction Costs: ${total_transaction_costs:.2f}")
+        avg_turnover = np.mean([pnl[1] / self.transaction_cost_rate for pnl in self.pnl_history.values()
+                                if pnl[1] is not None and self.transaction_cost_rate != 0])
+        print(f"Average Weekly Turnover: ${avg_turnover:.2f}")
+
+        # Exposure Metrics
+        avg_long_exposure = np.mean([pnl[2] for pnl in self.pnl_history.values() if pnl[2] is not None])
+        avg_short_exposure = np.mean([pnl[3] for pnl in self.pnl_history.values() if pnl[3] is not None])
+        print(f"Average Long Exposure: ${avg_long_exposure:.2f}")
+        print(f"Average Short Exposure: ${avg_short_exposure:.2f}")
+
+        # Optimization Method Counts
+        print(f"\nOptimization Method Usage:")
+        print(f" Linear Programming (linprog) Success: {self.optimization_counts.get('linprog_success', 0)} times")
+        print(f" Least Squares Fallback: {self.optimization_counts.get('least_squares_fallback', 0)} times")
+
+        # Performance Ratios
+        sharpe_ratio, annualized_return, annualized_std = self.compute_sharpe_ratio() or (None, None, None)
+        print(f"\nAnnualized Return: {annualized_return * 100:.2f}%")
+        print(f"Annualized Volatility: {annualized_std * 100:.2f}%")
+        print(
+            f"Annualized Sharpe Ratio: {sharpe_ratio:.4f}" if sharpe_ratio is not None else "Annualized Sharpe Ratio: N/A")
+
+        sortino_ratio = self.compute_sortino_ratio()
+        print(
+            f"Annualized Sortino Ratio: {sortino_ratio:.4f}" if sortino_ratio is not None else "Annualized Sortino Ratio: N/A")
+
+        max_drawdown = self.compute_max_drawdown()
+        print(f"Maximum Drawdown: {max_drawdown * 100:.2f}%" if max_drawdown is not None else "Maximum Drawdown: N/A")
+
+        calmar_ratio = annualized_return / max_drawdown if max_drawdown and max_drawdown > 0 else None
+        print(f"Calmar Ratio: {calmar_ratio:.4f}" if calmar_ratio is not None else "Calmar Ratio: N/A")
+
+        # Win Rate and Profit Factor
+        pnl_values = [pnl[0] for pnl in self.pnl_history.values() if pnl[0] is not None]
+        win_rate = len([p for p in pnl_values if p > 0]) / len(pnl_values) * 100 if pnl_values else 0.0
+        print(f"Win Rate: {win_rate:.2f}%")
+
+        profit_factor = self.compute_profit_factor()
+        print(f"Profit Factor: {profit_factor:.4f}" if profit_factor is not None else "Profit Factor: N/A")
+
+        # Sector Exposure Analysis
+        print("\nAverage Sector Exposure ($):")
+        sector_exposures = {sector: [] for sector in set(self.sectors.values())}
+        for date in self.weights:
+            weights = self.weights[date]
+            for sector in sector_exposures:
+                sector_mask = np.array([1 if self.sectors[stock] == sector else 0 for stock in self.stocks])
+                exposure = np.abs(np.sum(weights * sector_mask))
+                sector_exposures[sector].append(exposure)
+        for sector, exposures in sector_exposures.items():
+            avg_exposure = np.mean(exposures) if exposures else 0.0
+            print(f" {sector}: ${avg_exposure:.2f}")
+
+        # Stock Contribution Analysis
+        print("\nAverage Stock P&L Contribution ($):")
+        stock_pnls = {stock: [] for stock in self.stocks}
+        for date in self.rebalance_dates[:-1]:
+            actual_returns = self.rebalance_data.get(date, {}).get('actual_returns')
+            weights = self.weights.get(date)
+            if actual_returns is not None and weights is not None:
+                for i, stock in enumerate(self.stocks):
+                    if i < len(actual_returns) and i < len(weights):
+                        stock_pnls[stock].append(weights[i] * actual_returns[i])
+        for stock, pnls in stock_pnls.items():
+            avg_pnl = np.mean(pnls) if pnls else 0.0
+            print(f" {stock}: ${avg_pnl:.2f}")
+
         print("\nSummary of Factor Data:")
         print(f"Total Factors: {len(self.factors)}")
         print(f"Date Range: {self.factor_data.index[0].date()} to {self.factor_data.index[-1].date()}")
@@ -1386,18 +1583,8 @@ class PCAFactorStrategy:
                 if factor_name in self.factor_data.columns:
                     mean_return = self.factor_data[factor_name].mean()
                     std_return = self.factor_data[factor_name].std()
-                    print(f" {factor_name}: Mean Weekly Return = {mean_return:.6f}, Std = {std_return:.6f}")
-        print("\nPortfolio Performance Metrics:")
-        sharpe = self.compute_sharpe_ratio()
-        print(f"Annualized Sharpe Ratio: {sharpe:.4f}" if sharpe is not None else "Sharpe Ratio: N/A")
-        cumulative_pnl = sum(pnl[0] for pnl in self.pnl_history.values() if pnl[0] is not None)
-        print(f"Cumulative P&L: ${cumulative_pnl:.2f}")
-        total_turnover = sum(pnl[1] for pnl in self.pnl_history.values() if pnl[1] is not None)
-        print(f"Total Transaction Costs: ${total_turnover:.2f}")
-        avg_long_exposure = np.mean([pnl[2] for pnl in self.pnl_history.values() if pnl[2] is not None])
-        avg_short_exposure = np.mean([pnl[3] for pnl in self.pnl_history.values() if pnl[3] is not None])
-        print(f"Average Long Exposure: ${avg_long_exposure:.2f}")
-        print(f"Average Short Exposure: ${avg_short_exposure:.2f}")
+                    print(f"  {factor_name}: Mean Weekly Return = {mean_return:.6f}, Std = {std_return:.6f}")
+
         print("\nRebalancing Dates (Showing first/last 5):")
         display_dates = self.rebalance_dates[:5].append(self.rebalance_dates[-5:]) if len(
             self.rebalance_dates) > 10 else self.rebalance_dates
@@ -1406,6 +1593,7 @@ class PCAFactorStrategy:
             days_between = (self.rebalance_dates[next_date_idx] - date).days if next_date_idx < len(
                 self.rebalance_dates) else None
             print(f" {i}. {date.date()} (Days to next: {days_between if days_between else 'N/A'})")
+
         print(
             "\nActual Weekly Stock Returns, Explained Variance, Portfolio Metrics, and Regression R² (First/Last 5 Dates):")
         for date in display_dates:
@@ -1414,11 +1602,11 @@ class PCAFactorStrategy:
             if data['actual_returns'] is not None:
                 print(" Actual Returns:")
                 for stock, ret in zip(self.stocks, data['actual_returns']):
-                    print(f" {stock}: {ret:.6f}")
+                    print(f"  {stock}: {ret:.6f}")
             if data['explained_variance'] is not None:
                 print(" Explained Variance Ratios:")
                 for i, var in enumerate(data['explained_variance'], 1):
-                    print(f" PC{i}: {var:.4f} ({var * 100:.2f}%)")
+                    print(f"  PC{i}: {var:.4f} ({var * 100:.2f}%)")
             if date in self.pnl_history:
                 net_pnl, transaction_costs, long_exposure, short_exposure = self.pnl_history[date]
                 print(" Portfolio Metrics:")
@@ -1442,7 +1630,7 @@ class PCAFactorStrategy:
                     test_error = regression[pc_idx]['test_error']
                     test_r2 = self.compute_rolling_r2(pc_idx, date, window=10, use_future=False)
                     print(
-                        f" PC{pc_idx + 1}: Train R² = {train_r2:.4f}, Test Error = {test_error if test_error is not None else 'N/A'}, Rolling Test R² = {test_r2 if test_r2 is not None else 'N/A'}")
+                        f"  PC{pc_idx + 1}: Train R² = {train_r2:.4f}, Test Error = {test_error if test_error is not None else 'N/A'}, Rolling Test R² = {test_r2 if test_r2 is not None else 'N/A'}")
             else:
                 print(" No regression data available")
             self.debug_scaling(date)
@@ -1451,7 +1639,7 @@ class PCAFactorStrategy:
 if __name__ == "__main__":
     strategy = PCAFactorStrategy(
         start_date='2021-07-01',
-        end_date='2022-08-22',
+        end_date='2023-08-22',
         rebalance_frequency='W-FRI',
         lookback=252,
         min_trading_days=100,
