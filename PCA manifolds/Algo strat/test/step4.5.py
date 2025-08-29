@@ -102,6 +102,7 @@ class PCAFactorStrategy:
             **self.sector_rotation_factors,
             **self.volatility_factors
         }
+        self.sector_r2_history = {}  # Store sector R² values for each rebalance date
         self.stock_data = None
         self.factor_data = None
         self.rotation_data = None
@@ -143,7 +144,6 @@ class PCAFactorStrategy:
         #     'HOOD': 'Financials',  # Trading platform
         #     'SNAP': 'Communication Services'  # Social media
         # }
-
     def download_data(self):
         """Download stock and factor data, compute weekly factor returns, and set rebalance dates."""
         nominal_start = pd.to_datetime(self.start_date)
@@ -153,10 +153,10 @@ class PCAFactorStrategy:
                                                                 pd.MultiIndex) else raw_stock_data
         self.stock_data = self.stock_data.dropna(axis=0, how='any')
         raw_factor_data = yf.download(self.factors, start=earliest_data_start, end=self.end_date, auto_adjust=True)
-        factor_data_daily = raw_factor_data['Close'] if isinstance(raw_factor_data.columns,
-                                                                   pd.MultiIndex) else raw_factor_data
-        factor_data_daily = factor_data_daily.dropna(axis=1, how='all').dropna(axis=0, how='any')
-        self.factor_data = factor_data_daily.resample(self.rebalance_frequency).last()
+        self.factor_data_daily = raw_factor_data['Close'] if isinstance(raw_factor_data.columns,
+                                                                       pd.MultiIndex) else raw_factor_data
+        self.factor_data_daily = self.factor_data_daily.dropna(axis=1, how='all').dropna(axis=0, how='any')
+        self.factor_data = self.factor_data_daily.resample(self.rebalance_frequency).last()
         self.factor_data = self.compute_returns(self.factor_data)
         all_factor_tickers = list(set(sum(self.all_factor_categories.values(), ())))
         raw_rotation_data = yf.download(all_factor_tickers, start=earliest_data_start, end=self.end_date,
@@ -183,6 +183,7 @@ class PCAFactorStrategy:
         print(f"Factor data shape: {self.factor_data.shape}, Total factors: {len(self.factors)}")
         print(f"Rebalance dates: {len(self.rebalance_dates)}")
         print(f"Successfully added factor categories: {len(self.all_factor_categories)}")
+
     def compute_returns(self, prices):
         """Compute simple (percent) returns from prices."""
         prices_clean = prices.where(prices > 0)
@@ -224,7 +225,7 @@ class PCAFactorStrategy:
         return all_factors
 
     def compute_pca_for_rebalance(self, rebalance_date):
-        """Compute PCA loadings matrix for a rebalance date, retaining stock return scales."""
+        """Compute PCA loadings matrix for a rebalance date, retaining stock return scales, and calculate percentage of sector movement explained by each PC."""
         if rebalance_date not in self.stock_data.index:
             print(f"Warning: Rebalance date {rebalance_date.date()} not in stock data")
             return None, None, None
@@ -257,8 +258,120 @@ class PCAFactorStrategy:
         for i in range(loadings.shape[1]):
             if np.sum(loadings[:, i]) < 0:
                 loadings[:, i] = -loadings[:, i]
+        # Compute sector returns and their variance
+        sector_prices = self.factor_data_daily[self.sector_proxy].loc[prices.index]
+        sector_returns = self.compute_returns(sector_prices)
+        if sector_returns.empty:
+            print(f"Warning: No valid sector returns for {rebalance_date.date()}")
+        else:
+            common_dates = returns.index.intersection(sector_returns.index)
+            if len(common_dates) >= self.min_trading_days:
+                sector_returns = sector_returns.loc[common_dates].values.flatten()  # Ensure 1D array
+                returns_standardized = returns_standardized.loc[common_dates].values  # Convert to NumPy array
+                # Compute PC scores
+                pc_scores = returns_standardized @ pca.components_.T  # Ensure NumPy array
+                if not isinstance(pc_scores, np.ndarray):
+                    print(f"Warning: pc_scores is not a NumPy array at {rebalance_date.date()}")
+                    pc_scores = np.array(pc_scores)
+                # Regress sector returns on PC scores to get R²
+                sector_r2 = []
+                for pc_idx in range(min(self.num_pcs, len(pca.components_))):
+                    pc_scores_pc = pc_scores[:, pc_idx].reshape(-1, 1)  # Ensure 2D array for sklearn
+                    if len(pc_scores_pc) != len(sector_returns):
+                        print(f"Warning: Mismatch in data length for PC{pc_idx + 1} at {rebalance_date.date()}")
+                        sector_r2.append(0.0)
+                        continue
+                    try:
+                        model = LinearRegression().fit(pc_scores_pc, sector_returns)
+                        r2 = r2_score(sector_returns, model.predict(pc_scores_pc))
+                        sector_r2.append(r2 * 100)  # Convert to percentage
+                    except Exception as e:
+                        print(f"Warning: Regression failed for PC{pc_idx + 1} at {rebalance_date.date()}: {e}")
+                        sector_r2.append(0.0)
+                # Print percentage of sector movement explained by each PC
+                print(
+                    f"\nPercentage of sector ({self.sector_proxy}) movement explained by each PC for {rebalance_date.date()}:")
+                for pc_idx, r2 in enumerate(sector_r2):
+                    print(f"  PC{pc_idx + 1}: {r2:.2f}%")
+            else:
+                print(f"Warning: Insufficient common dates for sector R² calculation at {rebalance_date.date()}")
         return loadings, explained_variance, stock_std
 
+    def compute_pca_for_rebalance(self, rebalance_date):
+        """Compute PCA loadings matrix for a rebalance date, retaining stock return scales, and calculate percentage of sector movement explained by each PC."""
+        if rebalance_date not in self.stock_data.index:
+            print(f"Warning: Rebalance date {rebalance_date.date()} not in stock data")
+            return None, None, None
+        end_idx = self.stock_data.index.get_loc(rebalance_date)
+        start_idx = max(0, end_idx - self.lookback + 1)
+        if end_idx - start_idx + 1 < self.min_trading_days:
+            print(
+                f"Warning: Insufficient data for {rebalance_date.date()} ({end_idx - start_idx + 1} days < {self.min_trading_days})")
+            return None, None, None
+        prices = self.stock_data.iloc[start_idx:end_idx + 1]
+        returns = self.compute_returns(prices)
+        if len(returns) < self.min_trading_days:
+            print(f"Warning: Insufficient valid returns for {rebalance_date.date()} ({len(returns)} days)")
+            return None, None, None
+        # Compute mean and std for rescaling
+        returns_mean = returns.mean()
+        returns_std = returns.std()
+        returns_std = returns_std.where(returns_std > 0, 1e-10)  # Avoid division by zero
+        returns_standardized = (returns - returns_mean) / returns_std
+        returns_standardized = returns_standardized.dropna(axis=1, how='any')
+        cov_matrix = returns_standardized.T @ returns_standardized / (len(returns_standardized) - 1)
+        pca = PCA(n_components=min(self.num_pcs, len(self.stocks)))
+        pca.fit(returns_standardized)
+        loadings = pca.components_.T
+        explained_variance = pca.explained_variance_ratio_
+        # Rescale loadings back to original return space
+        num_stocks = min(len(self.stocks), loadings.shape[0])
+        stock_std = returns_std.values[:num_stocks]
+        loadings = loadings / stock_std[:, np.newaxis]
+        for i in range(loadings.shape[1]):
+            if np.sum(loadings[:, i]) < 0:
+                loadings[:, i] = -loadings[:, i]
+        # Compute sector returns and their variance
+        sector_prices = self.factor_data_daily[self.sector_proxy].loc[prices.index]
+        sector_returns = self.compute_returns(sector_prices)
+        if sector_returns.empty:
+            print(f"Warning: No valid sector returns for {rebalance_date.date()}")
+        else:
+            common_dates = returns.index.intersection(sector_returns.index)
+            if len(common_dates) >= self.min_trading_days:
+                sector_returns = sector_returns.loc[common_dates].values.flatten()  # Ensure 1D array
+                returns_standardized = returns_standardized.loc[common_dates].values  # Convert to NumPy array
+                # Compute PC scores
+                pc_scores = returns_standardized @ pca.components_.T  # Ensure NumPy array
+                if not isinstance(pc_scores, np.ndarray):
+                    print(f"Warning: pc_scores is not a NumPy array at {rebalance_date.date()}")
+                    pc_scores = np.array(pc_scores)
+                # Regress sector returns on PC scores to get R²
+                sector_r2 = []
+                for pc_idx in range(min(self.num_pcs, len(pca.components_))):
+                    pc_scores_pc = pc_scores[:, pc_idx].reshape(-1, 1)  # Ensure 2D array for sklearn
+                    if len(pc_scores_pc) != len(sector_returns):
+                        print(f"Warning: Mismatch in data length for PC{pc_idx + 1} at {rebalance_date.date()}")
+                        sector_r2.append(0.0)
+                        continue
+                    try:
+                        model = LinearRegression().fit(pc_scores_pc, sector_returns)
+                        r2 = r2_score(sector_returns, model.predict(pc_scores_pc))
+                        sector_r2.append(r2 * 100)  # Convert to percentage
+                    except Exception as e:
+                        print(f"Warning: Regression failed for PC{pc_idx + 1} at {rebalance_date.date()}: {e}")
+                        sector_r2.append(0.0)
+                # Store sector R² values
+                self.sector_r2_history[rebalance_date] = sector_r2
+                # Print percentage of sector movement explained by each PC
+                print(
+                    f"\nPercentage of sector ({self.sector_proxy}) movement explained by each PC for {rebalance_date.date()}:")
+                for pc_idx, r2 in enumerate(sector_r2):
+                    print(f"  PC{pc_idx + 1}: {r2:.2f}%")
+            else:
+                print(f"Warning: Insufficient common dates for sector R² calculation at {rebalance_date.date()}")
+                self.sector_r2_history[rebalance_date] = [0.0] * self.num_pcs  # Store zeros if calculation fails
+        return loadings, explained_variance, stock_std
     def compute_centrality_for_rebalance(self, rebalance_date):
         """Compute centrality vector for a rebalance date."""
         if rebalance_date not in self.stock_data.index:
@@ -697,11 +810,12 @@ class PCAFactorStrategy:
         centrality_vector = centrality_vector / centrality_vector.mean()
         r_hat_weighted = r_hat * centrality_vector
         return r_hat_weighted
+
     def plot_pred_vs_actual_scatter(self):
         """Scatter plot: predicted vs actual weekly returns for each stock and rebalance date."""
         predicted_data = {}
         actual_data = {}
-        for rebalance_date in self.rebalance_dates[:-1]: # Skip last if no actuals
+        for rebalance_date in self.rebalance_dates[:-1]:  # Skip last if no actuals
             r_hat_weighted = self.compute_weighted_predicted_returns(rebalance_date)
             actual_returns = self.rebalance_data.get(rebalance_date, {}).get('actual_returns')
             if r_hat_weighted is not None and actual_returns is not None:
@@ -712,11 +826,27 @@ class PCAFactorStrategy:
             return
         fig, ax = plt.subplots(figsize=(10, 8))
         colors = plt.cm.rainbow(np.linspace(0, 1, len(self.stocks)))
+        all_preds = []
+        all_acts = []
         for stock_idx, stock in enumerate(self.stocks):
             preds = [predicted_data[date][stock_idx] for date in predicted_data if
                      len(predicted_data[date]) > stock_idx]
             acts = [actual_data[date][stock_idx] for date in actual_data if len(actual_data[date]) > stock_idx]
             ax.scatter(preds, acts, color=colors[stock_idx], label=stock, alpha=0.6)
+            all_preds.extend(preds)
+            all_acts.extend(acts)
+        # Compute and plot line of best fit
+        if all_preds and all_acts:
+            model = LinearRegression()
+            X = np.array(all_preds).reshape(-1, 1)
+            y = np.array(all_acts)
+            model.fit(X, y)
+            slope = model.coef_[0]
+            intercept = model.intercept_
+            x_range = np.linspace(min(all_preds), max(all_preds), 100)
+            ax.plot(x_range, model.predict(x_range.reshape(-1, 1)), color='black', linestyle='--',
+                    label='Best Fit Line')
+            print(f"Slope of the line of best fit: {slope:.4f}")
         ax.set_xlabel('Weekly Predicted Returns (%)')
         ax.set_ylabel('Weekly Actual Returns (%)')
         ax.set_title('Scatter: Predicted vs Actual Stock Returns Across Rebalance Dates (Percent)')
@@ -725,11 +855,6 @@ class PCAFactorStrategy:
         plt.tight_layout()
         plt.show()
         # Compute and output average R² for the prediction vs actual
-        all_preds = []
-        all_acts = []
-        for date in predicted_data:
-            all_preds.extend(predicted_data[date])
-            all_acts.extend(actual_data[date])
         if all_preds:
             overall_r2 = r2_score(all_acts, all_preds)
             print(f"Overall R² between predicted and actual stock returns: {overall_r2:.4f}")
@@ -779,6 +904,256 @@ class PCAFactorStrategy:
         ax.tick_params(axis='x', rotation=45)
         plt.tight_layout()
         plt.show()
+    def compute_betas(self, rebalance_date):
+        """Compute stock betas relative to the sector proxy using the lookback period."""
+        if rebalance_date not in self.stock_data.index:
+            print(f"Warning: Rebalance date {rebalance_date.date()} not in stock data")
+            return None
+        end_idx = self.stock_data.index.get_loc(rebalance_date)
+        start_idx = max(0, end_idx - self.lookback + 1)
+        if end_idx - start_idx + 1 < self.min_trading_days:
+            print(f"Warning: Insufficient data for betas at {rebalance_date.date()}")
+            return None
+        prices = self.stock_data.iloc[start_idx:end_idx + 1]
+        returns = self.compute_returns(prices)
+        if len(returns) < self.min_trading_days:
+            print(f"Warning: Insufficient valid returns for betas at {rebalance_date.date()}")
+            return None
+        sector_prices = self.factor_data_daily[self.sector_proxy].loc[prices.index]
+        sector_returns = self.compute_returns(sector_prices)
+        common_dates = returns.index.intersection(sector_returns.index)
+        if len(common_dates) < self.min_trading_days:
+            print(f"Warning: Insufficient common dates for betas at {rebalance_date.date()}")
+            return None
+        returns = returns.loc[common_dates]
+        sector_returns = sector_returns.loc[common_dates].values.reshape(-1, 1)
+        betas = []
+        for stock in self.stocks:
+            stock_returns = returns[stock].values
+            model = LinearRegression().fit(sector_returns, stock_returns)
+            betas.append(model.coef_[0])
+        return np.array(betas)
+
+    def optimize_portfolio(self, r_hat_weighted, C_total, betas):
+        """Optimize portfolio weights to maximize expected return subject to market neutral constraints."""
+        if r_hat_weighted is None or betas is None:
+            return np.zeros(len(self.stocks)), False
+        n = len(self.stocks)
+        pos_idx = np.where(r_hat_weighted >= 0)[0]
+        neg_idx = np.where(r_hat_weighted < 0)[0]
+        n_pos = len(pos_idx)
+        n_neg = len(neg_idx)
+        if n_pos == 0 or n_neg == 0:
+            print("Warning: Cannot form market neutral portfolio (one side empty)")
+            return np.zeros(n), False
+        num_vars = n_pos + n_neg
+        r_pos = r_hat_weighted[pos_idx]
+        r_neg = r_hat_weighted[neg_idx]
+        c = np.concatenate((-r_pos, r_neg))
+        A_eq_dollar = np.concatenate((np.ones(n_pos), -np.ones(n_neg)))[np.newaxis, :]
+        b_eq_dollar = np.array([0.0])
+        beta_pos = betas[pos_idx]
+        beta_neg = betas[neg_idx]
+        A_eq_beta = np.concatenate((beta_pos, -beta_neg))[np.newaxis, :]
+        b_eq_beta = np.array([0.0])
+        A_eq = np.vstack((A_eq_dollar, A_eq_beta))
+        b_eq = np.concatenate((b_eq_dollar, b_eq_beta))
+        A_ub = np.ones((1, num_vars))
+        b_ub = np.array([C_total])
+        bounds = [(0, None)] * num_vars
+        res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method='highs')
+        if res.success:
+            w = res.x
+            v = np.zeros(n)
+            v[pos_idx] = w[:n_pos]
+            v[neg_idx] = -w[n_pos:]
+            return v, True
+        else:
+            print(f"Optimization failed: {res.message}")
+            return np.zeros(n), False
+
+    def compute_transaction_cost(self, prev_v, new_v):
+        """Compute transaction cost based on turnover."""
+        turnover = np.sum(np.abs(new_v - prev_v))
+        cost = turnover * self.transaction_cost_rate
+        return cost
+
+    def compute_profitability_metrics(self):
+        """Compute and print profitability metrics."""
+        if not self.portfolio_values:
+            print("No portfolio data available")
+            return
+        dates = sorted(self.portfolio_values.keys())
+        values = np.array([self.portfolio_values[d] for d in dates])
+        weekly_returns = np.diff(values) / values[:-1]
+        if len(weekly_returns) == 0:
+            print("Insufficient data for metrics")
+            return
+        # Drawdown
+        peak = np.maximum.accumulate(values)
+        drawdown = (values - peak) / peak
+        max_drawdown = np.min(drawdown)
+        # Sharpe (annualized, assuming risk-free=0)
+        mean_ret = np.mean(weekly_returns)
+        std_ret = np.std(weekly_returns)
+        sharpe = mean_ret / std_ret * np.sqrt(52) if std_ret > 0 else 0
+        # Calmar
+        annual_ret = mean_ret * 52
+        calmar = annual_ret / -max_drawdown if max_drawdown < 0 else 0
+        # Percent profitable weeks
+        pct_profitable = np.mean(weekly_returns > 0) * 100
+        # Per-side metrics
+        long_pnls = []
+        short_pnls = []
+        long_amounts = []
+        short_amounts = []
+        long_returns = []
+        short_returns = []
+        for i in range(len(dates) - 1):
+            date = dates[i]
+            next_date = dates[i + 1]
+            v = self.weights.get(date, np.zeros(len(self.stocks)))
+            actual_returns = self.rebalance_data.get(date, {}).get('actual_returns')
+            if actual_returns is None:
+                continue
+            pnl = np.dot(v, actual_returns)
+            long_mask = v > 0
+            short_mask = v < 0
+            long_pnl = np.sum(v[long_mask] * actual_returns[long_mask])
+            short_pnl = np.sum(v[short_mask] * actual_returns[short_mask])
+            long_amt = np.sum(v[long_mask])
+            short_amt = np.sum(np.abs(v[short_mask]))
+            long_ret = long_pnl / long_amt if long_amt > 0 else 0
+            short_ret = short_pnl / short_amt if short_amt > 0 else 0
+            long_pnls.append(long_pnl)
+            short_pnls.append(short_pnl)
+            long_returns.append(long_ret)
+            short_returns.append(short_ret)
+        pct_prof_long = np.mean([p > 0 for p in long_returns if abs(p) > 1e-6]) * 100 if long_returns else 0
+        pct_prof_short = np.mean([p > 0 for p in short_returns if abs(p) > 1e-6]) * 100 if short_returns else 0
+        avg_weekly_ret = mean_ret * 100
+        avg_weekly_long_ret = np.mean(long_returns) * 100 if long_returns else 0
+        avg_weekly_short_ret = np.mean(short_returns) * 100 if short_returns else 0
+        total_profit = values[-1] - self.initial_capital
+        # Print
+        print(f"Max Drawdown: {max_drawdown * 100:.2f}%")
+        print(f"Sharpe Ratio (annualized): {sharpe:.2f}")
+        print(f"Calmar Ratio: {calmar:.2f}")
+        print(f"Percent Profitable Weeks: {pct_profitable:.2f}%")
+        print(f"Percent Profitable Long Weeks: {pct_prof_long:.2f}%")
+        print(f"Percent Profitable Short Weeks: {pct_prof_short:.2f}%")
+        print(f"Total Profit: ${total_profit:.2f}")
+        print(f"Average Weekly Returns: {avg_weekly_ret:.2f}%")
+        print(f"Average Weekly Long Returns: {avg_weekly_long_ret:.2f}%")
+        print(f"Average Weekly Short Returns: {avg_weekly_short_ret:.2f}%")
+        print(f"Optimization Failures: {self.num_opt_fails}")
+        # Other info
+        total_costs = sum([self.compute_transaction_cost(self.weights.get(dates[i], np.zeros(len(self.stocks))), self.weights.get(dates[i+1], np.zeros(len(self.stocks)))) for i in range(len(dates)-1)])
+        print(f"Total Transaction Costs: ${total_costs:.2f}")
+        avg_turnover = np.mean([np.sum(np.abs(self.weights.get(dates[i], np.zeros(len(self.stocks))) - self.weights.get(dates[i+1], np.zeros(len(self.stocks))))) / self.portfolio_values.get(dates[i], 1) for i in range(len(dates)-1)]) * 100
+        print(f"Average Weekly Turnover: {avg_turnover:.2f}%")
+
+    def plot_portfolio_value_over_time(self):
+        """Plot portfolio value over time starting at $10,000."""
+        if not self.portfolio_values:
+            print("No portfolio data available")
+            return
+        dates = sorted(self.portfolio_values.keys())
+        values = [self.portfolio_values[d] for d in dates]
+        plt.figure(figsize=(12, 6))
+        plt.plot(dates, values, marker='o')
+        plt.title('Portfolio Value Over Time')
+        plt.xlabel('Date')
+        plt.ylabel('Portfolio Value ($)')
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+
+    def plot_portfolio_composition_over_time(self):
+        """Plot portfolio composition over time with longs above y=0 and shorts below."""
+        if not self.weights:
+            print("No weights data available")
+            return
+        dates = sorted(self.weights.keys())
+        pos_values = {stock: [] for stock in self.stocks}
+        neg_values = {stock: [] for stock in self.stocks}
+        for d in dates:
+            v = self.weights[d]
+            for j, stock in enumerate(self.stocks):
+                if v[j] > 0:
+                    pos_values[stock].append(v[j])
+                    neg_values[stock].append(0)
+                elif v[j] < 0:
+                    pos_values[stock].append(0)
+                    neg_values[stock].append(v[j])
+                else:
+                    pos_values[stock].append(0)
+                    neg_values[stock].append(0)
+        colors = plt.cm.tab20(np.linspace(0, 1, len(self.stocks)))
+        fig, ax = plt.subplots(figsize=(12, 8))
+        ax.stackplot(dates, list(pos_values.values()), labels=self.stocks, colors=colors)
+        ax.stackplot(dates, list(neg_values.values()), colors=colors)
+        ax.axhline(0, color='black', linewidth=1)
+        ax.set_title('Portfolio Composition Over Time')
+        ax.set_xlabel('Date')
+        ax.set_ylabel('Dollar Allocation ($)')
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+
+    def plot_sector_r2_over_time(self):
+        """Plot the percentage of sector (XLF) movement explained by each PC over time."""
+        if not hasattr(self, 'sector_r2_history') or not self.sector_r2_history:
+            print("No sector R² data available for plotting")
+            return
+        dates = sorted(self.sector_r2_history.keys())
+        r2_data = {i: [] for i in range(self.num_pcs)}
+        for date in dates:
+            r2_values = self.sector_r2_history[date]
+            for pc_idx in range(self.num_pcs):
+                r2_value = r2_values[pc_idx] if pc_idx < len(r2_values) else 0.0
+                r2_data[pc_idx].append(r2_value)
+        colors = ['blue', 'red', 'green', 'orange', 'purple']
+        plt.figure(figsize=(12, 6))
+        for pc_idx in range(self.num_pcs):
+            valid_mask = ~np.isnan(r2_data[pc_idx])
+            if np.any(valid_mask):
+                plt.plot(np.array(dates)[valid_mask], np.array(r2_data[pc_idx])[valid_mask],
+                         label=f'PC{pc_idx + 1}', marker='o', markersize=3,
+                         color=colors[pc_idx % len(colors)], alpha=0.7)
+        plt.title(f"Percentage of Sector ({self.sector_proxy}) Movement Explained by Each PC Over Time")
+        plt.xlabel("Rebalance Date")
+        plt.ylabel("Percentage of Variance Explained (%)")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.xticks(rotation=45)
+        plt.ylim(0, 100)
+        plt.tight_layout()
+        plt.show()
+        # Output average R² over time for each PC
+        print("\nAverage Percentage of Sector Movement Explained Over Time:")
+        for pc_idx in range(self.num_pcs):
+            avg_r2 = np.nanmean(r2_data[pc_idx])
+            print(f"PC{pc_idx + 1}: {avg_r2:.2f}%")
+
+    def print_avg_sector_r2(self):
+        """Print the average percentage of sector (XLF) movement explained by each PC over time."""
+        if not hasattr(self, 'sector_r2_history') or not self.sector_r2_history:
+            print("No sector R² data available")
+            return
+        dates = sorted(self.sector_r2_history.keys())
+        r2_data = {i: [] for i in range(self.num_pcs)}
+        for date in dates:
+            r2_values = self.sector_r2_history[date]
+            for pc_idx in range(self.num_pcs):
+                r2_value = r2_values[pc_idx] if pc_idx < len(r2_values) else 0.0
+                r2_data[pc_idx].append(r2_value)
+        # Output average R² over time for each PC
+        print("\nAverage Percentage of Sector Movement Explained Over Time:")
+        for pc_idx in range(self.num_pcs):
+            avg_r2 = np.nanmean(r2_data[pc_idx])
+            print(f"PC{pc_idx + 1}: {avg_r2:.2f}%")
 
     def main(self):
         """Main function to run the PCA factor strategy."""
@@ -787,13 +1162,17 @@ class PCAFactorStrategy:
         self.download_data()
 
         # Process each rebalance date
-        for rebalance_date in self.rebalance_dates:
+        C_total = self.initial_capital
+        prev_v = np.zeros(len(self.stocks))
+        self.num_opt_fails = 0
+        for i, rebalance_date in enumerate(self.rebalance_dates):
             print(f"\nProcessing rebalance date: {rebalance_date.date()}")
 
             # Compute PCA and centrality
             pca_matrix, explained_variance, stock_std = self.compute_pca_for_rebalance(rebalance_date)
             centrality_vector = self.compute_centrality_for_rebalance(rebalance_date)
             actual_returns = self.compute_actual_returns_for_rebalance(rebalance_date)
+            betas = self.compute_betas(rebalance_date)
 
             # Store rebalance data
             self.rebalance_data[rebalance_date] = {
@@ -801,14 +1180,44 @@ class PCAFactorStrategy:
                 'centrality_vector': centrality_vector,
                 'actual_returns': actual_returns,
                 'explained_variance': explained_variance,
-                'stock_std': stock_std
+                'stock_std': stock_std,
+                'betas': betas
             }
+
+            # Apply PnL from previous period if applicable
+            if i > 0:
+                prev_date = self.rebalance_dates[i - 1]
+                actual_returns_prev = self.rebalance_data[prev_date].get('actual_returns')
+                if actual_returns_prev is not None:
+                    pnl = np.dot(prev_v, actual_returns_prev)
+                    self.pnl_history[rebalance_date] = pnl
+                    C_total += pnl
 
             # Train regression models
             self.regression_results[rebalance_date] = self.train_regression_models(rebalance_date)
 
             # Debug scaling
             self.debug_scaling(rebalance_date)
+
+            # Compute predicted returns and optimize portfolio
+            r_hat_weighted = self.compute_weighted_predicted_returns(rebalance_date)
+            if r_hat_weighted is not None and betas is not None:
+                v, success = self.optimize_portfolio(r_hat_weighted, C_total, betas)
+                if not success:
+                    self.num_opt_fails += 1
+                    v = prev_v  # Hold previous positions if optimization fails
+            else:
+                v = prev_v
+                self.num_opt_fails += 1
+
+            # Compute and apply transaction cost
+            cost = self.compute_transaction_cost(prev_v, v)
+            C_total -= cost
+
+            # Store portfolio data
+            self.portfolio_values[rebalance_date] = C_total
+            self.weights[rebalance_date] = v
+            prev_v = v
 
         # Compute actual future PC returns
         self.compute_actuals_future()
@@ -822,11 +1231,20 @@ class PCAFactorStrategy:
         self.plot_pred_vs_actual_scatter()
         self.plot_predicted_over_time()
         self.plot_actual_over_time()
+        self.plot_sector_r2_over_time()
+        self.print_avg_sector_r2()  # Replace with new function name
 
+        # Compute and print metrics
+        print("\nProfitability Metrics:")
+        self.compute_profitability_metrics()
+
+        # Plot portfolio graphs
+        self.plot_portfolio_value_over_time()
+        self.plot_portfolio_composition_over_time()
 if __name__ == "__main__":
     strategy = PCAFactorStrategy(
-        start_date='2021-07-01',
-        end_date='2023-08-22',
+        start_date='2019-01-01',
+        end_date='2025-08-22',
         rebalance_frequency='W-FRI',
         lookback=252,
         min_trading_days=100,
