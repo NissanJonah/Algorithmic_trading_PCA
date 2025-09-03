@@ -251,83 +251,8 @@ class PCAFactorStrategy:
         pca.fit(returns_standardized)
         loadings = pca.components_.T
         explained_variance = pca.explained_variance_ratio_
-        # Rescale loadings back to original return space
         num_stocks = min(len(self.stocks), loadings.shape[0])
         stock_std = returns_std.values[:num_stocks]
-        loadings = loadings / stock_std[:, np.newaxis]
-        for i in range(loadings.shape[1]):
-            if np.sum(loadings[:, i]) < 0:
-                loadings[:, i] = -loadings[:, i]
-        # Compute sector returns and their variance
-        sector_prices = self.factor_data_daily[self.sector_proxy].loc[prices.index]
-        sector_returns = self.compute_returns(sector_prices)
-        if sector_returns.empty:
-            print(f"Warning: No valid sector returns for {rebalance_date.date()}")
-        else:
-            common_dates = returns.index.intersection(sector_returns.index)
-            if len(common_dates) >= self.min_trading_days:
-                sector_returns = sector_returns.loc[common_dates].values.flatten()  # Ensure 1D array
-                returns_standardized = returns_standardized.loc[common_dates].values  # Convert to NumPy array
-                # Compute PC scores
-                pc_scores = returns_standardized @ pca.components_.T  # Ensure NumPy array
-                if not isinstance(pc_scores, np.ndarray):
-                    print(f"Warning: pc_scores is not a NumPy array at {rebalance_date.date()}")
-                    pc_scores = np.array(pc_scores)
-                # Regress sector returns on PC scores to get R²
-                sector_r2 = []
-                for pc_idx in range(min(self.num_pcs, len(pca.components_))):
-                    pc_scores_pc = pc_scores[:, pc_idx].reshape(-1, 1)  # Ensure 2D array for sklearn
-                    if len(pc_scores_pc) != len(sector_returns):
-                        print(f"Warning: Mismatch in data length for PC{pc_idx + 1} at {rebalance_date.date()}")
-                        sector_r2.append(0.0)
-                        continue
-                    try:
-                        model = LinearRegression().fit(pc_scores_pc, sector_returns)
-                        r2 = r2_score(sector_returns, model.predict(pc_scores_pc))
-                        sector_r2.append(r2 * 100)  # Convert to percentage
-                    except Exception as e:
-                        print(f"Warning: Regression failed for PC{pc_idx + 1} at {rebalance_date.date()}: {e}")
-                        sector_r2.append(0.0)
-                # Print percentage of sector movement explained by each PC
-                print(
-                    f"\nPercentage of sector ({self.sector_proxy}) movement explained by each PC for {rebalance_date.date()}:")
-                for pc_idx, r2 in enumerate(sector_r2):
-                    print(f"  PC{pc_idx + 1}: {r2:.2f}%")
-            else:
-                print(f"Warning: Insufficient common dates for sector R² calculation at {rebalance_date.date()}")
-        return loadings, explained_variance, stock_std
-
-    def compute_pca_for_rebalance(self, rebalance_date):
-        """Compute PCA loadings matrix for a rebalance date, retaining stock return scales, and calculate percentage of sector movement explained by each PC."""
-        if rebalance_date not in self.stock_data.index:
-            print(f"Warning: Rebalance date {rebalance_date.date()} not in stock data")
-            return None, None, None
-        end_idx = self.stock_data.index.get_loc(rebalance_date)
-        start_idx = max(0, end_idx - self.lookback + 1)
-        if end_idx - start_idx + 1 < self.min_trading_days:
-            print(
-                f"Warning: Insufficient data for {rebalance_date.date()} ({end_idx - start_idx + 1} days < {self.min_trading_days})")
-            return None, None, None
-        prices = self.stock_data.iloc[start_idx:end_idx + 1]
-        returns = self.compute_returns(prices)
-        if len(returns) < self.min_trading_days:
-            print(f"Warning: Insufficient valid returns for {rebalance_date.date()} ({len(returns)} days)")
-            return None, None, None
-        # Compute mean and std for rescaling
-        returns_mean = returns.mean()
-        returns_std = returns.std()
-        returns_std = returns_std.where(returns_std > 0, 1e-10)  # Avoid division by zero
-        returns_standardized = (returns - returns_mean) / returns_std
-        returns_standardized = returns_standardized.dropna(axis=1, how='any')
-        cov_matrix = returns_standardized.T @ returns_standardized / (len(returns_standardized) - 1)
-        pca = PCA(n_components=min(self.num_pcs, len(self.stocks)))
-        pca.fit(returns_standardized)
-        loadings = pca.components_.T
-        explained_variance = pca.explained_variance_ratio_
-        # Rescale loadings back to original return space
-        num_stocks = min(len(self.stocks), loadings.shape[0])
-        stock_std = returns_std.values[:num_stocks]
-        loadings = loadings / stock_std[:, np.newaxis]
         for i in range(loadings.shape[1]):
             if np.sum(loadings[:, i]) < 0:
                 loadings[:, i] = -loadings[:, i]
@@ -372,6 +297,7 @@ class PCAFactorStrategy:
                 print(f"Warning: Insufficient common dates for sector R² calculation at {rebalance_date.date()}")
                 self.sector_r2_history[rebalance_date] = [0.0] * self.num_pcs  # Store zeros if calculation fails
         return loadings, explained_variance, stock_std
+
     def compute_centrality_for_rebalance(self, rebalance_date):
         """Compute centrality vector for a rebalance date."""
         if rebalance_date not in self.stock_data.index:
@@ -784,15 +710,16 @@ class PCAFactorStrategy:
         pca_matrix = self.rebalance_data.get(rebalance_date, {}).get('pca_matrix')
         if pca_matrix is None:
             return None
-        # Ensure dimensions match
+        sigma = self.compute_pc_std(rebalance_date)
+        if sigma is None:
+            return None
         num_stocks = min(len(self.stocks), pca_matrix.shape[0])
         num_pcs = min(self.num_pcs, pca_matrix.shape[1])
         pca_matrix = pca_matrix[:num_stocks, :num_pcs]
         pred_pct_change_pc = pred_pct_change_pc[:num_pcs]
-        # Compute predicted stock returns
-        r_hat = pca_matrix @ pred_pct_change_pc
-        stock_std = self.rebalance_data.get(rebalance_date, {}).get('stock_std')
-        r_hat = stock_std[:num_stocks] * r_hat * stock_std[:num_stocks]
+        sigma = sigma[:num_pcs]
+        # Compute r_hat = V * (ΔPC_pred ⊙ σ_PC)
+        r_hat = pca_matrix @ (pred_pct_change_pc * sigma)
         return r_hat
     def compute_weighted_predicted_returns(self, rebalance_date):
         """Apply centrality weighting to predicted stock returns without compression."""

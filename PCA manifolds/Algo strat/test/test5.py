@@ -1,69 +1,21 @@
-import numpy as np
-import pandas as pd
-import yfinance as yf
-import datetime
-import pandas.tseries.offsets as offsets
-import json
-from sklearn.decomposition import PCA
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import r2_score
-import matplotlib.pyplot as plt
-from sklearn.linear_model import Ridge, ElasticNet, Lasso
-from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_squared_error
-import numpy as np
-from scipy.optimize import linprog
 import yfinance as yf
 import pandas as pd
-import matplotlib.pyplot as plt
-class PCAFactorStrategy:
+import numpy as np
+from datetime import datetime, timedelta
+import warnings
 
-    def __init__(self, start_date, end_date, rebalance_frequency='W-FRI', lookback=252,
-                 min_trading_days=100, num_pcs=5, centrality_std=0.13,
-                 regression_lookback=52, min_regression_weeks=42):
-        """
-        Initialize the PCAFactorStrategy with configurable parameters.
-        Parameters:
-        - start_date: Start date for data (str, e.g., '2022-01-01')
-        - end_date: End date for data (str, e.g., '2025-08-22')
-        - rebalance_frequency: Frequency for rebalancing (str, e.g., 'W-FRI')
-        - lookback: Number of trading days for PCA/centrality (int, default 252)
-        - min_trading_days: Minimum valid trading days for PCA/centrality (int, default 100)
-        - num_pcs: Number of principal components (int, default 5)
-        - centrality_std: Standard deviation for centrality vector (float, default 0.13)
-        - regression_lookback: Number of weeks for regression training (int, default 52)
-        - min_regression_weeks: Minimum weeks required for regression (int, default 42)
-        """
+warnings.filterwarnings('ignore')
+
+
+class DataManager:
+    def __init__(self):
+        # Stock universe - financial sector
         self.stocks = ['JPM', 'BAC', 'WFC', 'C', 'GS', 'MS', 'V', 'MA', 'AXP', 'PNC', 'TFC', 'USB', 'ALL', 'MET', 'PRU']
-        # self.stocks = [
-        #     'ROKU',  # Roku
-        #     'PTON',  # Peloton
-        #     'ZM',  # Zoom
-        #     'TDOC',  # Teladoc
-        #     'AFRM',  # Affirm
-        #     'RBLX',  # Roblox
-        #     'COIN',  # Coinbase
-        #     'CVNA',  # Carvana
-        #     'OPEN',  # Opendoor
-        #     'SHOP',  # Shopify
-        #     'UPST',  # Upstart
-        #     'DOCU',  # DocuSign
-        #     'DOCN',  # DigitalOcean
-        #     'HOOD',  # Robinhood
-        #     'SNAP'  # Snap
-        # ]
-        self.start_date = start_date
-        self.end_date = end_date
-        self.rebalance_frequency = rebalance_frequency
-        self.lookback = lookback
-        self.min_trading_days = min_trading_days
-        self.num_pcs = num_pcs
-        self.centrality_std = centrality_std
-        self.regression_lookback = regression_lookback
-        self.min_regression_weeks = min_regression_weeks
-        self.lags = 3  # Number of lags for multiple lookbacks (including lag 0)
+
+        # Base factors
         self.factors = ['XLF', 'VFH', 'IYF', 'KRE', '^GSPC', '^VIX', '^TNX', 'FAS', 'DIA', 'GLD']
+
+        # Factor pairs for spread calculations
         self.rotation_pairs = {
             "Growth vs Value": ("VUG", "VTV"),
             "Large vs Small Cap": ("SPY", "IWM"),
@@ -72,11 +24,13 @@ class PCAFactorStrategy:
             "Banking vs Financials": ("KBE", "XLF"),
             "Regional vs Banks": ("KRE", "KBE")
         }
+
         self.momentum_factors = {
             "High vs Low Beta": ("SPHB", "SPLV"),
             "Momentum vs Anti-momentum": ("MTUM", "VMOT"),
             "Quality vs Junk": ("QUAL", "SJNK")
         }
+
         self.macro_factors = {
             "Dollar Strength": ("UUP", "UDN"),
             "Inflation Expectation": ("SCHP", "VTEB"),
@@ -84,6 +38,7 @@ class PCAFactorStrategy:
             "Yield Curve": ("SHY", "TLT"),
             "Real vs Nominal": ("VTEB", "VGIT")
         }
+
         self.sector_rotation_factors = {
             "Cyclical vs Defensive": ("XLI", "XLP"),
             "Risk-on vs Risk-off": ("XLY", "XLRE"),
@@ -91,1811 +46,1848 @@ class PCAFactorStrategy:
             "Healthcare vs Tech": ("XLV", "XLK"),
             "Materials vs Staples": ("XLB", "XLP")
         }
+
         self.volatility_factors = {
             "Vol Surface": ("VXX", "SVXY"),
             "Equity vs Bond Vol": ("^VIX", "^MOVE")
         }
-        self.all_factor_categories = {
-            **self.rotation_pairs,
-            **self.momentum_factors,
-            **self.macro_factors,
-            **self.sector_rotation_factors,
-            **self.volatility_factors
-        }
-        self.stock_data = None
-        self.factor_data = None
-        self.rotation_data = None
-        self.rebalance_dates = None
-        self.rebalance_data = {}
-        self.regression_results = {}
-        self.predictions = {i: {} for i in range(num_pcs)}
-        self.actuals = {i: {} for i in range(num_pcs)}
-        self.actuals_future = {i: {} for i in range(num_pcs)}
-        # New attributes for portfolio optimization
-        self.initial_capital = 10000.0  # Initial capital in dollars
-        self.portfolio_values = {}  # Store portfolio value (C_total) at each rebalance
-        self.weights = {}  # Store portfolio weights (v_i) at each rebalance
-        self.pnl_history = {}  # Store P&L at each rebalance
-        self.transaction_cost_rate = 0.001  # 0.1% transaction cost per dollar traded
-        self.sector_proxy = 'XLF'  # Sector proxy for beta calculation
-        self.betas = None  # Will store stock betas
-        self.sectors = {
-            'JPM': 'Banking', 'BAC': 'Banking', 'WFC': 'Banking', 'C': 'Banking',
-            'GS': 'Investment Banking', 'MS': 'Investment Banking',
-            'V': 'Payments', 'MA': 'Payments', 'AXP': 'Payments',
-            'PNC': 'Regional Banking', 'TFC': 'Regional Banking', 'USB': 'Regional Banking',
-            'ALL': 'Insurance', 'MET': 'Insurance', 'PRU': 'Insurance'
-        }
-        # self.sectors = {
-        #     'ROKU': 'Communication Services',  # Streaming media
-        #     'PTON': 'Consumer Discretionary',  # Fitness equipment
-        #     'ZM': 'Technology',  # Video conferencing
-        #     'TDOC': 'Healthcare',  # Telehealth
-        #     'AFRM': 'Financials',  # Buy now, pay later
-        #     'RBLX': 'Technology',  # Gaming platform
-        #     'COIN': 'Financials',  # Cryptocurrency exchange
-        #     'CVNA': 'Consumer Discretionary',  # Online car sales
-        #     'OPEN': 'Real Estate',  # Real estate tech
-        #     'SHOP': 'Technology',  # E-commerce platform
-        #     'UPST': 'Financials',  # AI lending platform
-        #     'DOCU': 'Technology',  # E-signature software
-        #     'DOCN': 'Technology',  # Cloud infrastructure
-        #     'HOOD': 'Financials',  # Trading platform
-        #     'SNAP': 'Communication Services'  # Social media
-        # }
+
+        # Date parameters
+        self.start_date = '2020-01-01'
+        self.end_date = '2021-01-01'
+        self.lookback_weeks = 52
+
+        # Calculate earliest data start (need extra data for lookback)
+        start_dt = datetime.strptime(self.start_date, '%Y-%m-%d')
+        self.earliest_data_start = (start_dt - timedelta(weeks=self.lookback_weeks + 4)).strftime('%Y-%m-%d')
+
+        # Combine all tickers
+        self.all_tickers = self._get_all_tickers()
+
+        # Data storage
+        self.raw_data = None
+
+    def _get_all_tickers(self):
+        """Combine all tickers into a single list."""
+        tickers = set()
+
+        # Add stocks and base factors
+        tickers.update(self.stocks)
+        tickers.update(self.factors)
+
+        # Add all factor pair tickers
+        for pair_dict in [self.rotation_pairs, self.momentum_factors, self.macro_factors,
+                          self.sector_rotation_factors, self.volatility_factors]:
+            for name, (ticker1, ticker2) in pair_dict.items():
+                tickers.add(ticker1)
+                tickers.add(ticker2)
+
+        return sorted(list(tickers))
 
     def download_data(self):
-        """Download stock and factor data, compute weekly factor returns, and set rebalance dates."""
-        nominal_start = pd.to_datetime(self.start_date)
-        earliest_data_start = nominal_start - offsets.BDay(max(self.lookback + 15, self.regression_lookback * 5 + 10))
-        raw_stock_data = yf.download(self.stocks, start=earliest_data_start, end=self.end_date, auto_adjust=True)
-        self.stock_data = raw_stock_data['Close'] if isinstance(raw_stock_data.columns,
-                                                                pd.MultiIndex) else raw_stock_data
-        self.stock_data = self.stock_data.dropna(axis=0, how='any')
-        raw_factor_data = yf.download(self.factors, start=earliest_data_start, end=self.end_date, auto_adjust=True)
-        factor_data_daily = raw_factor_data['Close'] if isinstance(raw_factor_data.columns,
-                                                                   pd.MultiIndex) else raw_factor_data
-        factor_data_daily = factor_data_daily.dropna(axis=1, how='all').dropna(axis=0, how='any')
-        self.factor_data = factor_data_daily.resample(self.rebalance_frequency).last()
-        self.factor_data = self.compute_returns(self.factor_data)
-        all_factor_tickers = list(set(sum(self.all_factor_categories.values(), ())))
-        raw_rotation_data = yf.download(all_factor_tickers, start=earliest_data_start, end=self.end_date,
-                                        auto_adjust=True)
-        rotation_data_daily = raw_rotation_data['Close'] if isinstance(raw_rotation_data.columns,
-                                                                       pd.MultiIndex) else raw_rotation_data
-        rotation_data_daily = rotation_data_daily.dropna(axis=1, how='all').dropna(axis=0, how='any')
-        self.rotation_data = rotation_data_daily.resample(self.rebalance_frequency).last()
-        computed_factors = self.compute_all_factor_categories()
-        if not computed_factors.empty:
-            common_dates = self.factor_data.index.intersection(computed_factors.index)
-            self.factor_data = self.factor_data.loc[common_dates]
-            computed_factors = computed_factors.loc[common_dates]
-            self.factor_data = pd.concat([self.factor_data, computed_factors], axis=1)
-        if self.factor_data.empty or len(self.factor_data.columns) == 0:
-            raise ValueError("No valid factor data available")
-        self.factors = list(self.factor_data.columns)
-        all_dates = self.stock_data.index
-        rebalance_dates = self.stock_data.resample(self.rebalance_frequency).last().index
-        self.rebalance_dates = rebalance_dates[rebalance_dates.isin(all_dates)]
-        first_possible_rebalance = all_dates[all_dates >= (nominal_start + offsets.BDay(self.lookback))][0]
-        self.rebalance_dates = self.rebalance_dates[self.rebalance_dates >= first_possible_rebalance]
-        print(f"Stock data shape: {self.stock_data.shape}, Stocks: {len(self.stocks)}")
-        print(f"Factor data shape: {self.factor_data.shape}, Total factors: {len(self.factors)}")
-        print(f"Rebalance dates: {len(self.rebalance_dates)}")
-        print(f"Successfully added factor categories: {len(self.all_factor_categories)}")
-    def compute_returns(self, prices):
-        """Compute simple (percent) returns from prices."""
-        prices_clean = prices.where(prices > 0)
-        returns = prices_clean.pct_change().dropna()
-        returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
-        return returns
-    def compute_all_factor_categories(self):
-        """Compute factor categories as differences in weekly returns."""
-        if not hasattr(self, 'rotation_data') or self.rotation_data.empty:
-            print("Warning: No factor data available")
-            return pd.DataFrame()
-        all_factors = pd.DataFrame(index=self.rotation_data.index)
-        factor_returns = self.compute_returns(self.rotation_data)
-        successful_factors = []
-        failed_factors = []
-        for factor_name, (asset1, asset2) in self.all_factor_categories.items():
-            if asset1 in factor_returns.columns and asset2 in factor_returns.columns:
-                all_factors[factor_name] = factor_returns[asset1] - factor_returns[asset2]
-                successful_factors.append(factor_name)
-            else:
-                missing_assets = [asset for asset in [asset1, asset2] if asset not in factor_returns.columns]
-                failed_factors.append((factor_name, missing_assets))
-        all_factors = all_factors.dropna()
-        print(f"Successfully computed {len(successful_factors)} factors:")
-        for category, factors in [
-            ("Rotation", list(self.rotation_pairs.keys())),
-            ("Momentum", list(self.momentum_factors.keys())),
-            ("Macro", list(self.macro_factors.keys())),
-            ("Sector Rotation", list(self.sector_rotation_factors.keys())),
-            ("Volatility", list(self.volatility_factors.keys()))
-        ]:
-            successful_in_category = [f for f in factors if f in successful_factors]
-            if successful_in_category:
-                print(f" {category}: {successful_in_category}")
-        if failed_factors:
-            print(f"\nFailed to compute {len(failed_factors)} factors (missing data):")
-            for factor_name, missing in failed_factors:
-                print(f" {factor_name}: Missing {missing}")
-        return all_factors
+        """Download all price data from Yahoo Finance."""
+        print(f"Downloading data for {len(self.all_tickers)} tickers...")
+        print(f"Date range: {self.earliest_data_start} to {self.end_date}")
 
-    def compute_pca_for_rebalance(self, rebalance_date):
-        """Compute PCA loadings matrix for a rebalance date, retaining stock return scales."""
-        if rebalance_date not in self.stock_data.index:
-            print(f"Warning: Rebalance date {rebalance_date.date()} not in stock data")
-            return None, None, None
-        end_idx = self.stock_data.index.get_loc(rebalance_date)
-        start_idx = max(0, end_idx - self.lookback + 1)
-        if end_idx - start_idx + 1 < self.min_trading_days:
-            print(
-                f"Warning: Insufficient data for {rebalance_date.date()} ({end_idx - start_idx + 1} days < {self.min_trading_days})")
-            return None, None, None
-        prices = self.stock_data.iloc[start_idx:end_idx + 1]
-        returns = self.compute_returns(prices)
-        if len(returns) < self.min_trading_days:
-            print(f"Warning: Insufficient valid returns for {rebalance_date.date()} ({len(returns)} days)")
-            return None, None, None
-        # Compute mean and std for rescaling
-        returns_mean = returns.mean()
-        returns_std = returns.std()
-        returns_std = returns_std.where(returns_std > 0, 1e-10)  # Avoid division by zero
-        returns_standardized = (returns - returns_mean) / returns_std
-        returns_standardized = returns_standardized.dropna(axis=1, how='any')
-        cov_matrix = returns_standardized.T @ returns_standardized / (len(returns_standardized) - 1)
-        pca = PCA(n_components=min(self.num_pcs, len(self.stocks)))
-        pca.fit(returns_standardized)
-        loadings = pca.components_.T
-        explained_variance = pca.explained_variance_ratio_
-        # Rescale loadings back to original return space
-        num_stocks = min(len(self.stocks), loadings.shape[0])
-        stock_std = returns_std.values[:num_stocks]
-        loadings = loadings / stock_std[:, np.newaxis]
-        for i in range(loadings.shape[1]):
-            if np.sum(loadings[:, i]) < 0:
-                loadings[:, i] = -loadings[:, i]
-        return loadings, explained_variance, stock_std
-
-    def compute_centrality_for_rebalance(self, rebalance_date):
-        """Compute centrality vector for a rebalance date."""
-        if rebalance_date not in self.stock_data.index:
-            print(f"Warning: Rebalance date {rebalance_date.date()} not in stock data")
-            return None
-        end_idx = self.stock_data.index.get_loc(rebalance_date)
-        start_idx = max(0, end_idx - self.lookback + 1)
-        if end_idx - start_idx + 1 < self.min_trading_days:
-            print(f"Warning: Insufficient data for centrality at {rebalance_date.date()}")
-            return None
-        prices = self.stock_data.iloc[start_idx:end_idx + 1]
-        returns = self.compute_returns(prices)
-        if len(returns) < self.min_trading_days:
-            print(f"Warning: Insufficient valid returns for centrality at {rebalance_date.date()}")
-            return None
-        corr_matrix = returns.corr()
-        eigenvalues, eigenvectors = np.linalg.eigh(corr_matrix)
-        max_eigen_idx = np.argmax(eigenvalues)
-        centrality_vector = eigenvectors[:, max_eigen_idx]
-        centrality_vector = centrality_vector / centrality_vector.std() * self.centrality_std
-        centrality_vector = centrality_vector - centrality_vector.mean() + 1.0
-        return centrality_vector
-
-    def compute_actual_returns_for_rebalance(self, rebalance_date):
-        """Compute actual weekly stock returns for a rebalance date."""
-        if rebalance_date not in self.stock_data.index:
-            print(f"Warning: Rebalance date {rebalance_date.date()} not in stock data")
-            return None
-        rebalance_idx = self.rebalance_dates.get_loc(rebalance_date)
-        if rebalance_idx + 1 >= len(self.rebalance_dates):
-            print(f"Warning: No next rebalance date for {rebalance_date.date()}")
-            return None
-        next_rebalance_date = self.rebalance_dates[rebalance_idx + 1]
-        if next_rebalance_date not in self.stock_data.index:
-            next_dates = self.stock_data.index[self.stock_data.index > rebalance_date]
-            if len(next_dates) == 0:
-                print(f"Warning: No valid next date for {rebalance_date.date()}")
-                return None
-            next_rebalance_date = next_dates[0]
         try:
-            start_price = self.stock_data.loc[rebalance_date]
-            end_price = self.stock_data.loc[next_rebalance_date]
-            returns = (end_price / start_price) - 1
-            returns = returns.replace([np.inf, -np.inf], np.nan)
-            if returns.isna().any():
-                print(f"Warning: Missing returns for {rebalance_date.date()} to {next_rebalance_date.date()}")
-                return None
-            # Sanity check: ensure returns are reasonable (e.g., within -50% to +50% weekly)
-            if np.any(np.abs(returns) > 0.5):
-                print(f"Warning: Unrealistic returns detected for {rebalance_date.date()}: {returns}")
-                return None
-            return returns.values
-        except KeyError as e:
-            print(f"Warning: Missing price data for {rebalance_date.date()} or {next_rebalance_date.date()}: {e}")
-            return None
-    def compute_actuals_future(self):
-        """Compute actual PC returns using the PCA matrix from the next rebalance date."""
-        for i in range(len(self.rebalance_dates) - 1):
-            date = self.rebalance_dates[i]
-            next_date = self.rebalance_dates[i + 1]
-            data = self.rebalance_data.get(date, {})
-            actual_returns = data.get('actual_returns')
-            if actual_returns is None:
-                continue
-            next_data = self.rebalance_data.get(next_date, {})
-            pca_matrix = next_data.get('pca_matrix')
-            if pca_matrix is None:
-                continue
-            actual_returns = np.array(actual_returns)
-            num_stocks = min(len(actual_returns), pca_matrix.shape[0])
-            actual_returns = actual_returns[:num_stocks]
-            pca_matrix = pca_matrix[:num_stocks, :]
-            for pc_idx in range(self.num_pcs):
-                pc_return = np.dot(actual_returns, pca_matrix[:, pc_idx])
-                self.actuals_future[pc_idx][next_date] = pc_return
-    def compute_rolling_r2(self, pc_idx, rebalance_date, window=10, use_future=False):
-        """Compute rolling R^2 for predictions up to (but not including) rebalance_date."""
-        actuals_dict = self.actuals_future if use_future else self.actuals
-        valid_dates = [d for d in self.predictions[pc_idx].keys() if d < rebalance_date]
-        if len(valid_dates) < 2:
-            return None
-        valid_dates = sorted(valid_dates)[-window:] if len(valid_dates) >= window else sorted(valid_dates)
-        if len(valid_dates) < 2:
-            return None
-        preds = [self.predictions[pc_idx][d] for d in valid_dates]
-        actuals = [actuals_dict[pc_idx][d] for d in valid_dates]
-        if np.var(actuals) < 1e-10:
-            return None
-        try:
-            r2 = r2_score(actuals, preds)
-            return max(r2, -10.0)
-        except:
-            return None
-    def plot_r2_scores(self):
-        """Create two plots: Rolling Test R^2 using same PCA and using next PCA."""
-        test_r2_data = {i: [] for i in range(self.num_pcs)}
-        test_r2_future_data = {i: [] for i in range(self.num_pcs)}
-        dates = []
-        for rebalance_date in self.rebalance_dates:
-            dates.append(rebalance_date)
-            for pc_idx in range(self.num_pcs):
-                test_r2 = self.compute_rolling_r2(pc_idx, rebalance_date, window=10, use_future=False)
-                test_r2_data[pc_idx].append(test_r2 if test_r2 is not None else np.nan)
-                test_r2_future = self.compute_rolling_r2(pc_idx, rebalance_date, window=10, use_future=True)
-                test_r2_future_data[pc_idx].append(test_r2_future if test_r2_future is not None else np.nan)
-        colors = ['blue', 'red', 'green', 'orange', 'purple']
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
-        # First plot: Rolling Test R² (Same PCA)
-        for pc_idx in range(self.num_pcs):
-            valid_mask = ~np.isnan(test_r2_data[pc_idx])
-            if np.any(valid_mask):
-                ax1.plot(np.array(dates)[valid_mask], np.array(test_r2_data[pc_idx])[valid_mask],
-                         label=f'PC{pc_idx + 1}', marker='o', markersize=3,
-                         color=colors[pc_idx % len(colors)], alpha=0.7)
-        ax1.set_title("Rolling Test R² Over Time (Same PCA)", fontsize=14)
-        ax1.set_ylabel("R² Score", fontsize=12)
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
-        ax1.tick_params(axis='x', rotation=45)
-        ax1.set_ylim(-2, 1)
-        # Second plot: Rolling Test R² (Next PCA)
-        for pc_idx in range(self.num_pcs):
-            valid_mask = ~np.isnan(test_r2_future_data[pc_idx])
-            if np.any(valid_mask):
-                ax2.plot(np.array(dates)[valid_mask], np.array(test_r2_future_data[pc_idx])[valid_mask],
-                         label=f'PC{pc_idx + 1}', marker='o', markersize=3,
-                         color=colors[pc_idx % len(colors)], alpha=0.7)
-        ax2.set_title("Rolling Test R² Over Time (Next PCA)", fontsize=14)
-        ax2.set_xlabel("Rebalance Date", fontsize=12)
-        ax2.set_ylabel("R² Score", fontsize=12)
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
-        ax2.tick_params(axis='x', rotation=45)
-        ax2.set_ylim(-2, 1)
-        plt.tight_layout()
-        plt.show()
-        # Output average R² over time for both plots
-        print("Average Rolling R² over time (Same PCA):")
-        for pc_idx in range(self.num_pcs):
-            avg_r2 = np.nanmean(test_r2_data[pc_idx])
-            print(f"PC{pc_idx+1}: {avg_r2:.4f}")
-        print("Average Rolling R² over time (Next PCA):")
-        for pc_idx in range(self.num_pcs):
-            avg_r2 = np.nanmean(test_r2_future_data[pc_idx])
-            print(f"PC{pc_idx+1}: {avg_r2:.4f}")
-    def compute_weekly_pc_returns(self, rebalance_date):
-        """Compute weekly PC returns for the lookback period and the next week."""
-        if rebalance_date not in self.stock_data.index:
-            print(f"Warning: Rebalance date {rebalance_date.date()} not in stock data")
-            return None, None
-        weekly_prices = self.stock_data.resample(self.rebalance_frequency).last()
-        weekly_dates = weekly_prices.index[weekly_prices.index <= rebalance_date]
-        start_idx = max(0, len(weekly_dates) - self.regression_lookback)
-        if len(weekly_dates[start_idx:]) < self.min_regression_weeks:
-            print(
-                f"Warning: Insufficient weekly data for {rebalance_date.date()} ({len(weekly_dates[start_idx:])} weeks)")
-            return None, None
-        weekly_stock_returns = self.compute_returns(weekly_prices.iloc[start_idx:])
-        pca_matrix = self.rebalance_data.get(rebalance_date, {}).get('pca_matrix')
-        if pca_matrix is None:
-            print(f"Warning: No PCA matrix for {rebalance_date.date()}")
-            return None, None
-        # Ensure dimensions match
-        num_stocks = min(weekly_stock_returns.shape[1], pca_matrix.shape[0])
-        num_pcs = min(self.num_pcs, pca_matrix.shape[1])
-        pc_returns = weekly_stock_returns.iloc[:, :num_stocks] @ pca_matrix[:num_stocks, :num_pcs]
-        actual_returns = self.rebalance_data.get(rebalance_date, {}).get('actual_returns')
-        next_pc_returns = None
-        if actual_returns is not None:
-            # Ensure dimensions match for actual returns too
-            actual_returns_array = np.array(actual_returns)[:num_stocks]
-            next_pc_returns = np.dot(actual_returns_array, pca_matrix[:num_stocks, :num_pcs])
-        return pc_returns, next_pc_returns
-    def train_regression_models(self, rebalance_date):
-        """Train Lasso to select factors, then Linear Regression for predictions."""
-        pc_returns, next_pc_returns = self.compute_weekly_pc_returns(rebalance_date)
-        if pc_returns is None:
-            print(f"Warning: Cannot train regression for {rebalance_date.date()} (insufficient data)")
-            return None
-        factor_returns = self.factor_data.loc[self.factor_data.index <= rebalance_date]
-        factor_returns = factor_returns.iloc[-self.regression_lookback:]
-        common_dates = pc_returns.index.intersection(factor_returns.index)
-        if len(common_dates) < self.min_regression_weeks:
-            print(f"Warning: Insufficient common dates for {rebalance_date.date()} ({len(common_dates)} weeks)")
-            return None
-        X = factor_returns.loc[common_dates]
-        X = X.dropna(axis=0, how='any')
-        if len(X) < self.min_regression_weeks:
-            print(f"Warning: Insufficient data for {rebalance_date.date()} ({len(X)} weeks)")
-            return None
-        common_dates = X.index
-        X_values = X.values
-        pc_returns = pc_returns.loc[common_dates]
-        # Get next rebalance date for predictions
-        rebalance_idx = self.rebalance_dates.get_loc(rebalance_date)
-        next_rebalance_date = self.rebalance_dates[rebalance_idx + 1] if rebalance_idx + 1 < len(
-            self.rebalance_dates) else None
-        X_next = None
-        next_factor_returns = self.factor_data.loc[self.factor_data.index > rebalance_date]
-        if not next_factor_returns.empty and next_rebalance_date is not None:
-            X_next = next_factor_returns.iloc[0:1].values
-        results = {}
-        n_splits = min(5, len(common_dates) // 10)
-        if n_splits < 2:
-            n_splits = 2
-        tscv = TimeSeriesSplit(n_splits=n_splits)
-        for pc_idx in range(self.num_pcs):
-            y = pc_returns.values[:, pc_idx]
-            # Standardize features and target
-            scaler_X = StandardScaler()
-            X_scaled = scaler_X.fit_transform(X_values)
-            scaler_y = StandardScaler()
-            y_scaled = scaler_y.fit_transform(y.reshape(-1, 1)).flatten()
-            # Step 1: Lasso for feature selection
-            param_grid = {'alpha': np.logspace(-4, -1, 6)}
-            lasso = GridSearchCV(
-                estimator=Lasso(fit_intercept=True, max_iter=5000, tol=1e-5),
-                param_grid=param_grid,
-                cv=tscv,
-                scoring='neg_mean_squared_error',
-                n_jobs=1
-            )
-            lasso.fit(X_scaled, y_scaled)
-            selected_features = lasso.best_estimator_.coef_ != 0
-            selected_indices = np.where(selected_features)[0]
-            if len(selected_indices) == 0:
-                print(
-                    f"Warning: No features selected for PC{pc_idx + 1} at {rebalance_date.date()}, using all features")
-                selected_indices = np.arange(X_scaled.shape[1])
-            # Step 2: Linear Regression on selected features
-            X_selected = X_scaled[:, selected_indices]
-            model = LinearRegression(fit_intercept=True)
-            model.fit(X_selected, y_scaled)
-            train_r2 = r2_score(y_scaled, model.predict(X_selected))
-            # Compute CV R² and MSE
-            cv_r2_scores = []
-            cv_mse_scores = []
-            for train_idx, val_idx in tscv.split(X_selected):
-                X_train, X_val = X_selected[train_idx], X_selected[val_idx]
-                y_train, y_val = y_scaled[train_idx], y_scaled[val_idx]
-                temp_model = LinearRegression(fit_intercept=True)
-                temp_model.fit(X_train, y_train)
-                val_pred = temp_model.predict(X_val)
-                val_r2 = r2_score(y_val, val_pred)
-                cv_r2_scores.append(val_r2)
-                val_mse = mean_squared_error(y_val, val_pred)
-                cv_mse_scores.append(val_mse)
-            cv_r2_mean = np.mean(cv_r2_scores)
-            cv_r2_std = np.std(cv_r2_scores)
-            cv_score = -np.mean(cv_mse_scores)
-            # Prediction and actual
-            pred_value = None
-            actual_value = None
-            test_error = None
-            if X_next is not None:
-                X_next_scaled = scaler_X.transform(X_next)
-                X_next_selected = X_next_scaled[:, selected_indices]
-                pred_scaled = model.predict(X_next_selected)[0]
-                # Rescale prediction to original PC return scale
-                pred_value = scaler_y.inverse_transform([[pred_scaled]])[0][0]
-                actual_value = next_pc_returns[pc_idx] if next_pc_returns is not None else None
-                if actual_value is not None:
-                    epsilon = 1e-10
-                    test_error = abs(pred_value - actual_value) / (abs(actual_value) + epsilon)
-                    # Store predictions and actuals
-                    if next_rebalance_date not in self.predictions[pc_idx]:
-                        self.predictions[pc_idx][next_rebalance_date] = pred_value
-                        self.actuals[pc_idx][next_rebalance_date] = actual_value
-            # Coefficients (only for selected features)
-            coef_dict = {}
-            feature_idx = 0
-            for col_idx, col in enumerate(self.factor_data.columns):
-                if col_idx in selected_indices:
-                    coef_dict[f'{col}_lag0'] = model.coef_[feature_idx]
-                    feature_idx += 1
-                else:
-                    coef_dict[f'{col}_lag0'] = 0.0
-            results[pc_idx] = {
-                'model': model,
-                'scaler_X': scaler_X,
-                'scaler_y': scaler_y,
-                'selected_features': selected_indices,
-                'train_r2': train_r2,
-                'cv_r2_mean': cv_r2_mean,
-                'cv_r2_std': cv_r2_std,
-                'test_error': test_error,
-                'prediction': pred_value,
-                'actual': actual_value,
-                'model_type': 'Linear (Lasso-selected features)',
-                'cv_score': cv_score,
-                'coefficients': coef_dict
-            }
-        return results
-    def save_rebalance_data(self):
-        """Save rebalance_data to a JSON file, including regression coefficients."""
-        serializable_data = {}
-        for date, data in self.rebalance_data.items():
-            date_str = date.strftime('%Y-%m-%d')
-            serializable_data[date_str] = {
-                'pca_matrix': data['pca_matrix'].tolist() if data['pca_matrix'] is not None else None,
-                'centrality_vector': data['centrality_vector'].tolist() if data[
-                                                                               'centrality_vector'] is not None else None,
-                'actual_returns': data['actual_returns'].tolist() if data['actual_returns'] is not None else None,
-                'explained_variance': data['explained_variance'].tolist() if data[
-                                                                                 'explained_variance'] is not None else None,
-                'regression_coefficients': {
-                    str(pc_idx): self.regression_results.get(date, {}).get(pc_idx, {}).get('coefficients', {})
-                    for pc_idx in range(self.num_pcs)
-                }
-            }
-        with open('rebalance_data.json', 'w') as f:
-            json.dump(serializable_data, f, indent=2)
-        print("Saved rebalance data to rebalance_data.json")
-    def debug_scaling(self, rebalance_date):
-        """Debug function to print ranges of key variables for scaling analysis."""
-        print(f"\nDebugging scaling for {rebalance_date.date()}:")
-        # Factor returns scale
-        factor_returns = self.factor_data.loc[self.factor_data.index <= rebalance_date]
-        factor_returns = factor_returns.iloc[-self.regression_lookback:]
-        if not factor_returns.empty:
-            print(
-                f" Factor returns range (min, max): {factor_returns.min().min():.4f}, {factor_returns.max().max():.4f}")
-        # PC returns and sigma
-        pc_returns, next_pc_returns = self.compute_weekly_pc_returns(rebalance_date)
-        if pc_returns is not None:
-            print(f" PC returns range (min, max): {pc_returns.min().min():.4f}, {pc_returns.max().max():.4f}")
-        sigma = self.compute_pc_std(rebalance_date)
-        if sigma is not None:
-            print(f" Sigma: {sigma}")
-        # Predicted PC movements
-        pred_pct_change_pc = self.compute_predicted_pc_movement(rebalance_date)
-        if pred_pct_change_pc is not None:
-            print(f" Predicted PC movements range: {pred_pct_change_pc.min():.4f}, {pred_pct_change_pc.max():.4f}")
-        # Predicted stock returns
-        r_hat = self.compute_predicted_stock_returns(rebalance_date)
-        if r_hat is not None:
-            print(f" Predicted stock returns (r_hat) range: {r_hat.min():.4f}, {r_hat.max():.4f}")
-        # Weighted predicted returns
-        r_hat_weighted = self.compute_weighted_predicted_returns(rebalance_date)
-        if r_hat_weighted is not None:
-            print(f" Weighted predicted returns range: {r_hat_weighted.min():.4f}, {r_hat_weighted.max():.4f}")
-        # Actual stock returns
-        actual_returns = self.rebalance_data.get(rebalance_date, {}).get('actual_returns')
-        if actual_returns is not None:
-            print(f" Actual stock returns range: {actual_returns.min():.4f}, {actual_returns.max():.4f}")
-        # Centrality vector
-        centrality_vector = self.rebalance_data.get(rebalance_date, {}).get('centrality_vector')
-        if centrality_vector is not None:
-            print(f" Centrality vector range: {centrality_vector.min():.4f}, {centrality_vector.max():.4f}")
-
-    def compute_pc_std(self, rebalance_date):
-        """Compute scaling factor based on PC-specific standard deviations."""
-        weekly_prices = self.stock_data.resample(self.rebalance_frequency).last()
-        weekly_dates = weekly_prices.index[weekly_prices.index <= rebalance_date]
-        start_idx = max(0, len(weekly_dates) - self.regression_lookback)
-        if len(weekly_dates[start_idx:]) < self.min_regression_weeks:
-            print(
-                f"Warning: Insufficient weekly data for {rebalance_date.date()} ({len(weekly_dates[start_idx:])} weeks)")
-            return None
-        weekly_stock_returns = self.compute_returns(weekly_prices.iloc[start_idx:])
-        pca_matrix = self.rebalance_data.get(rebalance_date, {}).get('pca_matrix')
-        if pca_matrix is None:
-            print(f"Warning: No PCA matrix for {rebalance_date.date()}")
-            return None
-        # Ensure dimensions match
-        num_stocks = min(weekly_stock_returns.shape[1], pca_matrix.shape[0])
-        weekly_stock_returns = weekly_stock_returns.iloc[:, :num_stocks]
-        pca_matrix = pca_matrix[:num_stocks, :self.num_pcs]
-        # Compute PC returns
-        pc_returns = weekly_stock_returns @ pca_matrix
-        # Compute standard deviation for each PC
-        sigma = pc_returns.std(ddof=1).values
-        sigma = np.where(sigma == 0, 1e-10, sigma)  # Avoid division by zero
-        return sigma
-
-    def compute_predicted_pc_movement(self, rebalance_date):
-        """Compute predicted PC movements."""
-        results = self.regression_results.get(rebalance_date)
-        if not results:
-            return None
-        sigma = self.compute_pc_std(rebalance_date)
-        if sigma is None:
-            return None
-        pred_pct_change_pc = np.zeros(self.num_pcs)
-        for pc_idx in range(self.num_pcs):
-            pred_value = results[pc_idx].get('prediction')
-            if pred_value is not None:
-                pred_pct_change_pc[pc_idx] = pred_value
-        return pred_pct_change_pc
-
-    def compute_predicted_stock_returns(self, rebalance_date):
-        """Compute predicted stock returns using loadings and predicted PC movements."""
-        pred_pct_change_pc = self.compute_predicted_pc_movement(rebalance_date)
-        if pred_pct_change_pc is None:
-            return None
-        pca_matrix = self.rebalance_data.get(rebalance_date, {}).get('pca_matrix')
-        if pca_matrix is None:
-            return None
-        # Ensure dimensions match
-        num_stocks = min(len(self.stocks), pca_matrix.shape[0])
-        num_pcs = min(self.num_pcs, pca_matrix.shape[1])
-        pca_matrix = pca_matrix[:num_stocks, :num_pcs]
-        pred_pct_change_pc = pred_pct_change_pc[:num_pcs]
-        # Compute predicted stock returns
-        r_hat = pca_matrix @ pred_pct_change_pc
-        stock_std = self.rebalance_data.get(rebalance_date, {}).get('stock_std')
-        r_hat = stock_std[:num_stocks] * r_hat * stock_std[:num_stocks]
-        return r_hat
-    def compute_weighted_predicted_returns(self, rebalance_date):
-        """Apply centrality weighting to predicted stock returns without compression."""
-        r_hat = self.compute_predicted_stock_returns(rebalance_date)
-        if r_hat is None:
-            return None
-        centrality_vector = self.rebalance_data.get(rebalance_date, {}).get('centrality_vector')
-        if centrality_vector is None:
-            return None
-        # Ensure dimensions match
-        num_stocks = min(len(r_hat), len(centrality_vector))
-        r_hat = r_hat[:num_stocks]
-        centrality_vector = centrality_vector[:num_stocks]
-        # Normalize centrality vector to mean=1.0
-        centrality_vector = centrality_vector / centrality_vector.mean()
-        r_hat_weighted = r_hat * centrality_vector
-        return r_hat_weighted
-    def plot_pred_vs_actual_scatter(self):
-        """Scatter plot: predicted vs actual weekly returns for each stock and rebalance date."""
-        predicted_data = {}
-        actual_data = {}
-        for rebalance_date in self.rebalance_dates[:-1]: # Skip last if no actuals
-            r_hat_weighted = self.compute_weighted_predicted_returns(rebalance_date)
-            actual_returns = self.rebalance_data.get(rebalance_date, {}).get('actual_returns')
-            if r_hat_weighted is not None and actual_returns is not None:
-                predicted_data[rebalance_date] = r_hat_weighted * 100  # To percent
-                actual_data[rebalance_date] = actual_returns * 100  # To percent
-        if not predicted_data:
-            print("No data available for scatter plot")
-            return
-        fig, ax = plt.subplots(figsize=(10, 8))
-        colors = plt.cm.rainbow(np.linspace(0, 1, len(self.stocks)))
-        for stock_idx, stock in enumerate(self.stocks):
-            preds = [predicted_data[date][stock_idx] for date in predicted_data if
-                     len(predicted_data[date]) > stock_idx]
-            acts = [actual_data[date][stock_idx] for date in actual_data if len(actual_data[date]) > stock_idx]
-            ax.scatter(preds, acts, color=colors[stock_idx], label=stock, alpha=0.6)
-        ax.set_xlabel('Weekly Predicted Returns (%)')
-        ax.set_ylabel('Weekly Actual Returns (%)')
-        ax.set_title('Scatter: Predicted vs Actual Stock Returns Across Rebalance Dates (Percent)')
-        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-        ax.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.show()
-        # Compute and output average R² for the prediction vs actual
-        all_preds = []
-        all_acts = []
-        for date in predicted_data:
-            all_preds.extend(predicted_data[date])
-            all_acts.extend(actual_data[date])
-        if all_preds:
-            overall_r2 = r2_score(all_acts, all_preds)
-            print(f"Overall R² between predicted and actual stock returns: {overall_r2:.4f}")
-    def plot_predicted_over_time(self):
-        """Line plot: predicted stock movement over time for each stock."""
-        predicted_data = {}
-        for rebalance_date in self.rebalance_dates:
-            r_hat_weighted = self.compute_weighted_predicted_returns(rebalance_date)
-            if r_hat_weighted is not None:
-                predicted_data[rebalance_date] = r_hat_weighted * 100  # To percent
-        if not predicted_data:
-            print("No data available for predicted over time plot")
-            return
-        dates = sorted(predicted_data.keys())
-        fig, ax = plt.subplots(figsize=(12, 8))
-        for stock_idx, stock in enumerate(self.stocks):
-            preds = [predicted_data.get(date, np.full(len(self.stocks), np.nan))[stock_idx] for date in dates]
-            ax.plot(dates, preds, marker='o', label=stock, alpha=0.7)
-        ax.set_xlabel('Time (Rebalance Dates)')
-        ax.set_ylabel('Predicted Stock Movement (%)')
-        ax.set_title('Predicted Stock Movement Over Time')
-        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-        ax.grid(True, alpha=0.3)
-        ax.tick_params(axis='x', rotation=45)
-        plt.tight_layout()
-        plt.show()
-    def plot_actual_over_time(self):
-        """Line plot: actual stock movement over time for each stock."""
-        actual_data = {}
-        for rebalance_date in self.rebalance_dates[:-1]: # Skip last if no actuals
-            actual_returns = self.rebalance_data.get(rebalance_date, {}).get('actual_returns')
-            if actual_returns is not None:
-                actual_data[rebalance_date] = actual_returns * 100  # To percent
-        if not actual_data:
-            print("No data available for actual over time plot")
-            return
-        dates = sorted(actual_data.keys())
-        fig, ax = plt.subplots(figsize=(12, 8))
-        for stock_idx, stock in enumerate(self.stocks):
-            acts = [actual_data.get(date, np.full(len(self.stocks), np.nan))[stock_idx] for date in dates]
-            ax.plot(dates, acts, marker='o', label=stock, alpha=0.7)
-        ax.set_xlabel('Time (Rebalance Dates)')
-        ax.set_ylabel('Actual Stock Movement (%)')
-        ax.set_title('Actual Stock Movement Over Time')
-        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-        ax.grid(True, alpha=0.3)
-        ax.tick_params(axis='x', rotation=45)
-        plt.tight_layout()
-        plt.show()
-
-    def compute_betas(self, rebalance_date):
-        """Compute stock betas relative to sector proxy (XLF) over the lookback period."""
-        if rebalance_date not in self.stock_data.index:
-            print(f"Warning: Rebalance date {rebalance_date.date()} not in stock data")
-            return None
-
-        end_idx = self.stock_data.index.get_loc(rebalance_date)
-        start_idx = max(0, end_idx - self.lookback + 1)
-        if end_idx - start_idx + 1 < self.min_trading_days:
-            print(
-                f"Warning: Insufficient data for beta calculation at {rebalance_date.date()} ({end_idx - start_idx + 1} days)")
-            return None
-
-        # Fetch stock prices for the lookback period
-        prices = self.stock_data.iloc[start_idx:end_idx + 1]
-        if prices.empty:
-            print(f"Warning: Empty stock price data for {rebalance_date.date()}")
-            return None
-
-        # Fetch sector proxy (XLF) data for the same period
-        try:
-            sector_data = yf.download(
-                self.sector_proxy,
-                start=prices.index[0],
-                end=prices.index[-1] + pd.Timedelta(days=1),  # Ensure end date inclusivity
+            # Download all data at once
+            self.raw_data = yf.download(
+                self.all_tickers,
+                start=self.earliest_data_start,
+                end=self.end_date,
                 auto_adjust=True
-            )['Close']
-            # Ensure sector_data is a Series, not a DataFrame
-            if isinstance(sector_data, pd.DataFrame):
-                if sector_data.shape[1] == 1:
-                    sector_data = sector_data.iloc[:, 0]
-                else:
-                    print(
-                        f"Warning: Sector data for {self.sector_proxy} at {rebalance_date.date()} has unexpected shape {sector_data.shape}")
-                    return None
+            )
+
+            # If single ticker, yfinance returns different structure
+            if len(self.all_tickers) == 1:
+                self.raw_data = pd.DataFrame({self.all_tickers[0]: self.raw_data['Close']})
+            else:
+                # Use Close prices only
+                self.raw_data = self.raw_data['Close']
+
+            print(f"Successfully downloaded data for {len(self.raw_data.columns)} tickers")
+            print(f"Data shape: {self.raw_data.shape}")
+            print(f"Date range: {self.raw_data.index[0]} to {self.raw_data.index[-1]}")
+
         except Exception as e:
-            print(f"Warning: Failed to download sector proxy {self.sector_proxy} data at {rebalance_date.date()}: {e}")
-            return None
+            print(f"Error downloading data: {e}")
+            raise
 
-        if sector_data.empty or len(sector_data) < self.min_trading_days:
-            print(
-                f"Warning: Insufficient or empty sector data for {self.sector_proxy} at {rebalance_date.date()} (rows: {len(sector_data)})")
-            return None
+    def validate_data_integrity(self):
+        """Validate the downloaded data for completeness and quality."""
+        print("\n=== DATA VALIDATION RESULTS ===")
 
-        # Compute returns for stocks and sector
-        returns = self.compute_returns(prices)
-        sector_returns = self.compute_returns(sector_data)
+        # Check if data was downloaded
+        if self.raw_data is None:
+            raise ValueError("No data downloaded. Call download_data() first.")
 
-        # Align dates
-        common_dates = returns.index.intersection(sector_returns.index)
-        if len(common_dates) < self.min_trading_days:
-            print(
-                f"Warning: Insufficient common dates for beta calculation at {rebalance_date.date()} ({len(common_dates)} days)")
-            return None
+        validation_results = {
+            'total_tickers_requested': len(self.all_tickers),
+            'total_tickers_downloaded': len(self.raw_data.columns),
+            'missing_tickers': [],
+            'data_start_date': self.raw_data.index[0],
+            'data_end_date': self.raw_data.index[-1],
+            'total_trading_days': len(self.raw_data),
+            'missing_data_summary': {},
+            'extreme_values_detected': {},
+            'validation_passed': True,
+            'issues': []
+        }
 
-        returns = returns.loc[common_dates]
-        sector_returns = sector_returns.loc[common_dates]
+        # Check for missing tickers
+        downloaded_tickers = set(self.raw_data.columns)
+        requested_tickers = set(self.all_tickers)
+        missing_tickers = requested_tickers - downloaded_tickers
 
-        # Ensure sector_returns is a Series
-        if isinstance(sector_returns, pd.DataFrame):
-            if sector_returns.shape[1] == 1:
-                sector_returns = sector_returns.iloc[:, 0]
-            else:
-                print(f"Warning: sector_returns has unexpected shape {sector_returns.shape} at {rebalance_date.date()}")
-                return None
-
-        # Debugging: Print shapes to diagnose dimension issues
-        print(
-            f"Debug: returns shape = {returns.shape}, sector_returns shape = {sector_returns.shape} at {rebalance_date.date()}")
-
-        betas = []
-        for stock in self.stocks:
-            if stock in returns.columns:
-                try:
-                    stock_returns = returns[stock]
-                    if len(stock_returns) != len(sector_returns):
-                        print(
-                            f"Warning: Mismatch in return lengths for {stock} ({len(stock_returns)}) vs sector ({len(sector_returns)}) at {rebalance_date.date()}")
-                        betas.append(0.0)
-                        continue
-                    cov = stock_returns.cov(sector_returns)
-                    var = sector_returns.var()
-                    beta = cov / var if var > 0 else 0.0
-                    betas.append(beta)
-                except Exception as e:
-                    print(f"Warning: Error computing beta for {stock} at {rebalance_date.date()}: {e}")
-                    betas.append(0.0)
-            else:
-                print(f"Warning: Stock {stock} not in returns data at {rebalance_date.date()}")
-                betas.append(0.0)
-
-        return np.array(betas)
-
-    def optimize_portfolio(self, rebalance_date):
-        """Optimize portfolio weights using linear programming with specified constraints, ensuring market neutrality."""
-        r_hat_weighted = self.compute_weighted_predicted_returns(rebalance_date)
-        if r_hat_weighted is None:
-            print(f"Warning: No predicted returns for {rebalance_date.date()}")
-            return None
-        betas = self.compute_betas(rebalance_date)
-        if betas is None:
-            print(f"Warning: No betas for {rebalance_date.date()}")
-            return None
-        prev_date = self.rebalance_dates[self.rebalance_dates < rebalance_date][-1] if rebalance_date != \
-                                                                                       self.rebalance_dates[0] else None
-        C_total = self.portfolio_values.get(prev_date, self.initial_capital)
-        n = len(self.stocks)
-        # Decision variables: v_i (long and short positions handled by positive/negative values)
-        c = -r_hat_weighted  # Objective: maximize sum(v_i * r_hat_weighted_i)
-        # Constraints
-        A_eq = []
-        b_eq = []
-        A_ub = []
-        b_ub = []
-        bounds = []
-        # 1. Market neutrality: sum(v_i) = 0
-        A_eq.append(np.ones(n))
-        b_eq.append(0.0)
-        # 2. Long and short allocations
-        long_mask = r_hat_weighted >= 0
-        short_mask = r_hat_weighted < 0
-        # Sum of long positions = 0.65 * C_total
-        long_eq = np.zeros(n)
-        long_eq[long_mask] = 1.0
-        A_eq.append(long_eq)
-        b_eq.append(0.65 * C_total)
-        # Sum of abs(short positions) = 0.35 * C_total
-        short_eq = np.zeros(n)
-        short_eq[short_mask] = -1.0
-        A_eq.append(short_eq)
-        b_eq.append(0.35 * C_total)
-        # 3. Individual stock limits and short only negative returns
-        for i in range(n):
-            if r_hat_weighted[i] >= 0:
-                bounds.append((0, 0.15 * C_total))
-            else:
-                bounds.append((-0.12 * C_total, 0))
-        # 4. Short concentration limit: |v_i_short| <= 0.3 * total_short_allocation
-        total_short_allocation = 0.35 * C_total
-        for i in range(n):
-            if r_hat_weighted[i] < 0:
-                row = np.zeros(n)
-                row[i] = -1.0
-                A_ub.append(row)
-                b_ub.append(0.3 * total_short_allocation)
-        # 5. Beta exposure constraint: |v · β| <= 0.15
-        A_ub.append(betas)
-        A_ub.append(-betas)
-        b_ub.append(0.15 * C_total)
-        b_ub.append(0.15 * C_total)
-        # 6. Total allocation: sum(|v_i|) <= C_total
-        A_ub.append(np.ones(n))
-        A_ub.append(-np.ones(n))
-        b_ub.append(C_total)
-        b_ub.append(C_total)
-        # 7. Sector exposure: limit exposure to any sector to 40% of C_total
-        sector_limits = 0.4 * C_total
-        for sector in set(self.sectors.values()):
-            sector_mask = np.array([1 if self.sectors[stock] == sector else 0 for stock in self.stocks])
-            A_ub.append(sector_mask)
-            A_ub.append(-sector_mask)
-            b_ub.append(sector_limits)
-            b_ub.append(sector_limits)
-        # Convert to numpy arrays
-        A_eq = np.array(A_eq) if A_eq else None
-        b_eq = np.array(b_eq) if b_eq else None
-        A_ub = np.array(A_ub) if A_ub else None
-        b_ub = np.array(b_ub) if b_ub else None
-        # Track optimization method
-        if not hasattr(self, 'optimization_counts'):
-            self.optimization_counts = {'linprog_success': 0, 'least_squares_fallback': 0}
-        # Try linear programming
-        try:
-            res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method='highs')
-            if res.success:
-                weights = res.x
-                # Verify market neutrality
-                if abs(np.sum(weights)) > 1e-6:
-                    print(
-                        f"Warning: Linear programming solution not market neutral at {rebalance_date.date()}. Adjusting weights.")
-                    weights -= np.sum(weights) / n
-                self.optimization_counts['linprog_success'] += 1
-                print(f"Optimization Debug: Used linprog successfully for {rebalance_date.date()}")
-                return weights
-        except Exception as e:
-            print(f"Linear programming failed for {rebalance_date.date()}: {e}")
-        # Fallback to least squares optimization
-        print(f"Falling back to least squares optimization for {rebalance_date.date()}")
-        self.optimization_counts['least_squares_fallback'] += 1
-        weights = np.zeros(n)
-        long_indices = np.where(r_hat_weighted >= 0)[0]
-        short_indices = np.where(r_hat_weighted < 0)[0]
-        if len(long_indices) > 0:
-            long_weights = np.ones(len(long_indices)) * (0.65 * C_total / max(len(long_indices), 1))
-            weights[long_indices] = long_weights
-        if len(short_indices) > 0:
-            short_weights = -np.ones(len(short_indices)) * (0.35 * C_total / max(len(short_indices), 1))
-            weights[short_indices] = short_weights
-        # Ensure market neutrality
-        net_position = np.sum(weights)
-        if abs(net_position) > 1e-6:
-            adjustment = net_position / n
-            weights -= adjustment
-        # Verify short only negative returns
-        for i in range(n):
-            if r_hat_weighted[i] >= 0 and weights[i] < 0:
-                weights[i] = 0
-            elif r_hat_weighted[i] < 0 and weights[i] > 0:
-                weights[i] = 0
-        # Re-normalize to maintain long/short allocation constraints
-        long_sum = np.sum(weights[weights > 0])
-        short_sum = np.abs(np.sum(weights[weights < 0]))
-        if long_sum > 0:
-            weights[weights > 0] *= (0.65 * C_total) / long_sum
-        if short_sum > 0:
-            weights[weights < 0] *= (0.35 * C_total) / short_sum
-        # Final market neutrality adjustment
-        net_position = np.sum(weights)
-        if abs(net_position) > 1e-6:
-            weights -= net_position / n
-        return weights
-
-    def optimize_portfolio(self, rebalance_date):
-        """Optimize portfolio weights using linear programming to enforce full capital allocation."""
-        r_hat_weighted = self.compute_weighted_predicted_returns(rebalance_date)
-        if r_hat_weighted is None:
-            print(f"Warning: No predicted returns for {rebalance_date.date()}")
-            return None
-        betas = self.compute_betas(rebalance_date)
-        if betas is None:
-            print(f"Warning: No betas for {rebalance_date.date()}")
-            return None
-        prev_date = self.rebalance_dates[self.rebalance_dates < rebalance_date][-1] if rebalance_date != \
-                                                                                       self.rebalance_dates[0] else None
-        C_total = self.portfolio_values.get(prev_date, self.initial_capital)
-        n = len(self.stocks)
-        # Decision variables: v_i^+ and v_i^- (positive and negative components), total 2n variables
-        # v_i = v_i^+ - v_i^-, where v_i^+ >= 0, v_i^- >= 0
-        # Objective: maximize sum((v_i^+ - v_i^-) * r_hat_weighted_i)
-        c = np.concatenate([-r_hat_weighted, r_hat_weighted])  # -r_hat for v_i^+, +r_hat for v_i^-
-        # Constraints
-        A_eq = []
-        b_eq = []
-        A_ub = []
-        b_ub = []
-        bounds = [(0, None)] * (2 * n)  # v_i^+, v_i^- >= 0
-        # 1. Market neutrality: sum(v_i^+ - v_i^-) = 0
-        market_neutral = np.concatenate([np.ones(n), -np.ones(n)])
-        A_eq.append(market_neutral)
-        b_eq.append(0.0)
-        # 2. Full capital allocation: sum(v_i^+ + v_i^-) = C_total
-        capital_allocation = np.ones(2 * n)
-        A_eq.append(capital_allocation)
-        b_eq.append(C_total)
-        # 3. Short only negative returns: v_i^+ = 0 if r_hat < 0, v_i^- = 0 if r_hat >= 0
-        for i in range(n):
-            if r_hat_weighted[i] < 0:
-                bounds[i] = (0, 0)  # v_i^+ = 0 for short positions
-            else:
-                bounds[i + n] = (0, 0)  # v_i^- = 0 for long positions
-        # 4. Beta exposure constraint: |sum((v_i^+ - v_i^-) * beta_i)| <= 0.15 * C_total
-        beta_vec = np.concatenate([betas, -betas])
-        A_ub.append(beta_vec)
-        A_ub.append(-beta_vec)
-        b_ub.append(0.15 * C_total)
-        b_ub.append(0.15 * C_total)
-        # 5. Individual stock limits: |v_i^+ - v_i^-| <= 0.15 * C_total
-        for i in range(n):
-            # v_i^+ - v_i^- <= 0.15 * C_total
-            row = np.zeros(2 * n)
-            row[i] = 1
-            row[i + n] = -1
-            A_ub.append(row)
-            b_ub.append(0.15 * C_total)
-            # -(v_i^+ - v_i^-) <= 0.15 * C_total
-            A_ub.append(-row)
-            b_ub.append(0.15 * C_total)
-        # Convert to numpy arrays
-        A_eq = np.array(A_eq)
-        b_eq = np.array(b_eq)
-        A_ub = np.array(A_ub)
-        b_ub = np.array(b_ub)
-        # Track optimization method
-        if not hasattr(self, 'optimization_counts'):
-            self.optimization_counts = {'linprog_success': 0, 'least_squares_fallback': 0}
-        # Try linear programming
-        try:
-            res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method='highs')
-            if res.success:
-                x = res.x
-                weights = x[:n] - x[n:]  # v_i = v_i^+ - v_i^-
-                # Verify market neutrality and full allocation
-                if abs(np.sum(weights)) > 1e-6:
-                    print(f"Warning: Solution not market neutral at {rebalance_date.date()}. Adjusting weights.")
-                    weights -= np.sum(weights) / n
-                if abs(np.sum(np.abs(weights)) - C_total) > 1e-6:
-                    print(f"Warning: Solution does not fully allocate capital at {rebalance_date.date()}. Normalizing.")
-                    scale_factor = C_total / np.sum(np.abs(weights)) if np.sum(np.abs(weights)) > 0 else 1.0
-                    weights *= scale_factor
-                self.optimization_counts['linprog_success'] += 1
-                print(f"Optimization Debug: Used linprog successfully for {rebalance_date.date()}")
-                return weights
-        except Exception as e:
-            print(f"Linear programming failed for {rebalance_date.date()}: {e}")
-        # Fallback to simple allocation
-        print(f"Falling back to simplified allocation for {rebalance_date.date()}")
-        self.optimization_counts['least_squares_fallback'] += 1
-        weights = np.zeros(n)
-        long_indices = np.where(r_hat_weighted >= 0)[0]
-        short_indices = np.where(r_hat_weighted < 0)[0]
-        # Allocate 50% to long, 50% to short for market neutrality and full allocation
-        if len(long_indices) > 0:
-            long_weight = (0.5 * C_total) / max(len(long_indices), 1)
-            weights[long_indices] = long_weight
-        if len(short_indices) > 0:
-            short_weight = -(0.5 * C_total) / max(len(short_indices), 1)
-            weights[short_indices] = short_weight
-        # Ensure market neutrality
-        net_position = np.sum(weights)
-        if abs(net_position) > 1e-6:
-            weights -= net_position / n
-        # Ensure full capital allocation
-        if abs(np.sum(np.abs(weights)) - C_total) > 1e-6:
-            scale_factor = C_total / np.sum(np.abs(weights)) if np.sum(np.abs(weights)) > 0 else 1.0
-            weights *= scale_factor
-        return weights
-
-    def optimize_portfolio(self, rebalance_date):
-        """Optimize portfolio weights using linear programming with 50% long / 50% short allocation."""
-        r_hat_weighted = self.compute_weighted_predicted_returns(rebalance_date)
-        if r_hat_weighted is None:
-            print(f"Warning: No predicted returns for {rebalance_date.date()}")
-            return None
-        betas = self.compute_betas(rebalance_date)
-        if betas is None:
-            print(f"Warning: No betas for {rebalance_date.date()}")
-            return None
-        prev_date = self.rebalance_dates[self.rebalance_dates < rebalance_date][-1] if rebalance_date != \
-                                                                                       self.rebalance_dates[0] else None
-        C_total = self.portfolio_values.get(prev_date, self.initial_capital)
-        n = len(self.stocks)
-        # Decision variables: v_i^+ and v_i^- (positive and negative components), total 2n variables
-        # v_i = v_i^+ - v_i^-, where v_i^+ >= 0, v_i^- >= 0
-        # Objective: maximize sum((v_i^+ - v_i^-) * r_hat_weighted_i)
-        c = np.concatenate([-r_hat_weighted, r_hat_weighted])  # -r_hat for v_i^+, +r_hat for v_i^-
-        # Constraints
-        A_eq = []
-        b_eq = []
-        A_ub = []
-        b_ub = []
-        bounds = [(0, None)] * (2 * n)  # v_i^+, v_i^- >= 0
-        # 1. Market neutrality: sum(v_i^+ - v_i^-) = 0
-        market_neutral = np.concatenate([np.ones(n), -np.ones(n)])
-        A_eq.append(market_neutral)
-        b_eq.append(0.0)
-        # 2. Full capital allocation: sum(v_i^+ + v_i^-) = C_total
-        capital_allocation = np.ones(2 * n)
-        A_eq.append(capital_allocation)
-        b_eq.append(C_total)
-        # 3. Long allocation: sum(v_i^+) = 0.5 * C_total
-        long_allocation = np.concatenate([np.ones(n), np.zeros(n)])
-        A_eq.append(long_allocation)
-        b_eq.append(0.5 * C_total)
-        # 4. Short allocation: sum(v_i^-) = 0.5 * C_total
-        short_allocation = np.concatenate([np.zeros(n), np.ones(n)])
-        A_eq.append(short_allocation)
-        b_eq.append(0.5 * C_total)
-        # 5. Short only negative returns: v_i^+ = 0 if r_hat < 0, v_i^- = 0 if r_hat >= 0
-        for i in range(n):
-            if r_hat_weighted[i] < 0:
-                bounds[i] = (0, 0)  # v_i^+ = 0 for short positions
-            else:
-                bounds[i + n] = (0, 0)  # v_i^- = 0 for long positions
-        # 6. Beta exposure constraint: |sum((v_i^+ - v_i^-) * beta_i)| <= 0.1 * C_total
-        beta_vec = np.concatenate([betas, -betas])
-        A_ub.append(beta_vec)
-        A_ub.append(-beta_vec)
-        b_ub.append(0.1 * C_total)
-        b_ub.append(0.1 * C_total)
-        # 7. Individual stock limits: 0 ≤ v_i_long ≤ 0.15 * C_total, 0 ≤ |v_i_short| ≤ 0.12 * C_total
-        # Translated to: 0 ≤ v_i^+ ≤ 0.15 * C_total for longs, 0 ≤ v_i^- ≤ 0.12 * C_total for shorts
-        for i in range(n):
-            if r_hat_weighted[i] >= 0:
-                bounds[i] = (0, 0.15 * C_total)  # v_i^+ for longs
-            else:
-                bounds[i + n] = (0, 0.12 * C_total)  # v_i^- for shorts
-        # 8. Short concentration limit: v_i^- ≤ 0.25 * total_short_allocation for each short
-        total_short_allocation = 0.5 * C_total  # Based on 50% short
-        for i in range(n):
-            if r_hat_weighted[i] < 0:
-                row = np.zeros(2 * n)
-                row[i + n] = 1.0
-                A_ub.append(row)
-                b_ub.append(0.25 * total_short_allocation)
-        # Convert to numpy arrays
-        A_eq = np.array(A_eq)
-        b_eq = np.array(b_eq)
-        A_ub = np.array(A_ub)
-        b_ub = np.array(b_ub)
-        # Track optimization method
-        if not hasattr(self, 'optimization_counts'):
-            self.optimization_counts = {'linprog_success': 0, 'least_squares_fallback': 0}
-        # Try linear programming
-        try:
-            res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method='highs')
-            if res.success:
-                x = res.x
-                weights = x[:n] - x[n:]  # v_i = v_i^+ - v_i^-
-                # Verify constraints
-                if abs(np.sum(weights)) > 1e-6:
-                    print(f"Warning: Solution not market neutral at {rebalance_date.date()}. Adjusting weights.")
-                    weights -= np.sum(weights) / n
-                if abs(np.sum(np.abs(weights)) - C_total) > 1e-6:
-                    print(f"Warning: Solution does not fully allocate capital at {rebalance_date.date()}. Normalizing.")
-                    scale_factor = C_total / np.sum(np.abs(weights)) if np.sum(np.abs(weights)) > 0 else 1.0
-                    weights *= scale_factor
-                long_sum = np.sum(weights[weights > 0])
-                short_sum = np.abs(np.sum(weights[weights < 0]))
-                if abs(long_sum - 0.5 * C_total) > 1e-6 or abs(short_sum - 0.5 * C_total) > 1e-6:
-                    print(
-                        f"Warning: Long/short allocation off at {rebalance_date.date()}. Long: {long_sum:.2f}, Short: {short_sum:.2f}")
-                self.optimization_counts['linprog_success'] += 1
-                print(f"Optimization Debug: Used linprog successfully for {rebalance_date.date()}")
-                return weights
-        except Exception as e:
-            print(f"Linear programming failed for {rebalance_date.date()}: {e}")
-        # Fallback to simple allocation
-        print(f"Falling back to simplified allocation for {rebalance_date.date()}")
-        self.optimization_counts['least_squares_fallback'] += 1
-        weights = np.zeros(n)
-        long_indices = np.where(r_hat_weighted >= 0)[0]
-        short_indices = np.where(r_hat_weighted < 0)[0]
-        # Allocate 50% to long, 50% to short for market neutrality and full allocation
-        if len(long_indices) > 0:
-            long_weight = (0.5 * C_total) / max(len(long_indices), 1)
-            long_weight = min(long_weight, 0.15 * C_total)  # Enforce individual long limit
-            weights[long_indices] = long_weight
-        if len(short_indices) > 0:
-            short_weight = -(0.5 * C_total) / max(len(short_indices), 1)
-            short_weight = max(short_weight, -0.12 * C_total)  # Enforce individual short limit (negative)
-            weights[short_indices] = short_weight
-        # Enforce short concentration limit: clip if any |v_i_short| > 0.25 * total_short_allocation
-        total_short_allocation = 0.5 * C_total
-        weights[weights < 0] = np.maximum(weights[weights < 0], -0.25 * total_short_allocation)
-        # Ensure market neutrality
-        net_position = np.sum(weights)
-        if abs(net_position) > 1e-6:
-            weights -= net_position / n
-        # Ensure full capital allocation and 50/50 ratio
-        long_sum = np.sum(weights[weights > 0])
-        short_sum = np.abs(np.sum(weights[weights < 0]))
-        if long_sum > 0 and abs(long_sum - 0.5 * C_total) > 1e-6:
-            weights[weights > 0] *= (0.5 * C_total) / long_sum
-        if short_sum > 0 and abs(short_sum - 0.5 * C_total) > 1e-6:
-            weights[weights < 0] *= (0.5 * C_total) / short_sum
-        # Enforce beta exposure in fallback: if violated, proportionally reduce positions
-        beta_exposure = np.abs(np.dot(weights, betas))
-        if beta_exposure > 0.1 * C_total:
-            scale_factor = (0.1 * C_total) / beta_exposure
-            weights *= scale_factor
-        # Final market neutrality adjustment
-        net_position = np.sum(weights)
-        if abs(net_position) > 1e-6:
-            weights -= net_position / n
-        return weights
-
-    def compute_portfolio_metrics(self, rebalance_date, weights, prev_weights=None):
-        """Compute P&L, transaction costs, and portfolio metrics without P&L cap."""
-        actual_returns = self.rebalance_data.get(rebalance_date, {}).get('actual_returns')
-        if actual_returns is None or weights is None:
-            print(f"Warning: No actual returns or weights for {rebalance_date.date()}")
-            return None, None, None, None
-        prev_date = self.rebalance_dates[self.rebalance_dates < rebalance_date][-1] if rebalance_date != \
-                                                                                       self.rebalance_dates[0] else None
-        C_total = self.portfolio_values.get(prev_date, self.initial_capital)
-        # Ensure dimensions match
-        actual_returns = actual_returns[:len(weights)]
-        # Calculate P&L: weights (in dollars) * actual_returns (simple returns)
-        pnl = np.sum(weights * actual_returns)
-        # Calculate transaction costs
-        turnover = 0.0
-        if prev_weights is not None:
-            turnover = np.sum(np.abs(weights - prev_weights))
-        transaction_costs = turnover * self.transaction_cost_rate
-        # Net P&L
-        net_pnl = pnl - transaction_costs
-        # Long and short exposures
-        long_exposure = np.sum(weights[weights > 0])
-        short_exposure = np.abs(np.sum(weights[weights < 0]))
-        # Debugging: Print P&L components
-        print(
-            f"Debug: {rebalance_date.date()} - P&L: {pnl:.2f}, Transaction Costs: {transaction_costs:.2f}, "
-            f"Net P&L: {net_pnl:.2f}, Portfolio Value: {C_total + net_pnl:.2f}")
-        return net_pnl, transaction_costs, long_exposure, short_exposure
-
-    def compute_sharpe_ratio(self):
-        """Compute annualized Sharpe ratio based on weekly P&L."""
-        pnl_values = [self.pnl_history[date][0] for date in sorted(self.pnl_history.keys()) if
-                      self.pnl_history[date][0] is not None]
-        if len(pnl_values) < 2:
-            return None
-        weekly_returns = np.array(pnl_values) / self.initial_capital
-        mean_return = np.mean(weekly_returns)
-        std_return = np.std(weekly_returns, ddof=1)
-        if std_return == 0:
-            return None
-        annualized_return = mean_return * 52
-        annualized_std = std_return * np.sqrt(52)
-        sharpe_ratio = annualized_return / annualized_std
-        return sharpe_ratio, annualized_return, annualized_std
-
-    def compute_sortino_ratio(self):
-        """Compute annualized Sortino ratio using downside deviation."""
-        pnl_values = [self.pnl_history[date][0] for date in sorted(self.pnl_history.keys()) if
-                      self.pnl_history[date][0] is not None]
-        if len(pnl_values) < 2:
-            return None
-        weekly_returns = np.array(pnl_values) / self.initial_capital
-        mean_return = np.mean(weekly_returns)
-        downside_returns = weekly_returns[weekly_returns < 0]
-        if len(downside_returns) == 0:
-            return None
-        downside_std = np.std(downside_returns, ddof=1)
-        if downside_std == 0:
-            return None
-        annualized_return = mean_return * 52
-        annualized_downside_std = downside_std * np.sqrt(52)
-        sortino_ratio = annualized_return / annualized_downside_std
-        return sortino_ratio
-
-    def compute_max_drawdown(self):
-        """Compute maximum drawdown based on portfolio values with debugging output."""
-        dates = sorted(self.portfolio_values.keys())
-        if not dates:
-            print("No portfolio value data available for max drawdown calculation")
-            return None
-        portfolio_values = [self.portfolio_values[date] for date in dates]
-        portfolio_values = np.array(portfolio_values)
-        running_max = np.maximum.accumulate(portfolio_values)
-        drawdowns = (running_max - portfolio_values) / running_max
-        max_drawdown = np.max(drawdowns) if len(drawdowns) > 0 else 0.0
-        # Debugging output
-        if len(drawdowns) > 0:
-            max_drawdown_idx = np.argmax(drawdowns)
-            peak_date = dates[max_drawdown_idx]
-            peak_value = running_max[max_drawdown_idx]
-            trough_value = portfolio_values[max_drawdown_idx]
-            print(f"Max Drawdown Debug: Peak at {peak_date.date()} (${peak_value:.2f}), "
-                  f"Trough at {peak_date.date()} (${trough_value:.2f}), Drawdown = {max_drawdown * 100:.2f}%")
+        if missing_tickers:
+            validation_results['missing_tickers'] = list(missing_tickers)
+            validation_results['issues'].append(f"Missing {len(missing_tickers)} tickers")
+            print(f"❌ Missing tickers: {missing_tickers}")
         else:
-            print("Max Drawdown Debug: No drawdowns calculated (insufficient data)")
-        return max_drawdown
+            print("✅ All requested tickers downloaded successfully")
 
-    def compute_profit_factor(self):
-        """Compute profit factor (gross profits / gross losses)."""
-        pnl_values = [self.pnl_history[date][0] for date in sorted(self.pnl_history.keys()) if
-                      self.pnl_history[date][0] is not None]
-        if len(pnl_values) == 0:
-            return None
-        gross_profits = sum(p for p in pnl_values if p > 0)
-        gross_losses = abs(sum(p for p in pnl_values if p < 0))
-        if gross_losses == 0:
-            return None if gross_profits == 0 else float('inf')
-        return gross_profits / gross_losses
+        # Check date range
+        expected_start = datetime.strptime(self.earliest_data_start, '%Y-%m-%d').date()
+        actual_start = self.raw_data.index[0].date()
 
-    def compute_long_short_profits(self, rebalance_date):
-        """Compute P&L contributions from long and short positions for a rebalance date."""
-        actual_returns = self.rebalance_data.get(rebalance_date, {}).get('actual_returns')
-        weights = self.weights.get(rebalance_date)
-        if actual_returns is None or weights is None:
-            return None, None
-        actual_returns = actual_returns[:len(weights)]
-        long_mask = weights > 0
-        short_mask = weights < 0
-        long_pnl = np.sum(weights[long_mask] * actual_returns[long_mask]) if np.any(long_mask) else 0.0
-        short_pnl = np.sum(weights[short_mask] * actual_returns[short_mask]) if np.any(short_mask) else 0.0
-        return long_pnl, short_pnl
+        if actual_start > expected_start + timedelta(days=7):  # Allow some flexibility
+            validation_results['issues'].append("Start date significantly later than expected")
+            print(f"⚠️  Start date: Expected ~{expected_start}, Got {actual_start}")
+        else:
+            print(f"✅ Start date acceptable: {actual_start}")
 
+        # Check for missing data
+        print(f"\n📊 Missing Data Analysis:")
+        for ticker in self.raw_data.columns:
+            missing_count = self.raw_data[ticker].isnull().sum()
+            missing_pct = (missing_count / len(self.raw_data)) * 100
 
-    def plot_profits_over_time(self):
-        """Plot portfolio value (initial capital + cumulative P&L) over time."""
-        dates = sorted(self.portfolio_values.keys())
-        if not dates:
-            print("No portfolio value data available for plotting")
-            return
-        portfolio_values = []
-        for date in dates:
-            value = self.portfolio_values.get(date, self.initial_capital)
-            portfolio_values.append(value)
-        fig, ax = plt.subplots(figsize=(12, 6))
-        ax.plot(dates, portfolio_values, marker='o', color='blue', label='Portfolio Value')
-        ax.set_xlabel('Time (Rebalance Dates)')
-        ax.set_ylabel('Portfolio Value ($)')
-        ax.set_title('Portfolio Value Over Time (Starting at $10,000)')
-        ax.grid(True, alpha=0.3)
-        ax.tick_params(axis='x', rotation=45)
-        ax.legend()
-        plt.tight_layout()
-        plt.show()
-
-    def plot_portfolio_composition(self):
-        """Plot portfolio composition (long/short dollar allocations) over time as a stacked area chart."""
-        dates = sorted(self.weights.keys())
-        if not dates:
-            print("No portfolio weights available for plotting")
-            return
-        long_data = []
-        short_data = []
-        for date in dates:
-            weights = self.weights[date]
-            C_total = self.portfolio_values.get(date, self.initial_capital)
-            # Use dollar amounts directly for market neutrality visualization
-            long_dollars = np.where(weights > 0, weights, 0)
-            short_dollars = np.where(weights < 0, -weights, 0)
-            long_data.append(long_dollars)
-            short_data.append(short_dollars)
-        long_data = np.array(long_data).T  # Shape: (n_stocks, n_dates)
-        short_data = np.array(short_data).T
-        fig, ax = plt.subplots(figsize=(12, 8))
-        colors = plt.cm.rainbow(np.linspace(0, 1, len(self.stocks)))
-        # Plot long positions (above y=0)
-        ax.stackplot(dates, long_data, labels=[f'{stock} (Long)' for stock in self.stocks], colors=colors, alpha=0.6)
-        # Plot short positions (below y=0)
-        ax.stackplot(dates, -short_data, labels=[f'{stock} (Short)' for stock in self.stocks], colors=colors, alpha=0.6)
-        ax.axhline(0, color='black', linestyle='--', linewidth=1)
-        ax.set_xlabel('Time (Rebalance Dates)')
-        ax.set_ylabel('Portfolio Composition ($)')
-        ax.set_title('Portfolio Composition Over Time (Longs Above, Shorts Below, Market Neutral)')
-        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-        ax.grid(True, alpha=0.3)
-        ax.tick_params(axis='x', rotation=45)
-        plt.tight_layout()
-        plt.show()
-
-    def plot_beta_exposure(self):
-        """Plot portfolio beta exposure over time."""
-        dates = sorted(self.weights.keys())
-        if not dates:
-            print("No portfolio weights available for beta exposure plotting")
-            return
-        beta_exposures = []
-        for date in dates:
-            weights = self.weights[date]
-            betas = self.compute_betas(date)
-            if betas is None:
-                beta_exposures.append(np.nan)
-                continue
-            beta_exposure = np.abs(np.dot(weights, betas))
-            beta_exposures.append(beta_exposure)
-        fig, ax = plt.subplots(figsize=(12, 6))
-        ax.plot(dates, beta_exposures, marker='o', color='purple', label='Portfolio Beta Exposure')
-        ax.axhline(0.15, color='red', linestyle='--', label='Beta Constraint (±0.15)')
-        ax.axhline(-0.15, color='red', linestyle='--')
-        ax.set_xlabel('Time (Rebalance Dates)')
-        ax.set_ylabel('Portfolio Beta Exposure')
-        ax.set_title('Portfolio Beta Exposure Over Time')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        ax.tick_params(axis='x', rotation=45)
-        plt.tight_layout()
-        plt.show()
-
-    def debug_and_validate_last_two_days(self):
-        """Debug and validate data for the last two rebalance dates, including regression, returns, and portfolio metrics."""
-        if len(self.rebalance_dates) < 2:
-            print("Insufficient rebalance dates for debugging (need at least 2)")
-            return
-        last_two_dates = self.rebalance_dates[-2:]
-        for date in last_two_dates:
-            print(f"\n=== Debugging and Validation for {date.date()} ===")
-            # 1. Validate Data Availability
-            data = self.rebalance_data.get(date, {})
-            pca_matrix = data.get('pca_matrix')
-            centrality_vector = data.get('centrality_vector')
-            actual_returns = data.get('actual_returns')
-            explained_variance = data.get('explained_variance')
-            stock_std = data.get('stock_std')
-            regression_results = self.regression_results.get(date, {})
-            weights = self.weights.get(date)
-            net_pnl, transaction_costs, long_exposure, short_exposure = self.pnl_history.get(date,
-                                                                                             (None, None, None, None))
-            print("\nData Availability Check:")
-            print(f" PCA Matrix: {'Available' if pca_matrix is not None else 'Missing'}")
-            print(f" Centrality Vector: {'Available' if centrality_vector is not None else 'Missing'}")
-            print(f" Actual Returns: {'Available' if actual_returns is not None else 'Missing'}")
-            print(f" Explained Variance: {'Available' if explained_variance is not None else 'Missing'}")
-            print(f" Stock Std: {'Available' if stock_std is not None else 'Missing'}")
-            print(f" Regression Results: {'Available' if regression_results else 'Missing'}")
-            print(f" Weights: {'Available' if weights is not None else 'Missing'}")
-            print(f" Portfolio Metrics: {'Available' if net_pnl is not None else 'Missing'}")
-            # 2. Validate Dimensions
-            if pca_matrix is not None:
-                print(f"\nPCA Matrix Shape: {pca_matrix.shape} (Expected: {len(self.stocks)} x {self.num_pcs})")
-                if pca_matrix.shape[0] != len(self.stocks) or pca_matrix.shape[1] != self.num_pcs:
-                    print(" Warning: PCA matrix dimensions mismatch")
-            if centrality_vector is not None:
-                print(f"Centrality Vector Length: {len(centrality_vector)} (Expected: {len(self.stocks)})")
-                if len(centrality_vector) != len(self.stocks):
-                    print(" Warning: Centrality vector length mismatch")
-            if actual_returns is not None:
-                print(f"Actual Returns Length: {len(actual_returns)} (Expected: {len(self.stocks)})")
-                if len(actual_returns) != len(self.stocks):
-                    print(" Warning: Actual returns length mismatch")
-            if weights is not None:
-                print(f"Weights Length: {len(weights)} (Expected: {len(self.stocks)})")
-                if len(weights) != len(self.stocks):
-                    print(" Warning: Weights length mismatch")
-            # 3. Check for NaNs and Unrealistic Values
-            if actual_returns is not None:
-                if np.any(np.isnan(actual_returns)):
-                    print(" Warning: NaNs detected in actual returns")
-                if np.any(np.abs(actual_returns) > 0.5):
-                    print(" Warning: Unrealistic actual returns detected")
-            if weights is not None:
-                if np.any(np.isnan(weights)):
-                    print(" Warning: NaNs detected in weights")
-                if np.abs(np.sum(weights)) > 1e-6:
-                    print(f" Warning: Portfolio not market neutral (Net position: {np.sum(weights):.6f})")
-            # 4. Regression Details
-            print("\nRegression Details:")
-            for pc_idx in range(self.num_pcs):
-                result = regression_results.get(pc_idx, {})
-                if not result:
-                    print(f" PC{pc_idx + 1}: No regression data")
-                    continue
-                print(f" PC{pc_idx + 1}:")
-                print(f"  Train R²: {result.get('train_r2', 'N/A'):.4f}")
-                print(f"  CV R² Mean: {result.get('cv_r2_mean', 'N/A'):.4f}")
-                print(f"  CV R² Std: {result.get('cv_r2_std', 'N/A'):.4f}")
-                print(f"  Test Error: {result.get('test_error', 'N/A')}")
-                print(f"  Predicted PC Return: {result.get('prediction', 'N/A'):.6f}")
-                print(f"  Actual PC Return: {result.get('actual', 'N/A'):.6f}")
-                print("  Selected Factors and Coefficients:")
-                coef_dict = result.get('coefficients', {})
-                for factor, coef in coef_dict.items():
-                    if abs(coef) > 0:
-                        print(f"   {factor}: {coef:.6f}")
-            # 5. Predicted and Actual Returns
-            r_hat = self.compute_predicted_stock_returns(date)
-            r_hat_weighted = self.compute_weighted_predicted_returns(date)
-            print("\nStock Returns:")
-            print(" Stock | Predicted | Weighted Predicted | Actual")
-            print("-" * 50)
-            for i, stock in enumerate(self.stocks):
-                pred = r_hat[i] if r_hat is not None and i < len(r_hat) else np.nan
-                pred_weighted = r_hat_weighted[i] if r_hat_weighted is not None and i < len(r_hat_weighted) else np.nan
-                actual = actual_returns[i] if actual_returns is not None and i < len(actual_returns) else np.nan
-                print(f" {stock:<4} | {pred:.6f} | {pred_weighted:.6f} | {actual:.6f}")
-            # 6. Portfolio Metrics
-            print("\nPortfolio Metrics:")
-            print(f" Portfolio Value: ${self.portfolio_values.get(date, self.initial_capital):.2f}")
-            print(f" Net P&L: ${net_pnl:.2f}" if net_pnl is not None else " Net P&L: N/A")
-            print(
-                f" Transaction Costs: ${transaction_costs:.2f}" if transaction_costs is not None else " Transaction Costs: N/A")
-            print(f" Long Exposure: ${long_exposure:.2f}" if long_exposure is not None else " Long Exposure: N/A")
-            print(f" Short Exposure: ${short_exposure:.2f}" if short_exposure is not None else " Short Exposure: N/A")
-            if weights is not None:
-                print(" Portfolio Weights:")
-                for stock, w in zip(self.stocks, weights):
-                    print(
-                        f"  {stock}: ${w:.2f} ({w / self.portfolio_values.get(date, self.initial_capital) * 100:.2f}%)")
-            # 7. Additional Debug Info
-            print("\nAdditional Debug Info:")
-            factor_returns = self.factor_data.loc[self.factor_data.index <= date].iloc[-1]
-            print(" Latest Factor Returns:")
-            for factor, ret in factor_returns.items():
-                print(f"  {factor}: {ret:.6f}")
-            if pca_matrix is not None:
-                print(" PCA Loadings (First 5 stocks, all PCs):")
-                for i, stock in enumerate(self.stocks[:5]):
-                    loadings = pca_matrix[i, :] if i < pca_matrix.shape[0] else [np.nan] * self.num_pcs
-                    print(f"  {stock}: {loadings}")
-            if explained_variance is not None:
-                print(" Explained Variance Ratios:")
-                for i, var in enumerate(explained_variance, 1):
-                    print(f"  PC{i}: {var:.4f} ({var * 100:.2f}%)")
-
-    def plot_returns_boxplots(self):
-        """Create box plots for actual and predicted returns on the same page."""
-        # Collect actual and predicted returns
-        actual_data = {}
-        predicted_data = {}
-        for rebalance_date in self.rebalance_dates[:-1]:
-            r_hat_weighted = self.compute_weighted_predicted_returns(rebalance_date)
-            actual_returns = self.rebalance_data.get(rebalance_date, {}).get('actual_returns')
-            if r_hat_weighted is not None:
-                predicted_data[rebalance_date] = r_hat_weighted * 100  # To percent
-            if actual_returns is not None:
-                actual_data[rebalance_date] = actual_returns * 100  # To percent
-        if not actual_data or not predicted_data:
-            print("No data available for box plots")
-            return
-        # Prepare data for box plots
-        actual_returns_by_stock = {stock: [] for stock in self.stocks}
-        predicted_returns_by_stock = {stock: [] for stock in self.stocks}
-        for date in actual_data:
-            for i, stock in enumerate(self.stocks):
-                if i < len(actual_data[date]):
-                    actual_returns_by_stock[stock].append(actual_data[date][i])
-        for date in predicted_data:
-            for i, stock in enumerate(self.stocks):
-                if i < len(predicted_data[date]):
-                    predicted_returns_by_stock[stock].append(predicted_data[date][i])
-        # Convert to lists for plotting
-        actual_data_list = [actual_returns_by_stock[stock] for stock in self.stocks]
-        predicted_data_list = [predicted_returns_by_stock[stock] for stock in self.stocks]
-        # Create figure with two subplots
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
-        # Box plot for actual returns
-        ax1.boxplot(actual_data_list, vert=True, patch_artist=True, labels=self.stocks)
-        ax1.set_title('Actual Weekly Returns by Stock', fontsize=14)
-        ax1.set_ylabel('Returns (%)', fontsize=12)
-        ax1.grid(True, alpha=0.3)
-        ax1.tick_params(axis='x', rotation=45)
-        # Box plot for predicted returns
-        ax2.boxplot(predicted_data_list, vert=True, patch_artist=True, labels=self.stocks)
-        ax2.set_title('Predicted Weekly Returns by Stock', fontsize=14)
-        ax2.set_ylabel('Returns (%)', fontsize=12)
-        ax2.set_xlabel('Stocks', fontsize=12)
-        ax2.grid(True, alpha=0.3)
-        ax2.tick_params(axis='x', rotation=45)
-        plt.tight_layout()
-        plt.show()
-        # Print summary statistics
-        print("\nActual Returns Summary Statistics:")
-        for i, stock in enumerate(self.stocks):
-            data = actual_data_list[i]
-            if data:
-                print(f"{stock}:")
-                print(f" Mean: {np.mean(data):.6f}")
-                print(f" Median: {np.median(data):.6f}")
-                print(f" Q1: {np.percentile(data, 25):.6f}")
-                print(f" Q3: {np.percentile(data, 75):.6f}")
-        print("\nPredicted Returns Summary Statistics:")
-        for i, stock in enumerate(self.stocks):
-            data = predicted_data_list[i]
-            if data:
-                print(f"{stock}:")
-                print(f" Mean: {np.mean(data):.6f}")
-                print(f" Median: {np.median(data):.6f}")
-                print(f" Q1: {np.percentile(data, 25):.6f}")
-                print(f" Q3: {np.percentile(data, 75):.6f}")
-
-    def plot_stock_returns_and_composition(self, num_plots=6):
-        """Plot for each stock: actual returns overlaid with portfolio composition percentage over time.
-        Both series scaled to [-1, 1]. Limited to first num_plots stocks."""
-        dates = sorted(self.rebalance_dates)
-        if not dates or len(dates) < 2:
-            print("Insufficient data for stock returns and composition plots")
-            return
-        # Collect data: for each stock, lists of returns and compositions over dates
-        returns_data = {stock: [] for stock in self.stocks}
-        composition_data = {stock: [] for stock in self.stocks}
-        valid_dates = []  # Only dates with both returns and weights
-        for i in range(len(dates) - 1):  # Returns are forward-looking
-            date = dates[i]
-            if date not in self.weights or date not in self.rebalance_data:
-                continue
-            weights = self.weights[date]
-            actual_returns = self.rebalance_data[date].get('actual_returns')
-            if actual_returns is None:
-                continue
-            C_total = self.portfolio_values.get(date, self.initial_capital)
-            for stock_idx, stock in enumerate(self.stocks):
-                if stock_idx < len(weights) and stock_idx < len(actual_returns):
-                    # Composition: signed fraction (positive long, negative short)
-                    composition = weights[stock_idx] / C_total if C_total != 0 else 0.0
-                    returns_data[stock].append(actual_returns[stock_idx])
-                    composition_data[stock].append(composition)
-            valid_dates.append(date)
-        if not valid_dates:
-            print("No valid data for stock returns and composition plots")
-            return
-        # Plot for each stock up to num_plots
-        num_plots = min(num_plots, len(self.stocks))
-        for stock_idx in range(num_plots):
-            stock = self.stocks[stock_idx]
-            ret_series = np.array(returns_data[stock])
-            comp_series = np.array(composition_data[stock])
-            if len(ret_series) == 0 or len(comp_series) == 0:
-                print(f"No data for {stock}")
-                continue
-
-            # Scale each series to [-1, 1] independently
-            def scale_to_minus1_1(y):
-                if np.max(y) == np.min(y):
-                    return np.zeros_like(y)  # All zero if constant
-                return 2 * (y - np.min(y)) / (np.max(y) - np.min(y)) - 1
-
-            ret_scaled = scale_to_minus1_1(ret_series)
-            comp_scaled = scale_to_minus1_1(comp_series)
-            fig, ax = plt.subplots(figsize=(12, 6))
-            ax.plot(valid_dates, ret_scaled, marker='o', color='blue', label='Scaled Actual Returns')
-            ax.plot(valid_dates, comp_scaled, marker='x', color='red', label='Scaled Composition Fraction (signed)')
-            ax.set_xlabel('Rebalance Dates')
-            ax.set_ylabel('Scaled Value [-1, 1]')
-            ax.set_title(f'{stock}: Scaled Returns vs Portfolio Composition Over Time')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            ax.tick_params(axis='x', rotation=45)
-            plt.tight_layout()
-            plt.show()
-
-    def main(self):
-        """Main method with regression, optimization, and detailed profitability report."""
-        self.download_data()
-        self.portfolio_values = {date: self.initial_capital for date in self.rebalance_dates}
-        prev_weights = None
-        long_pnls = []
-        short_pnls = []
-        for rebalance_date in self.rebalance_dates:
-            pca_matrix, explained_variance, stock_std = self.compute_pca_for_rebalance(rebalance_date)
-            centrality_vector = self.compute_centrality_for_rebalance(rebalance_date)
-            actual_returns = self.compute_actual_returns_for_rebalance(rebalance_date)
-            self.rebalance_data[rebalance_date] = {
-                'pca_matrix': pca_matrix,
-                'centrality_vector': centrality_vector,
-                'actual_returns': actual_returns,
-                'explained_variance': explained_variance,
-                'stock_std': stock_std
+            validation_results['missing_data_summary'][ticker] = {
+                'missing_count': missing_count,
+                'missing_percentage': missing_pct
             }
-            regression_results = self.train_regression_models(rebalance_date)
-            if regression_results:
-                self.regression_results[rebalance_date] = regression_results
-            weights = self.optimize_portfolio(rebalance_date)
-            if weights is not None:
-                self.weights[rebalance_date] = weights
-                net_pnl, transaction_costs, long_exposure, short_exposure = self.compute_portfolio_metrics(
-                    rebalance_date, weights, prev_weights
-                )
-                self.pnl_history[rebalance_date] = (net_pnl, transaction_costs, long_exposure, short_exposure)
-                if net_pnl is not None and rebalance_date != self.rebalance_dates[-1]:
-                    next_date_idx = self.rebalance_dates.get_loc(rebalance_date) + 1
-                    next_date = self.rebalance_dates[next_date_idx]
-                    current_value = self.portfolio_values.get(rebalance_date, self.initial_capital)
-                    self.portfolio_values[next_date] = current_value + net_pnl
-                    print(
-                        f"Debug: Updated portfolio value for {next_date.date()}: {self.portfolio_values[next_date]:.2f}")
-                long_pnl, short_pnl = self.compute_long_short_profits(rebalance_date)
-                if long_pnl is not None:
-                    long_pnls.append(long_pnl)
-                    short_pnls.append(short_pnl)
-                prev_weights = weights
-            self.debug_scaling(rebalance_date)
-        self.compute_actuals_future()
-        self.plot_r2_scores()
-        self.plot_pred_vs_actual_scatter()
-        self.plot_predicted_over_time()
-        self.plot_actual_over_time()
-        self.plot_profits_over_time()
-        self.plot_portfolio_composition()
-        self.plot_beta_exposure()
-        self.plot_returns_boxplots()
-        self.plot_stock_returns_and_composition(num_plots=6)
 
-        # Detailed Profitability Report
-        print("\n=== Detailed Portfolio Performance Report ===")
-        print(f"Date Range: {self.rebalance_dates[0].date()} to {self.rebalance_dates[-1].date()}")
-        print(f"Rebalance Frequency: {self.rebalance_frequency}")
-        print(f"Number of Rebalance Periods: {len(self.rebalance_dates)}")
-        print(f"Initial Capital: ${self.initial_capital:.2f}")
+            if missing_pct > 10:  # More than 10% missing
+                validation_results['issues'].append(f"{ticker}: {missing_pct:.1f}% missing data")
+                print(f"❌ {ticker}: {missing_count} missing ({missing_pct:.1f}%)")
+            elif missing_pct > 5:  # 5-10% missing
+                print(f"⚠️  {ticker}: {missing_count} missing ({missing_pct:.1f}%)")
+            elif missing_count > 0:
+                print(f"✅ {ticker}: {missing_count} missing ({missing_pct:.1f}%)")
 
-        # P&L Metrics
-        cumulative_pnl = sum(pnl[0] for pnl in self.pnl_history.values() if pnl[0] is not None)
-        print(f"\nCumulative P&L: ${cumulative_pnl:.2f}")
-        avg_weekly_pnl = cumulative_pnl / len(self.pnl_history) if self.pnl_history else 0.0
-        print(f"Average Weekly P&L: ${avg_weekly_pnl:.2f}")
+        # Check for extreme values (potential data errors)
+        print(f"\n📈 Extreme Values Analysis:")
+        for ticker in self.raw_data.columns:
+            if ticker in self.raw_data.columns:
+                prices = self.raw_data[ticker].dropna()
+                if len(prices) > 0:
+                    # Calculate daily returns
+                    returns = prices.pct_change().dropna()
 
-        # Long and Short P&L
-        avg_long_pnl = np.mean(long_pnls) if long_pnls else 0.0
-        avg_short_pnl = np.mean(short_pnls) if short_pnls else 0.0
-        print(f"Average Weekly Long P&L: ${avg_long_pnl:.2f}")
-        print(f"Average Weekly Short P&L: ${avg_short_pnl:.2f}")
-        total_long_pnl = sum(long_pnls) if long_pnls else 0.0
-        total_short_pnl = sum(short_pnls) if short_pnls else 0.0
-        print(f"Total Long P&L: ${total_long_pnl:.2f}")
-        print(f"Total Short P&L: ${total_short_pnl:.2f}")
+                    # Check for extreme daily returns (>50% or <-50%)
+                    extreme_positive = (returns > 0.5).sum()
+                    extreme_negative = (returns < -0.5).sum()
 
-        # Transaction Costs and Turnover
-        total_transaction_costs = sum(pnl[1] for pnl in self.pnl_history.values() if pnl[1] is not None)
-        print(f"Total Transaction Costs: ${total_transaction_costs:.2f}")
-        avg_turnover = np.mean([pnl[1] / self.transaction_cost_rate for pnl in self.pnl_history.values()
-                                if pnl[1] is not None and self.transaction_cost_rate != 0])
-        print(f"Average Weekly Turnover: ${avg_turnover:.2f}")
+                    if extreme_positive > 0 or extreme_negative > 0:
+                        validation_results['extreme_values_detected'][ticker] = {
+                            'extreme_positive': extreme_positive,
+                            'extreme_negative': extreme_negative
+                        }
+                        print(
+                            f"⚠️  {ticker}: {extreme_positive} extreme positive, {extreme_negative} extreme negative returns")
 
-        # Exposure Metrics
-        avg_long_exposure = np.mean([pnl[2] for pnl in self.pnl_history.values() if pnl[2] is not None])
-        avg_short_exposure = np.mean([pnl[3] for pnl in self.pnl_history.values() if pnl[3] is not None])
-        print(f"Average Long Exposure: ${avg_long_exposure:.2f}")
-        print(f"Average Short Exposure: ${avg_short_exposure:.2f}")
+        # Check data coverage for critical periods
+        print(f"\n📅 Data Coverage Analysis:")
+        strategy_start = datetime.strptime(self.start_date, '%Y-%m-%d')
+        strategy_data = self.raw_data[self.raw_data.index >= strategy_start]
 
-        # Optimization Method Counts
-        print(f"\nOptimization Method Usage:")
-        print(f" Linear Programming (linprog) Success: {self.optimization_counts.get('linprog_success', 0)} times")
-        print(f" Least Squares Fallback: {self.optimization_counts.get('least_squares_fallback', 0)} times")
+        if len(strategy_data) < 200:  # Less than ~8 months of trading days
+            validation_results['issues'].append("Insufficient data for strategy period")
+            print(f"❌ Strategy period has only {len(strategy_data)} trading days")
+        else:
+            print(f"✅ Strategy period has {len(strategy_data)} trading days")
 
-        # Performance Ratios
-        sharpe_ratio, annualized_return, annualized_std = self.compute_sharpe_ratio() or (None, None, None)
-        print(f"\nAnnualized Return: {annualized_return * 100:.2f}%")
-        print(f"Annualized Volatility: {annualized_std * 100:.2f}%")
-        print(
-            f"Annualized Sharpe Ratio: {sharpe_ratio:.4f}" if sharpe_ratio is not None else "Annualized Sharpe Ratio: N/A")
+        # Stock-specific validation
+        print(f"\n🏦 Stock Universe Validation:")
+        missing_stocks = set(self.stocks) - downloaded_tickers
+        if missing_stocks:
+            validation_results['issues'].append(f"Missing critical stocks: {missing_stocks}")
+            print(f"❌ Missing stocks: {missing_stocks}")
+        else:
+            print("✅ All stocks in universe downloaded")
 
-        sortino_ratio = self.compute_sortino_ratio()
-        print(
-            f"Annualized Sortino Ratio: {sortino_ratio:.4f}" if sortino_ratio is not None else "Annualized Sortino Ratio: N/A")
+        # Factor-specific validation
+        print(f"\n📊 Factor Universe Validation:")
+        missing_factors = set(self.factors) - downloaded_tickers
+        if missing_factors:
+            validation_results['issues'].append(f"Missing base factors: {missing_factors}")
+            print(f"❌ Missing base factors: {missing_factors}")
+        else:
+            print("✅ All base factors downloaded")
 
-        max_drawdown = self.compute_max_drawdown()
-        print(f"Maximum Drawdown: {max_drawdown * 100:.2f}%" if max_drawdown is not None else "Maximum Drawdown: N/A")
+        # Overall validation result
+        if len(validation_results['issues']) == 0:
+            print(f"\n✅ DATA VALIDATION PASSED")
+            print(f"Ready to proceed with {len(self.raw_data.columns)} tickers")
+            print(f"Data range: {validation_results['data_start_date']} to {validation_results['data_end_date']}")
+        else:
+            validation_results['validation_passed'] = False
+            print(f"\n❌ DATA VALIDATION ISSUES DETECTED:")
+            for issue in validation_results['issues']:
+                print(f"   - {issue}")
 
-        calmar_ratio = annualized_return / max_drawdown if max_drawdown and max_drawdown > 0 else None
-        print(f"Calmar Ratio: {calmar_ratio:.4f}" if calmar_ratio is not None else "Calmar Ratio: N/A")
+        return validation_results
 
-        # Win Rate and Profit Factor
-        pnl_values = [pnl[0] for pnl in self.pnl_history.values() if pnl[0] is not None]
-        win_rate = len([p for p in pnl_values if p > 0]) / len(pnl_values) * 100 if pnl_values else 0.0
-        print(f"Win Rate: {win_rate:.2f}%")
 
-        profit_factor = self.compute_profit_factor()
-        print(f"Profit Factor: {profit_factor:.4f}" if profit_factor is not None else "Profit Factor: N/A")
+class ReturnsCalculator:
+    def __init__(self):
+        # Data storage
+        self.weekly_prices = None
+        self.stock_returns = None
+        self.factor_returns = None
+        self.rotation_returns = None
+        self.momentum_returns = None
+        self.macro_returns = None
+        self.sector_rotation_returns = None
+        self.volatility_returns = None
+        self.all_factor_returns = None
 
-        # Sector Exposure Analysis
-        print("\nAverage Sector Exposure ($):")
-        sector_exposures = {sector: [] for sector in set(self.sectors.values())}
-        for date in self.weights:
-            weights = self.weights[date]
-            for sector in sector_exposures:
-                sector_mask = np.array([1 if self.sectors[stock] == sector else 0 for stock in self.stocks])
-                exposure = np.abs(np.sum(weights * sector_mask))
-                sector_exposures[sector].append(exposure)
-        for sector, exposures in sector_exposures.items():
-            avg_exposure = np.mean(exposures) if exposures else 0.0
-            print(f" {sector}: ${avg_exposure:.2f}")
+    def calculate_weekly_returns(self, raw_data):
+        """Convert daily prices to weekly returns and calculate factor spreads."""
+        print(f"Converting daily prices to weekly returns...")
 
-        # Stock Contribution Analysis
-        print("\nAverage Stock P&L Contribution ($):")
-        stock_pnls = {stock: [] for stock in self.stocks}
-        for date in self.rebalance_dates[:-1]:
-            actual_returns = self.rebalance_data.get(date, {}).get('actual_returns')
-            weights = self.weights.get(date)
-            if actual_returns is not None and weights is not None:
-                for i, stock in enumerate(self.stocks):
-                    if i < len(actual_returns) and i < len(weights):
-                        stock_pnls[stock].append(weights[i] * actual_returns[i])
-        for stock, pnls in stock_pnls.items():
-            avg_pnl = np.mean(pnls) if pnls else 0.0
-            print(f" {stock}: ${avg_pnl:.2f}")
+        # Resample to weekly prices (using Friday close, or last available price of week)
+        self.weekly_prices = raw_data.resample('W-FRI').last()
 
-        print("\nSummary of Factor Data:")
-        print(f"Total Factors: {len(self.factors)}")
-        print(f"Date Range: {self.factor_data.index[0].date()} to {self.factor_data.index[-1].date()}")
-        print(f"Rebalance Frequency: {self.rebalance_frequency}")
-        print(f"Rebalance Dates: {len(self.rebalance_dates)}")
-        print(f"\nList of Stocks: {self.stocks}")
-        print("\nFactor Categories (Weekly Returns):")
-        for category, factors in [
-            ("Rotation", self.rotation_pairs),
-            ("Momentum", self.momentum_factors),
-            ("Macro", self.macro_factors),
-            ("Sector Rotation", self.sector_rotation_factors),
-            ("Volatility", self.volatility_factors)
-        ]:
-            print(f" {category}:")
-            for factor_name in factors.keys():
-                if factor_name in self.factor_data.columns:
-                    mean_return = self.factor_data[factor_name].mean()
-                    std_return = self.factor_data[factor_name].std()
-                    print(f"  {factor_name}: Mean Weekly Return = {mean_return:.6f}, Std = {std_return:.6f}")
+        print(f"Daily data shape: {raw_data.shape}")
+        print(f"Weekly data shape: {self.weekly_prices.shape}")
+        print(f"Weekly data range: {self.weekly_prices.index[0]} to {self.weekly_prices.index[-1]}")
 
-        print("\nRebalancing Dates (Showing first/last 5):")
-        display_dates = self.rebalance_dates[:5].append(self.rebalance_dates[-5:]) if len(
-            self.rebalance_dates) > 10 else self.rebalance_dates
-        for i, date in enumerate(display_dates, 1):
-            next_date_idx = self.rebalance_dates.get_loc(date) + 1
-            days_between = (self.rebalance_dates[next_date_idx] - date).days if next_date_idx < len(
-                self.rebalance_dates) else None
-            print(f" {i}. {date.date()} (Days to next: {days_between if days_between else 'N/A'})")
+        # Calculate weekly returns as percentage
+        weekly_returns = self.weekly_prices.pct_change().dropna() * 100
 
-        print(
-            "\nActual Weekly Stock Returns, Explained Variance, Portfolio Metrics, and Regression R² (First/Last 5 Dates):")
-        for date in display_dates:
-            data = self.rebalance_data.get(date, {})
-            print(f"\n{date.date()}:")
-            if data['actual_returns'] is not None:
-                print(" Actual Returns:")
-                for stock, ret in zip(self.stocks, data['actual_returns']):
-                    print(f"  {stock}: {ret:.6f}")
-            if data['explained_variance'] is not None:
-                print(" Explained Variance Ratios:")
-                for i, var in enumerate(data['explained_variance'], 1):
-                    print(f"  PC{i}: {var:.4f} ({var * 100:.2f}%)")
-            if date in self.pnl_history:
-                net_pnl, transaction_costs, long_exposure, short_exposure = self.pnl_history[date]
-                print(" Portfolio Metrics:")
-                print(f"  Net P&L: ${net_pnl:.2f}" if net_pnl is not None else "  Net P&L: N/A")
-                print(
-                    f"  Transaction Costs: ${transaction_costs:.2f}" if transaction_costs is not None else "  Transaction Costs: N/A")
-                print(f"  Long Exposure: ${long_exposure:.2f}" if long_exposure is not None else "  Long Exposure: N/A")
-                print(
-                    f"  Short Exposure: ${short_exposure:.2f}" if short_exposure is not None else "  Short Exposure: N/A")
-            if date in self.weights:
-                print(" Portfolio Weights:")
-                for stock, w in zip(self.stocks, self.weights[date]):
-                    print(
-                        f"  {stock}: ${w:.2f} ({w / self.portfolio_values.get(date, self.initial_capital) * 100:.2f}%)")
-            regression = self.regression_results.get(date, {})
-            if regression:
-                print(" Regression R² Scores:")
-                print(" Lasso:")
-                for pc_idx in range(self.num_pcs):
-                    train_r2 = regression[pc_idx]['train_r2']
-                    test_error = regression[pc_idx]['test_error']
-                    test_r2 = self.compute_rolling_r2(pc_idx, date, window=10, use_future=False)
-                    print(
-                        f"  PC{pc_idx + 1}: Train R² = {train_r2:.4f}, Test Error = {test_error if test_error is not None else 'N/A'}, Rolling Test R² = {test_r2 if test_r2 is not None else 'N/A'}")
+        # Extract stock returns
+        stock_tickers = ['JPM', 'BAC', 'WFC', 'C', 'GS', 'MS', 'V', 'MA', 'AXP', 'PNC', 'TFC', 'USB', 'ALL', 'MET',
+                         'PRU']
+        available_stocks = [ticker for ticker in stock_tickers if ticker in weekly_returns.columns]
+        self.stock_returns = weekly_returns[available_stocks].copy()
+
+        # Extract base factor returns
+        base_factors = ['XLF', 'VFH', 'IYF', 'KRE', '^GSPC', '^VIX', '^TNX', 'FAS', 'DIA', 'GLD']
+        available_base_factors = [factor for factor in base_factors if factor in weekly_returns.columns]
+        self.factor_returns = weekly_returns[available_base_factors].copy()
+
+        # Calculate factor spreads
+        self._calculate_factor_spreads(weekly_returns)
+
+        # Combine all factor returns
+        self._combine_all_factors()
+
+        print(f"Stock returns shape: {self.stock_returns.shape}")
+        print(f"Total factor returns shape: {self.all_factor_returns.shape}")
+
+    def _calculate_factor_spreads(self, weekly_returns):
+        """Calculate spread returns for all factor pairs."""
+
+        # Rotation factors
+        rotation_pairs = {
+            "Growth_vs_Value": ("VUG", "VTV"),
+            "Large_vs_Small_Cap": ("SPY", "IWM"),
+            "Tech_vs_Market": ("XLK", "SPY"),
+            "Financials_vs_Market": ("XLF", "SPY"),
+            "Banking_vs_Financials": ("KBE", "XLF"),
+            "Regional_vs_Banks": ("KRE", "KBE")
+        }
+
+        self.rotation_returns = pd.DataFrame(index=weekly_returns.index)
+        for name, (ticker1, ticker2) in rotation_pairs.items():
+            if ticker1 in weekly_returns.columns and ticker2 in weekly_returns.columns:
+                self.rotation_returns[name] = weekly_returns[ticker1] - weekly_returns[ticker2]
+
+        # Momentum factors
+        momentum_factors = {
+            "High_vs_Low_Beta": ("SPHB", "SPLV"),
+            "Momentum_vs_Anti_momentum": ("MTUM", "VMOT"),
+            "Quality_vs_Junk": ("QUAL", "SJNK")
+        }
+
+        self.momentum_returns = pd.DataFrame(index=weekly_returns.index)
+        for name, (ticker1, ticker2) in momentum_factors.items():
+            if ticker1 in weekly_returns.columns and ticker2 in weekly_returns.columns:
+                self.momentum_returns[name] = weekly_returns[ticker1] - weekly_returns[ticker2]
+
+        # Macro factors
+        macro_factors = {
+            "Dollar_Strength": ("UUP", "UDN"),
+            "Inflation_Expectation": ("SCHP", "VTEB"),
+            "Credit_Spread": ("LQD", "HYG"),
+            "Yield_Curve": ("SHY", "TLT"),
+            "Real_vs_Nominal": ("VTEB", "VGIT")
+        }
+
+        self.macro_returns = pd.DataFrame(index=weekly_returns.index)
+        for name, (ticker1, ticker2) in macro_factors.items():
+            if ticker1 in weekly_returns.columns and ticker2 in weekly_returns.columns:
+                self.macro_returns[name] = weekly_returns[ticker1] - weekly_returns[ticker2]
+
+        # Sector rotation factors
+        sector_rotation_factors = {
+            "Cyclical_vs_Defensive": ("XLI", "XLP"),
+            "Risk_on_vs_Risk_off": ("XLY", "XLRE"),
+            "Energy_vs_Utilities": ("XLE", "XLU"),
+            "Healthcare_vs_Tech": ("XLV", "XLK"),
+            "Materials_vs_Staples": ("XLB", "XLP")
+        }
+
+        self.sector_rotation_returns = pd.DataFrame(index=weekly_returns.index)
+        for name, (ticker1, ticker2) in sector_rotation_factors.items():
+            if ticker1 in weekly_returns.columns and ticker2 in weekly_returns.columns:
+                self.sector_rotation_returns[name] = weekly_returns[ticker1] - weekly_returns[ticker2]
+
+        # Volatility factors
+        volatility_factors = {
+            "Vol_Surface": ("VXX", "SVXY"),
+            "Equity_vs_Bond_Vol": ("^VIX", "^MOVE")
+        }
+
+        self.volatility_returns = pd.DataFrame(index=weekly_returns.index)
+        for name, (ticker1, ticker2) in volatility_factors.items():
+            if ticker1 in weekly_returns.columns and ticker2 in weekly_returns.columns:
+                self.volatility_returns[name] = weekly_returns[ticker1] - weekly_returns[ticker2]
+
+    def _combine_all_factors(self):
+        """Combine all factor returns into a single DataFrame."""
+        factor_dfs = []
+
+        # Add base factors
+        if self.factor_returns is not None and not self.factor_returns.empty:
+            factor_dfs.append(self.factor_returns)
+
+        # Add spread factors
+        for df in [self.rotation_returns, self.momentum_returns, self.macro_returns,
+                   self.sector_rotation_returns, self.volatility_returns]:
+            if df is not None and not df.empty:
+                factor_dfs.append(df)
+
+        if factor_dfs:
+            self.all_factor_returns = pd.concat(factor_dfs, axis=1)
+            # Remove any columns with all NaN values
+            self.all_factor_returns = self.all_factor_returns.dropna(axis=1, how='all')
+            # Forward fill missing values for factors (common in factor data)
+            self.all_factor_returns = self.all_factor_returns.fillna(method='ffill')
+        else:
+            self.all_factor_returns = pd.DataFrame()
+
+    def validate_returns_calculation(self):
+        """Validate the calculated returns for quality and correctness."""
+        print("\n=== RETURNS CALCULATION VALIDATION ===")
+
+        validation_results = {
+            'stock_returns_shape': self.stock_returns.shape if self.stock_returns is not None else (0, 0),
+            'factor_returns_shape': self.all_factor_returns.shape if self.all_factor_returns is not None else (0, 0),
+            'date_range': {
+                'start': self.stock_returns.index[0] if self.stock_returns is not None and len(
+                    self.stock_returns) > 0 else None,
+                'end': self.stock_returns.index[-1] if self.stock_returns is not None and len(
+                    self.stock_returns) > 0 else None
+            },
+            'validation_passed': True,
+            'issues': []
+        }
+
+        # Check if returns were calculated
+        if self.stock_returns is None or self.stock_returns.empty:
+            validation_results['issues'].append("Stock returns not calculated")
+            validation_results['validation_passed'] = False
+            print("❌ Stock returns not calculated")
+            return validation_results
+
+        if self.all_factor_returns is None or self.all_factor_returns.empty:
+            validation_results['issues'].append("Factor returns not calculated")
+            validation_results['validation_passed'] = False
+            print("❌ Factor returns not calculated")
+            return validation_results
+
+        # Validate stock returns
+        print(f"📊 Stock Returns Analysis:")
+        print(f"✅ Shape: {self.stock_returns.shape}")
+        print(f"✅ Date range: {self.stock_returns.index[0]} to {self.stock_returns.index[-1]}")
+
+        # Check for extreme returns
+        extreme_threshold = 50  # 50% weekly return threshold
+        for stock in self.stock_returns.columns:
+            extreme_returns = (np.abs(self.stock_returns[stock]) > extreme_threshold).sum()
+            if extreme_returns > 5:  # More than 5 extreme weeks
+                validation_results['issues'].append(f"{stock}: {extreme_returns} extreme weekly returns")
+                print(f"⚠️  {stock}: {extreme_returns} weeks with >50% returns")
+
+        # Check return distributions
+        print(f"\n📈 Return Distribution Analysis:")
+        stock_return_stats = self.stock_returns.describe()
+        mean_weekly_return = stock_return_stats.loc['mean'].mean()
+        std_weekly_return = stock_return_stats.loc['std'].mean()
+
+        print(f"✅ Average weekly return: {mean_weekly_return:.2f}%")
+        print(f"✅ Average weekly volatility: {std_weekly_return:.2f}%")
+
+        if abs(mean_weekly_return) > 2:  # More than 2% average weekly return seems high
+            validation_results['issues'].append(f"Unusually high average weekly return: {mean_weekly_return:.2f}%")
+            print(f"⚠️  High average weekly return: {mean_weekly_return:.2f}%")
+
+        # Validate factor returns
+        print(f"\n📊 Factor Returns Analysis:")
+        print(f"✅ Total factors: {self.all_factor_returns.shape[1]}")
+        print(f"✅ Date range: {self.all_factor_returns.index[0]} to {self.all_factor_returns.index[-1]}")
+
+        # Check factor categories
+        factor_categories = {
+            'Base Factors': len([col for col in self.all_factor_returns.columns if
+                                 col in ['XLF', 'VFH', 'IYF', 'KRE', '^GSPC', '^VIX', '^TNX', 'FAS', 'DIA', 'GLD']]),
+            'Rotation Factors': len([col for col in self.all_factor_returns.columns if 'vs' in col or '_vs_' in col]),
+            'Other Factors': self.all_factor_returns.shape[1]
+        }
+
+        for category, count in factor_categories.items():
+            if count > 0:
+                print(f"✅ {category}: {count}")
+
+        # Check for missing data
+        missing_data_pct = (self.all_factor_returns.isnull().sum() / len(self.all_factor_returns)) * 100
+        high_missing = missing_data_pct[missing_data_pct > 10]
+
+        if len(high_missing) > 0:
+            validation_results['issues'].append(f"Factors with >10% missing data: {list(high_missing.index)}")
+            print(f"⚠️  Factors with >10% missing data: {list(high_missing.index)}")
+
+        # Check data alignment
+        if len(self.stock_returns) != len(self.all_factor_returns):
+            validation_results['issues'].append("Stock and factor returns have different lengths")
+            print(f"⚠️  Length mismatch: Stocks {len(self.stock_returns)}, Factors {len(self.all_factor_returns)}")
+        else:
+            print(f"✅ Data alignment: {len(self.stock_returns)} weeks")
+
+        # Validate factor spreads calculation
+        print(f"\n🔄 Factor Spread Validation:")
+        spread_factors = [col for col in self.all_factor_returns.columns if '_vs_' in col]
+        print(f"✅ Calculated {len(spread_factors)} spread factors")
+
+        # Check spread factor properties
+        for factor in spread_factors[:3]:  # Check first 3 as examples
+            if factor in self.all_factor_returns.columns:
+                factor_data = self.all_factor_returns[factor].dropna()
+                if len(factor_data) > 0:
+                    factor_mean = factor_data.mean()
+                    factor_std = factor_data.std()
+                    print(f"✅ {factor}: mean={factor_mean:.2f}%, std={factor_std:.2f}%")
+
+        # Overall validation result
+        if len(validation_results['issues']) == 0:
+            print(f"\n✅ RETURNS CALCULATION VALIDATION PASSED")
+            print(
+                f"Ready for PCA analysis with {len(self.stock_returns)} stocks and {len(self.all_factor_returns.columns)} factors")
+        else:
+            validation_results['validation_passed'] = False
+            print(f"\n❌ RETURNS CALCULATION VALIDATION ISSUES:")
+            for issue in validation_results['issues']:
+                print(f"   - {issue}")
+
+        return validation_results
+
+
+class PCAAnalyzer:
+    def __init__(self):
+        # Data storage
+        self.correlation_matrices = {}
+        self.pca_loadings = {}
+        self.eigenvalues = {}
+        self.pc_returns = {}
+        self.pc_standard_deviations = {}
+        self.centrality_vectors = {}
+        self.rebalance_dates = []
+        self.lookback_weeks = 52
+
+    def perform_rolling_pca(self, stock_returns):
+        """Perform rolling PCA analysis on stock returns."""
+        print(f"Performing rolling PCA analysis...")
+
+        # Generate rebalance dates (weekly)
+        start_date = stock_returns.index[self.lookback_weeks]  # First date with full lookback
+        self.rebalance_dates = stock_returns.index[stock_returns.index >= start_date].tolist()
+
+        print(f"PCA analysis period: {start_date} to {stock_returns.index[-1]}")
+        print(f"Total rebalance dates: {len(self.rebalance_dates)}")
+
+        for i, rebalance_date in enumerate(self.rebalance_dates):
+            if i % 50 == 0:  # Progress indicator
+                print(f"Processing date {i + 1}/{len(self.rebalance_dates)}: {rebalance_date}")
+
+            # Get lookback period data
+            end_idx = stock_returns.index.get_loc(rebalance_date)
+            start_idx = end_idx - self.lookback_weeks + 1
+
+            lookback_returns = stock_returns.iloc[start_idx:end_idx + 1]
+
+            # Skip if insufficient data
+            if len(lookback_returns) < self.lookback_weeks:
+                continue
+
+            # Calculate correlation matrix and PCA
+            self._calculate_pca_for_date(rebalance_date, lookback_returns)
+
+        print(f"✅ PCA analysis complete for {len(self.rebalance_dates)} dates")
+
+    def _calculate_pca_for_date(self, rebalance_date, lookback_returns):
+        """Calculate PCA for a specific rebalance date."""
+
+        # Remove any stocks with missing data in the lookback period
+        clean_returns = lookback_returns.dropna(axis=1)
+
+        if clean_returns.shape[1] < 3:  # Need at least 3 stocks for meaningful PCA
+            return
+
+        # Step 1: Standardize returns (subtract mean, divide by std)
+        standardized_returns = (clean_returns - clean_returns.mean()) / clean_returns.std()
+
+        # Step 2: Calculate correlation matrix
+        correlation_matrix = standardized_returns.corr()
+        self.correlation_matrices[rebalance_date] = correlation_matrix
+
+        # Step 3: Calculate PCA using eigendecomposition
+        eigenvalues, eigenvectors = np.linalg.eigh(correlation_matrix.values)
+
+        # Sort eigenvalues and eigenvectors in descending order
+        idx = np.argsort(eigenvalues)[::-1]
+        eigenvalues = eigenvalues[idx]
+        eigenvectors = eigenvectors[:, idx]
+
+        # Store eigenvalues
+        self.eigenvalues[rebalance_date] = eigenvalues
+
+        # Step 4: Create PCA loadings matrix (rescaled by stock return std devs)
+        stock_std_devs = clean_returns.std().values
+        loadings = eigenvectors.copy()
+
+        # CORRECTED: Rescale loadings by dividing each stock's loadings by that stock's std dev
+        for i in range(loadings.shape[0]):
+            loadings[i, :] = loadings[i, :] / stock_std_devs[i]
+
+        # Flip signs if sum of loadings is negative (for consistency)
+        for j in range(loadings.shape[1]):
+            if np.sum(loadings[:, j]) < 0:
+                loadings[:, j] = -loadings[:, j]
+
+        # Store loadings as DataFrame
+        self.pca_loadings[rebalance_date] = pd.DataFrame(
+            loadings,
+            index=clean_returns.columns,
+            columns=[f'PC{i + 1}' for i in range(len(eigenvalues))]
+        )
+
+        # Step 5: Calculate PC returns by projecting stock returns onto loadings
+        # Use ORIGINAL returns (not standardized) for projection to maintain scale
+        pc_returns_matrix = clean_returns.values @ loadings
+        pc_returns_df = pd.DataFrame(
+            pc_returns_matrix,
+            index=clean_returns.index,
+            columns=[f'PC{i + 1}' for i in range(len(eigenvalues))]
+        )
+        self.pc_returns[rebalance_date] = pc_returns_df
+
+        # Step 6: Calculate PC standard deviations
+        pc_std_devs = pc_returns_df.std().values
+        self.pc_standard_deviations[rebalance_date] = pc_std_devs
+
+        # Step 7: Calculate centrality vector (dominant eigenvector of correlation matrix)
+        # CORRECTED: Don't take absolute values, preserve directional information
+        centrality = eigenvectors[:, 0]  # First eigenvector
+
+        # Normalize to have mean = 1.0 and std = 0.13 as specified
+        centrality = centrality / np.mean(centrality)  # Mean = 1.0
+        current_std = np.std(centrality)
+        if current_std > 0:
+            target_std = 0.13
+            centrality = 1.0 + (centrality - 1.0) * (target_std / current_std)
+
+        self.centrality_vectors[rebalance_date] = pd.Series(
+            centrality,
+            index=clean_returns.columns
+        )
+
+    def validate_pca_results(self):
+        """Validate the PCA analysis results."""
+        print("\n=== PCA ANALYSIS VALIDATION ===")
+
+        validation_results = {
+            'total_rebalance_dates': len(self.rebalance_dates),
+            'successful_pca_calculations': len(self.pca_loadings),
+            'average_stocks_per_analysis': 0,
+            'average_eigenvalue_explained_variance': {},
+            'centrality_vector_stats': {},
+            'validation_passed': True,
+            'issues': []
+        }
+
+        if len(self.pca_loadings) == 0:
+            validation_results['issues'].append("No PCA calculations completed")
+            validation_results['validation_passed'] = False
+            print("❌ No PCA calculations completed")
+            return validation_results
+
+        # Calculate average number of stocks
+        total_stocks = sum(len(loadings) for loadings in self.pca_loadings.values())
+        validation_results['average_stocks_per_analysis'] = total_stocks / len(self.pca_loadings)
+
+        print(f"📊 PCA Analysis Summary:")
+        print(f"✅ Rebalance dates: {len(self.rebalance_dates)}")
+        print(f"✅ Successful PCA calculations: {len(self.pca_loadings)}")
+        print(f"✅ Average stocks per analysis: {validation_results['average_stocks_per_analysis']:.1f}")
+
+        # Validate eigenvalues and explained variance
+        print(f"\n📈 Eigenvalue Analysis:")
+        sample_dates = list(self.eigenvalues.keys())[:5]  # Check first 5 dates
+
+        for date in sample_dates:
+            eigenvals = self.eigenvalues[date]
+            total_variance = np.sum(eigenvals)
+
+            # Check that eigenvalues are in descending order
+            if not np.all(eigenvals[:-1] >= eigenvals[1:]):
+                validation_results['issues'].append(f"Eigenvalues not in descending order for {date}")
+                print(f"⚠️  {date}: Eigenvalues not properly ordered")
+
+            # Calculate explained variance for first 5 PCs
+            explained_var = eigenvals[:5] / total_variance * 100
+            validation_results['average_eigenvalue_explained_variance'][str(date)] = explained_var.tolist()
+
+            print(f"✅ {date}: PC1={explained_var[0]:.1f}%, PC2={explained_var[1]:.1f}%, PC3={explained_var[2]:.1f}%")
+
+        # Validate PCA loadings
+        print(f"\n🔄 PCA Loadings Validation:")
+        sample_date = list(self.pca_loadings.keys())[0]
+        sample_loadings = self.pca_loadings[sample_date]
+
+        # Check loadings matrix properties
+        num_stocks, num_pcs = sample_loadings.shape
+        print(f"✅ Loadings matrix shape: {num_stocks} stocks × {num_pcs} PCs")
+
+        # Check for reasonable loading values
+        loading_stats = sample_loadings.describe()
+        extreme_loadings = np.abs(sample_loadings).max().max()
+
+        if extreme_loadings > 10:  # Loadings should generally be reasonable
+            validation_results['issues'].append(f"Extreme loading values detected: {extreme_loadings:.2f}")
+            print(f"⚠️  Extreme loading value: {extreme_loadings:.2f}")
+        else:
+            print(f"✅ Loading values reasonable (max: {extreme_loadings:.2f})")
+
+        # Validate PC returns
+        print(f"\n📊 PC Returns Validation:")
+        sample_pc_returns = self.pc_returns[sample_date]
+
+        # Check PC orthogonality (should be uncorrelated)
+        pc_corr = sample_pc_returns.corr()
+        off_diagonal = pc_corr.values[np.triu_indices_from(pc_corr.values, k=1)]
+        max_correlation = np.abs(off_diagonal).max()
+
+        if max_correlation > 0.1:  # PCs should be nearly orthogonal
+            validation_results['issues'].append(f"PCs not orthogonal (max correlation: {max_correlation:.3f})")
+            print(f"⚠️  PC orthogonality issue: max correlation = {max_correlation:.3f}")
+        else:
+            print(f"✅ PC orthogonality good (max correlation: {max_correlation:.3f})")
+
+        # Validate centrality vectors
+        print(f"\n🎯 Centrality Vector Validation:")
+        centrality_means = []
+        centrality_stds = []
+
+        for date in sample_dates:
+            if date in self.centrality_vectors:
+                centrality = self.centrality_vectors[date]
+                centrality_means.append(centrality.mean())
+                centrality_stds.append(centrality.std())
+
+        avg_mean = np.mean(centrality_means)
+        avg_std = np.mean(centrality_stds)
+
+        validation_results['centrality_vector_stats'] = {
+            'average_mean': avg_mean,
+            'average_std': avg_std
+        }
+
+        print(f"✅ Centrality vector mean: {avg_mean:.3f} (target: 1.000)")
+        print(f"✅ Centrality vector std: {avg_std:.3f} (target: 0.130)")
+
+        if abs(avg_mean - 1.0) > 0.05:
+            validation_results['issues'].append(f"Centrality mean off target: {avg_mean:.3f}")
+            print(f"⚠️  Centrality mean deviation: {avg_mean:.3f}")
+
+        if abs(avg_std - 0.13) > 0.02:
+            validation_results['issues'].append(f"Centrality std off target: {avg_std:.3f}")
+            print(f"⚠️  Centrality std deviation: {avg_std:.3f}")
+
+        # Check data consistency across dates
+        print(f"\n🔄 Data Consistency Check:")
+        stock_counts = [len(loadings) for loadings in self.pca_loadings.values()]
+        min_stocks = min(stock_counts)
+        max_stocks = max(stock_counts)
+
+        if max_stocks - min_stocks > 2:  # Some variation is expected due to data availability
+            validation_results['issues'].append(f"Inconsistent stock counts: {min_stocks}-{max_stocks}")
+            print(f"⚠️  Stock count variation: {min_stocks} to {max_stocks}")
+        else:
+            print(f"✅ Consistent stock counts: {min_stocks} to {max_stocks}")
+
+        # Overall validation result
+        if len(validation_results['issues']) == 0:
+            print(f"\n✅ PCA ANALYSIS VALIDATION PASSED")
+            print(f"Ready for factor regression with {len(self.pca_loadings)} complete PCA analyses")
+        else:
+            validation_results['validation_passed'] = False
+            print(f"\n❌ PCA ANALYSIS VALIDATION ISSUES:")
+            for issue in validation_results['issues']:
+                print(f"   - {issue}")
+
+        return validation_results
+
+
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import LassoCV
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score
+import warnings
+
+warnings.filterwarnings('ignore')
+
+
+class FactorRegressor:
+    def __init__(self):
+        # Data storage for regression models
+        self.lasso_models = {}  # Dict[date][pc] -> fitted LassoCV model
+        self.selected_factors = {}  # Dict[date][pc] -> list of selected factors
+        self.regression_coefficients = {}  # Dict[date][pc] -> coefficients dict
+        self.training_r2 = {}  # Dict[date][pc] -> R² on training data
+        self.alpha_values = {}  # Dict[date][pc] -> optimal regularization parameter
+        self.predicted_pc_returns = {}  # Dict[date] -> predicted PC returns vector
+
+        # Factor data storage
+        self.factor_returns = None
+        self.pc_returns = None
+        self.pc_standard_deviations = None
+
+        # Configuration
+        self.lookback_weeks = 52
+        self.max_pcs_to_model = 5  # Model first 5 PCs
+        self.cv_folds = 5  # Cross-validation folds
+
+        # Standardization scalers for each date and PC
+        self.factor_scalers = {}  # Dict[date][pc] -> StandardScaler for factors
+        self.pc_scalers = {}  # Dict[date][pc] -> StandardScaler for PC returns
+
+    def build_regression_models(self, all_factor_returns, pca_analyzer):
+        """Build Lasso regression models for each PC using factor returns."""
+        print(f"Building regression models for PC prediction...")
+
+        # Store references to data
+        self.factor_returns = all_factor_returns
+        self.pc_returns = pca_analyzer.pc_returns
+        self.pc_standard_deviations = pca_analyzer.pc_standard_deviations
+
+        # Get rebalance dates from PCA analyzer
+        rebalance_dates = pca_analyzer.rebalance_dates
+
+        print(f"Building models for {len(rebalance_dates)} rebalance dates")
+        print(f"Factor data shape: {self.factor_returns.shape}")
+
+        for i, rebalance_date in enumerate(rebalance_dates):
+            if i % 50 == 0:  # Progress indicator
+                print(f"Processing regression models for date {i + 1}/{len(rebalance_dates)}: {rebalance_date}")
+
+            self._build_models_for_date(rebalance_date)
+
+        print(f"✅ Regression model building complete for {len(rebalance_dates)} dates")
+
+    def _build_models_for_date(self, rebalance_date):
+        """Build regression models for all PCs on a specific date."""
+
+        # Skip if no PCA data available for this date
+        if rebalance_date not in self.pc_returns:
+            return
+
+        # Get PC returns for this date
+        pc_data = self.pc_returns[rebalance_date]
+
+        # Determine training period (52 weeks before rebalance date)
+        end_idx = self.factor_returns.index.get_loc(rebalance_date)
+        start_idx = max(0, end_idx - self.lookback_weeks + 1)
+
+        # Get training data
+        factor_training = self.factor_returns.iloc[start_idx:end_idx + 1].copy()
+
+        # Align PC returns with factor returns (same date range)
+        pc_training = pc_data.reindex(factor_training.index, method='nearest').copy()
+
+        # Skip if insufficient training data
+        if len(factor_training) < 20 or len(pc_training) < 20:
+            return
+
+        # Remove any rows with NaN values
+        combined_data = pd.concat([factor_training, pc_training], axis=1).dropna()
+
+        if len(combined_data) < 20:  # Need minimum data for robust regression
+            return
+
+        # Split back into factors and PCs
+        factor_cols = factor_training.columns
+        pc_cols = pc_training.columns
+
+        X_train = combined_data[factor_cols]
+        y_train_all = combined_data[pc_cols]
+
+        # Initialize storage for this date
+        self.lasso_models[rebalance_date] = {}
+        self.selected_factors[rebalance_date] = {}
+        self.regression_coefficients[rebalance_date] = {}
+        self.training_r2[rebalance_date] = {}
+        self.alpha_values[rebalance_date] = {}
+        self.factor_scalers[rebalance_date] = {}
+        self.pc_scalers[rebalance_date] = {}
+
+        # Build model for each PC (up to max_pcs_to_model)
+        num_pcs = min(self.max_pcs_to_model, len(pc_cols))
+
+        for pc_idx in range(num_pcs):
+            pc_name = pc_cols[pc_idx]
+
+            try:
+                self._build_single_pc_model(rebalance_date, pc_name, X_train, y_train_all[pc_name])
+            except Exception as e:
+                # Skip this PC if model building fails
+                print(f"Warning: Failed to build model for {pc_name} on {rebalance_date}: {e}")
+                continue
+
+    def _build_single_pc_model(self, rebalance_date, pc_name, X_train, y_train):
+        """Build Lasso regression model for a single PC."""
+
+        # Remove any remaining NaN values
+        valid_idx = ~(X_train.isnull().any(axis=1) | y_train.isnull())
+        X_clean = X_train[valid_idx]
+        y_clean = y_train[valid_idx]
+
+        if len(X_clean) < 10:  # Need minimum samples
+            return
+
+        # Standardize features and target
+        factor_scaler = StandardScaler()
+        pc_scaler = StandardScaler()
+
+        X_scaled = factor_scaler.fit_transform(X_clean)
+        y_scaled = pc_scaler.fit_transform(y_clean.values.reshape(-1, 1)).flatten()
+
+        # Store scalers
+        self.factor_scalers[rebalance_date][pc_name] = factor_scaler
+        self.pc_scalers[rebalance_date][pc_name] = pc_scaler
+
+        # Set up time series cross-validation
+        tscv = TimeSeriesSplit(n_splits=min(self.cv_folds, len(X_scaled) // 10))
+
+        # Define alpha range for Lasso regularization
+        alphas = np.logspace(-4, 1, 50)  # From 0.0001 to 10
+
+        # Fit Lasso with cross-validation
+        lasso_cv = LassoCV(
+            alphas=alphas,
+            cv=tscv,
+            random_state=42,
+            max_iter=2000,
+            selection='random'
+        )
+
+        lasso_cv.fit(X_scaled, y_scaled)
+
+        # Store the fitted model
+        self.lasso_models[rebalance_date][pc_name] = lasso_cv
+
+        # Store optimal alpha
+        self.alpha_values[rebalance_date][pc_name] = lasso_cv.alpha_
+
+        # Calculate training R²
+        y_pred_scaled = lasso_cv.predict(X_scaled)
+        training_r2 = r2_score(y_scaled, y_pred_scaled)
+        self.training_r2[rebalance_date][pc_name] = training_r2
+
+        # Store coefficients and selected factors
+        coefficients = lasso_cv.coef_
+        factor_names = X_clean.columns.tolist()
+
+        # Identify selected factors (non-zero coefficients)
+        selected_indices = np.abs(coefficients) > 1e-6  # Small threshold for numerical precision
+        selected_factor_names = [factor_names[i] for i in range(len(factor_names)) if selected_indices[i]]
+        selected_coefficients = {factor_names[i]: coefficients[i] for i in range(len(coefficients))}
+
+        self.selected_factors[rebalance_date][pc_name] = selected_factor_names
+        self.regression_coefficients[rebalance_date][pc_name] = selected_coefficients
+
+    def predict_pc_movements(self):
+        """Generate PC predictions for the next week using the fitted models."""
+        print(f"Generating PC predictions for next week...")
+
+        prediction_count = 0
+
+        for rebalance_date in self.lasso_models.keys():
+
+            # Get the next week's factor data for prediction
+            try:
+                next_week_date = self._get_next_week_date(rebalance_date)
+                if next_week_date is None:
+                    continue
+
+                # Get factor returns for the prediction date
+                if next_week_date not in self.factor_returns.index:
+                    continue
+
+                factor_data_next = self.factor_returns.loc[next_week_date]
+
+                # Initialize prediction storage for this date
+                pc_predictions = {}
+
+                # Generate prediction for each modeled PC
+                for pc_name in self.lasso_models[rebalance_date].keys():
+                    try:
+                        prediction = self._predict_single_pc(rebalance_date, pc_name, factor_data_next)
+                        if prediction is not None:
+                            pc_predictions[pc_name] = prediction
+                    except Exception as e:
+                        # Skip this PC prediction if it fails
+                        continue
+
+                if pc_predictions:
+                    self.predicted_pc_returns[rebalance_date] = pc_predictions
+                    prediction_count += 1
+
+            except Exception as e:
+                # Skip this date if prediction fails
+                continue
+
+        print(f"✅ Generated PC predictions for {prediction_count} dates")
+
+    def _predict_single_pc(self, rebalance_date, pc_name, factor_data_next):
+        """Predict a single PC's movement for next week."""
+
+        # Get the trained model and scalers
+        model = self.lasso_models[rebalance_date][pc_name]
+        factor_scaler = self.factor_scalers[rebalance_date][pc_name]
+        pc_scaler = self.pc_scalers[rebalance_date][pc_name]
+
+        # Get the factors that were used in training
+        training_factors = factor_scaler.feature_names_in_
+
+        # Extract relevant factor data
+        factor_values = []
+        for factor in training_factors:
+            if factor in factor_data_next.index and not pd.isna(factor_data_next[factor]):
+                factor_values.append(factor_data_next[factor])
             else:
-                print(" No regression data available")
-            self.debug_scaling(date)
-        self.save_rebalance_data()
+                # If factor data is missing, use 0 (neutral)
+                factor_values.append(0.0)
 
+        factor_values = np.array(factor_values).reshape(1, -1)
+
+        # Standardize using training scaler
+        factor_values_scaled = factor_scaler.transform(factor_values)
+
+        # Make prediction (in scaled space)
+        pc_pred_scaled = model.predict(factor_values_scaled)[0]
+
+        # Transform back to original scale
+        pc_pred = pc_scaler.inverse_transform([[pc_pred_scaled]])[0][0]
+
+        return pc_pred
+
+    def _get_next_week_date(self, current_date):
+        """Get the next week's date for prediction."""
+        try:
+            current_idx = self.factor_returns.index.get_loc(current_date)
+            if current_idx + 1 < len(self.factor_returns.index):
+                return self.factor_returns.index[current_idx + 1]
+            else:
+                return None
+        except (KeyError, IndexError):
+            return None
+
+    def validate_regression_models(self):
+        """Validate the regression model results."""
+        print("\n=== FACTOR REGRESSION VALIDATION ===")
+
+        validation_results = {
+            'total_models_built': 0,
+            'successful_predictions': len(self.predicted_pc_returns),
+            'average_training_r2': {},
+            'factor_selection_stats': {},
+            'alpha_distribution': {},
+            'model_stability': {},
+            'validation_passed': True,
+            'issues': []
+        }
+
+        if len(self.lasso_models) == 0:
+            validation_results['issues'].append("No regression models built")
+            validation_results['validation_passed'] = False
+            print("❌ No regression models built")
+            return validation_results
+
+        # Count total models
+        total_models = sum(len(models) for models in self.lasso_models.values())
+        validation_results['total_models_built'] = total_models
+
+        print(f"📊 Regression Model Summary:")
+        print(f"✅ Total models built: {total_models}")
+        print(f"✅ Rebalance dates with models: {len(self.lasso_models)}")
+        print(f"✅ Successful predictions: {len(self.predicted_pc_returns)}")
+
+        # Validate training R² values
+        print(f"\n📈 Training R² Analysis:")
+        all_r2_values = []
+        pc_r2_summary = {}
+
+        for date, models in self.training_r2.items():
+            for pc_name, r2_value in models.items():
+                all_r2_values.append(r2_value)
+
+                if pc_name not in pc_r2_summary:
+                    pc_r2_summary[pc_name] = []
+                pc_r2_summary[pc_name].append(r2_value)
+
+        if all_r2_values:
+            avg_r2 = np.mean(all_r2_values)
+            median_r2 = np.median(all_r2_values)
+            min_r2 = np.min(all_r2_values)
+            max_r2 = np.max(all_r2_values)
+
+            validation_results['average_training_r2']['overall'] = {
+                'mean': avg_r2,
+                'median': median_r2,
+                'min': min_r2,
+                'max': max_r2
+            }
+
+            print(f"✅ Overall R² - Mean: {avg_r2:.3f}, Median: {median_r2:.3f}")
+            print(f"✅ R² Range: {min_r2:.3f} to {max_r2:.3f}")
+
+            # Check for concerning R² values
+            negative_r2_count = sum(1 for r2 in all_r2_values if r2 < 0)
+            high_r2_count = sum(1 for r2 in all_r2_values if r2 > 0.8)
+
+            if negative_r2_count > total_models * 0.1:  # More than 10% negative
+                validation_results['issues'].append(f"High number of negative R² values: {negative_r2_count}")
+                print(f"⚠️  {negative_r2_count} models with negative R² (possible overfitting)")
+
+            if high_r2_count > total_models * 0.05:  # More than 5% very high
+                validation_results['issues'].append(f"Suspiciously high R² values: {high_r2_count}")
+                print(f"⚠️  {high_r2_count} models with R² > 0.8 (possible overfitting)")
+
+        # PC-specific R² analysis
+        for pc_name, r2_values in pc_r2_summary.items():
+            avg_pc_r2 = np.mean(r2_values)
+            validation_results['average_training_r2'][pc_name] = avg_pc_r2
+            print(f"✅ {pc_name}: Average R² = {avg_pc_r2:.3f} ({len(r2_values)} models)")
+
+        # Validate factor selection
+        print(f"\n🎯 Factor Selection Analysis:")
+        all_selected_factors = []
+        factors_frequency = {}
+
+        for date, models in self.selected_factors.items():
+            for pc_name, selected_factors in models.items():
+                all_selected_factors.extend(selected_factors)
+                for factor in selected_factors:
+                    factors_frequency[factor] = factors_frequency.get(factor, 0) + 1
+
+        if factors_frequency:
+            # Most frequently selected factors
+            top_factors = sorted(factors_frequency.items(), key=lambda x: x[1], reverse=True)[:10]
+
+            validation_results['factor_selection_stats'] = {
+                'total_factor_selections': len(all_selected_factors),
+                'unique_factors_selected': len(factors_frequency),
+                'top_factors': top_factors
+            }
+
+            avg_factors_per_model = len(all_selected_factors) / total_models if total_models > 0 else 0
+
+            print(f"✅ Average factors per model: {avg_factors_per_model:.1f}")
+            print(f"✅ Total unique factors selected: {len(factors_frequency)}")
+            print(f"✅ Top 5 factors: {[f[0] for f in top_factors[:5]]}")
+
+            if avg_factors_per_model > 20:  # Too many factors selected
+                validation_results['issues'].append(f"Too many factors per model: {avg_factors_per_model:.1f}")
+                print(f"⚠️  High average factors per model: {avg_factors_per_model:.1f}")
+
+        # Validate alpha values
+        print(f"\n🎛️  Regularization Parameter Analysis:")
+        all_alphas = []
+
+        for date, models in self.alpha_values.items():
+            for pc_name, alpha in models.items():
+                all_alphas.append(alpha)
+
+        if all_alphas:
+            avg_alpha = np.mean(all_alphas)
+            median_alpha = np.median(all_alphas)
+
+            validation_results['alpha_distribution'] = {
+                'mean': avg_alpha,
+                'median': median_alpha,
+                'min': np.min(all_alphas),
+                'max': np.max(all_alphas)
+            }
+
+            print(f"✅ Alpha values - Mean: {avg_alpha:.4f}, Median: {median_alpha:.4f}")
+
+            # Check for extreme alpha values
+            very_high_alpha = sum(1 for a in all_alphas if a > 1)
+            very_low_alpha = sum(1 for a in all_alphas if a < 0.001)
+
+            if very_high_alpha > len(all_alphas) * 0.1:
+                validation_results['issues'].append(f"Many models with very high regularization: {very_high_alpha}")
+                print(f"⚠️  {very_high_alpha} models with alpha > 1.0 (heavy regularization)")
+
+            if very_low_alpha > len(all_alphas) * 0.1:
+                validation_results['issues'].append(f"Many models with very low regularization: {very_low_alpha}")
+                print(f"⚠️  {very_low_alpha} models with alpha < 0.001 (minimal regularization)")
+
+        # Check prediction coverage
+        print(f"\n🎯 Prediction Coverage Analysis:")
+        prediction_rate = len(self.predicted_pc_returns) / len(self.lasso_models) if len(self.lasso_models) > 0 else 0
+        print(f"✅ Prediction success rate: {prediction_rate:.1%}")
+
+        if prediction_rate < 0.8:  # Less than 80% prediction success
+            validation_results['issues'].append(f"Low prediction success rate: {prediction_rate:.1%}")
+            print(f"⚠️  Low prediction coverage: {prediction_rate:.1%}")
+
+        # Overall validation result
+        if len(validation_results['issues']) == 0:
+            print(f"\n✅ FACTOR REGRESSION VALIDATION PASSED")
+            print(f"Models ready for stock return prediction")
+        else:
+            validation_results['validation_passed'] = False
+            print(f"\n❌ FACTOR REGRESSION VALIDATION ISSUES:")
+            for issue in validation_results['issues']:
+                print(f"   - {issue}")
+
+        return validation_results
+
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.metrics import r2_score
+import warnings
+
+warnings.filterwarnings('ignore')
+
+
+class StockPredictor:
+    def __init__(self):
+        # Data storage for stock predictions
+        self.predicted_stock_returns = {}  # Dict[date] -> dict[stock] -> predicted return %
+        self.actual_stock_returns = {}  # Dict[date] -> dict[stock] -> actual return %
+        self.prediction_r2_training = {}  # Dict[date] -> dict[stock] -> R² on training data
+        self.prediction_r2_testing = {}  # Dict[date] -> dict[stock] -> R² on testing data
+
+        # Data for plotting
+        self.scatter_plot_data = []  # List of dicts with 'date', 'stock', 'predicted', 'actual'
+        self.stock_r2_timeseries = {}  # Dict[stock] -> {'training': [], 'testing': [], 'dates': []}
+
+        # Data references
+        self.stock_returns = None
+        self.pca_analyzer = None
+        self.factor_regressor = None
+
+    def generate_stock_predictions(self, stock_returns, pca_analyzer, factor_regressor):
+        """Generate stock return predictions using PC predictions and PCA loadings."""
+        print(f"Generating stock return predictions...")
+
+        # Store references
+        self.stock_returns = stock_returns
+        self.pca_analyzer = pca_analyzer
+        self.factor_regressor = factor_regressor
+
+        prediction_count = 0
+
+        for rebalance_date in factor_regressor.predicted_pc_returns.keys():
+            try:
+                # Get predicted PC movements for this date
+                pc_predictions = factor_regressor.predicted_pc_returns[rebalance_date]
+
+                # Get PCA loadings for this date
+                if rebalance_date not in pca_analyzer.pca_loadings:
+                    continue
+
+                loadings = pca_analyzer.pca_loadings[rebalance_date]
+                centrality = pca_analyzer.centrality_vectors[rebalance_date]
+                pc_std_devs = pca_analyzer.pc_standard_deviations[rebalance_date]
+
+                # Generate predictions for this date
+                stock_predictions = self._predict_stocks_for_date(
+                    rebalance_date, pc_predictions, loadings, centrality, pc_std_devs
+                )
+
+                if stock_predictions:
+                    self.predicted_stock_returns[rebalance_date] = stock_predictions
+
+                    # Get actual returns for next week
+                    actual_returns = self._get_actual_returns_next_week(rebalance_date)
+                    if actual_returns:
+                        self.actual_stock_returns[rebalance_date] = actual_returns
+
+                        # Calculate R² values
+                        self._calculate_r2_values(rebalance_date, stock_predictions, actual_returns, loadings)
+
+                        # Store scatter plot data
+                        self._store_scatter_data(rebalance_date, stock_predictions, actual_returns)
+
+                        prediction_count += 1
+
+            except Exception as e:
+                # Skip this date if prediction fails
+                continue
+
+        # Build time series of R² values
+        self._build_r2_timeseries()
+
+        print(f"✅ Generated stock predictions for {prediction_count} dates")
+        print(f"✅ Scatter plot data points: {len(self.scatter_plot_data)}")
+
+    def _predict_stocks_for_date(self, rebalance_date, pc_predictions, loadings, centrality, pc_std_devs):
+        """Predict individual stock returns for a specific date."""
+
+        # Convert PC predictions to array
+        pc_predictions_array = np.zeros(len(pc_std_devs))
+        for pc_name, predicted_return in pc_predictions.items():
+            pc_idx = int(pc_name.replace('PC', '')) - 1  # Convert PC1 to index 0
+            if pc_idx < len(pc_std_devs):
+                pc_predictions_array[pc_idx] = predicted_return
+
+        # CORRECTED: Apply PC standard deviations before loadings transformation
+        # This implements: V · (ΔPC_pred ⊙ σ_PC)
+        scaled_pc_predictions = pc_predictions_array * pc_std_devs[:len(pc_predictions_array)]
+
+        # Calculate raw predicted returns using PCA loadings
+        raw_predictions = loadings.values @ scaled_pc_predictions
+
+        # Apply centrality weighting
+        # Final prediction = raw_prediction * (centrality / mean_centrality)
+        centrality_weights = centrality / centrality.mean()
+        adjusted_predictions = raw_predictions * centrality_weights.values
+
+        # Create dictionary of stock predictions
+        stock_predictions = {}
+        for i, stock in enumerate(loadings.index):
+            stock_predictions[stock] = adjusted_predictions[i]
+
+        return stock_predictions
+
+    def _get_actual_returns_next_week(self, rebalance_date):
+        """Get actual stock returns for the week following the rebalance date."""
+        try:
+            # Find the next week's date
+            current_idx = self.stock_returns.index.get_loc(rebalance_date)
+            if current_idx + 1 < len(self.stock_returns.index):
+                next_week_date = self.stock_returns.index[current_idx + 1]
+                actual_returns = self.stock_returns.loc[next_week_date].to_dict()
+
+                # Filter out any NaN values
+                actual_returns = {k: v for k, v in actual_returns.items() if not pd.isna(v)}
+                return actual_returns
+            else:
+                return None
+        except (KeyError, IndexError):
+            return None
+
+    def _calculate_r2_values(self, rebalance_date, predicted_returns, actual_returns, loadings):
+        """Calculate R² values for training and testing periods."""
+
+        # Get common stocks between predictions and actuals
+        common_stocks = set(predicted_returns.keys()) & set(actual_returns.keys())
+
+        if len(common_stocks) < 3:  # Need minimum stocks for meaningful R²
+            return
+
+        # Calculate R² for testing (predicted vs actual)
+        pred_values = [predicted_returns[stock] for stock in common_stocks]
+        actual_values = [actual_returns[stock] for stock in common_stocks]
+
+        if len(pred_values) > 1:
+            testing_r2 = r2_score(actual_values, pred_values)
+        else:
+            testing_r2 = 0.0
+
+        # Calculate R² for training (how well the regression explains the training period)
+        # This requires reconstructing what the model predicted for the training period
+        training_r2_dict = self._calculate_training_r2(rebalance_date, loadings, common_stocks)
+
+        # Store results
+        self.prediction_r2_testing[rebalance_date] = {stock: testing_r2 for stock in common_stocks}
+        self.prediction_r2_training[rebalance_date] = training_r2_dict
+
+    def _calculate_training_r2(self, rebalance_date, loadings, stocks):
+        """Calculate R² between regression line and lookback period for each stock."""
+
+        training_r2_dict = {}
+
+        try:
+            # Get the training period data (52 weeks before rebalance date)
+            end_idx = self.stock_returns.index.get_loc(rebalance_date)
+            start_idx = max(0, end_idx - 51)  # 52 weeks including current
+
+            training_data = self.stock_returns.iloc[start_idx:end_idx + 1]
+
+            # Get PC returns for the same period
+            if rebalance_date in self.pca_analyzer.pc_returns:
+                pc_returns = self.pca_analyzer.pc_returns[rebalance_date]
+                pc_std_devs = self.pca_analyzer.pc_standard_deviations[rebalance_date]
+
+                # Align PC returns with training period
+                aligned_pc_returns = pc_returns.reindex(training_data.index, method='nearest')
+
+                # For each stock, calculate how well PC projections explain actual returns
+                for stock in stocks:
+                    if stock in training_data.columns and stock in loadings.index:
+
+                        actual_stock_returns = training_data[stock].dropna()
+                        stock_loadings = loadings.loc[stock].values[:len(aligned_pc_returns.columns)]
+
+                        # CORRECTED: Reconstruct stock returns using proper scaling
+                        reconstructed_returns = []
+                        for date in actual_stock_returns.index:
+                            if date in aligned_pc_returns.index:
+                                pc_values = aligned_pc_returns.loc[date].values[:len(stock_loadings)]
+                                # Apply the same scaling as in prediction: loadings @ (PC_values * PC_std_devs)
+                                scaled_pc_values = pc_values * pc_std_devs[:len(pc_values)]
+                                reconstructed_return = np.dot(stock_loadings, scaled_pc_values)
+                                reconstructed_returns.append(reconstructed_return)
+
+                        # Calculate R² between actual and reconstructed returns
+                        if len(reconstructed_returns) == len(actual_stock_returns) and len(reconstructed_returns) > 1:
+                            training_r2 = r2_score(actual_stock_returns.values, reconstructed_returns)
+                            training_r2_dict[stock] = training_r2
+                        else:
+                            training_r2_dict[stock] = 0.0
+
+        except Exception as e:
+            # If calculation fails, assign 0 R²
+            for stock in stocks:
+                training_r2_dict[stock] = 0.0
+
+        return training_r2_dict
+
+    def _store_scatter_data(self, rebalance_date, predicted_returns, actual_returns):
+        """Store data for scatter plot generation."""
+
+        common_stocks = set(predicted_returns.keys()) & set(actual_returns.keys())
+
+        for stock in common_stocks:
+            self.scatter_plot_data.append({
+                'date': rebalance_date,
+                'stock': stock,
+                'predicted': predicted_returns[stock],
+                'actual': actual_returns[stock]
+            })
+
+    def _build_r2_timeseries(self):
+        """Build time series of R² values for each stock."""
+
+        # Initialize storage for each stock
+        all_stocks = set()
+        for date_dict in self.prediction_r2_training.values():
+            all_stocks.update(date_dict.keys())
+        for date_dict in self.prediction_r2_testing.values():
+            all_stocks.update(date_dict.keys())
+
+        for stock in all_stocks:
+            self.stock_r2_timeseries[stock] = {
+                'training': [],
+                'testing': [],
+                'dates': []
+            }
+
+        # Collect R² values over time
+        all_dates = sorted(set(self.prediction_r2_training.keys()) | set(self.prediction_r2_testing.keys()))
+
+        for date in all_dates:
+            for stock in all_stocks:
+                training_r2 = self.prediction_r2_training.get(date, {}).get(stock, np.nan)
+                testing_r2 = self.prediction_r2_testing.get(date, {}).get(stock, np.nan)
+
+                self.stock_r2_timeseries[stock]['dates'].append(date)
+                self.stock_r2_timeseries[stock]['training'].append(training_r2)
+                self.stock_r2_timeseries[stock]['testing'].append(testing_r2)
+
+    def create_scatter_plot(self):
+        """Create scatter plot of predicted vs actual returns."""
+
+        if len(self.scatter_plot_data) == 0:
+            print("No data available for scatter plot")
+            return None
+
+        # Convert to DataFrame for easier plotting
+        df = pd.DataFrame(self.scatter_plot_data)
+
+        # Create the plot
+        plt.figure(figsize=(10, 8))
+        plt.scatter(df['predicted'], df['actual'], alpha=0.6, s=20)
+
+        # Add diagonal line (perfect prediction line)
+        min_val = min(df['predicted'].min(), df['actual'].min())
+        max_val = max(df['predicted'].max(), df['actual'].max())
+        plt.plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.8, label='Perfect Prediction')
+
+        # Calculate and display overall R²
+        overall_r2 = r2_score(df['actual'], df['predicted'])
+
+        plt.xlabel('Predicted Returns (%)')
+        plt.ylabel('Actual Returns (%)')
+        plt.title(f'Predicted vs Actual Stock Returns\n(R² = {overall_r2:.4f}, n = {len(df)} predictions)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        # Add some statistics as text
+        plt.text(0.05, 0.95,
+                 f'Total predictions: {len(df)}\nUnique stocks: {df["stock"].nunique()}\nDate range: {df["date"].min().strftime("%Y-%m-%d")} to {df["date"].max().strftime("%Y-%m-%d")}',
+                 transform=plt.gca().transAxes, verticalalignment='top',
+                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+
+        plt.tight_layout()
+        return plt.gcf()
+
+    def create_r2_timeseries_plots(self):
+        """Create R² time series plots for each stock."""
+
+        if len(self.stock_r2_timeseries) == 0:
+            print("No R² time series data available")
+            return []
+
+        figures = []
+
+        for stock in sorted(self.stock_r2_timeseries.keys()):
+            data = self.stock_r2_timeseries[stock]
+
+            if len(data['dates']) == 0:
+                continue
+
+            # Create figure with two subplots
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+
+            # Convert dates to pandas datetime for better plotting
+            dates = pd.to_datetime(data['dates'])
+            training_r2 = np.array(data['training'])
+            testing_r2 = np.array(data['testing'])
+
+            # Remove NaN values for plotting
+            valid_training = ~np.isnan(training_r2)
+            valid_testing = ~np.isnan(testing_r2)
+
+            # Plot 1: Training R² (regression line vs lookback period)
+            if np.any(valid_training):
+                ax1.plot(dates[valid_training], training_r2[valid_training],
+                         'b-', marker='o', markersize=3, linewidth=1, alpha=0.7)
+                ax1.set_title(f'{stock} - Training R² (Regression vs 52-Week Lookback)')
+                ax1.set_ylabel('R² Value')
+                ax1.grid(True, alpha=0.3)
+                ax1.set_ylim(0, 1)
+
+                # Add average line
+                avg_training_r2 = np.mean(training_r2[valid_training])
+                ax1.axhline(y=avg_training_r2, color='red', linestyle='--', alpha=0.7,
+                            label=f'Average: {avg_training_r2:.3f}')
+                ax1.legend()
+
+            # Plot 2: Testing R² (predicted vs actual next week)
+            if np.any(valid_testing):
+                ax2.plot(dates[valid_testing], testing_r2[valid_testing],
+                         'g-', marker='s', markersize=3, linewidth=1, alpha=0.7)
+                ax2.set_title(f'{stock} - Testing R² (Predicted vs Actual Next Week)')
+                ax2.set_xlabel('Date')
+                ax2.set_ylabel('R² Value')
+                ax2.grid(True, alpha=0.3)
+
+                # Add average line
+                avg_testing_r2 = np.mean(testing_r2[valid_testing])
+                ax2.axhline(y=avg_testing_r2, color='red', linestyle='--', alpha=0.7,
+                            label=f'Average: {avg_testing_r2:.3f}')
+                ax2.legend()
+
+            plt.tight_layout()
+            figures.append(fig)
+
+        return figures
+
+    def validate_predictions(self):
+        """Validate the stock prediction results."""
+        print("\n=== STOCK PREDICTION VALIDATION ===")
+
+        validation_results = {
+            'total_prediction_dates': len(self.predicted_stock_returns),
+            'total_scatter_points': len(self.scatter_plot_data),
+            'stocks_with_predictions': 0,
+            'overall_testing_r2': 0.0,
+            'average_training_r2': 0.0,
+            'prediction_statistics': {},
+            'r2_statistics': {},
+            'validation_passed': True,
+            'issues': []
+        }
+
+        if len(self.predicted_stock_returns) == 0:
+            validation_results['issues'].append("No stock predictions generated")
+            validation_results['validation_passed'] = False
+            print("❌ No stock predictions generated")
+            return validation_results
+
+        # Basic statistics
+        print(f"📊 Prediction Summary:")
+        print(f"✅ Prediction dates: {len(self.predicted_stock_returns)}")
+        print(f"✅ Scatter plot points: {len(self.scatter_plot_data)}")
+
+        # Calculate overall statistics
+        if self.scatter_plot_data:
+            df = pd.DataFrame(self.scatter_plot_data)
+            validation_results['stocks_with_predictions'] = df['stock'].nunique()
+            validation_results['overall_testing_r2'] = r2_score(df['actual'], df['predicted'])
+
+            print(f"✅ Unique stocks: {df['stock'].nunique()}")
+            print(f"✅ Overall testing R²: {validation_results['overall_testing_r2']:.4f}")
+
+            # Prediction range statistics
+            pred_stats = df['predicted'].describe()
+            actual_stats = df['actual'].describe()
+
+            validation_results['prediction_statistics'] = {
+                'predicted_mean': pred_stats['mean'],
+                'predicted_std': pred_stats['std'],
+                'actual_mean': actual_stats['mean'],
+                'actual_std': actual_stats['std']
+            }
+
+            print(f"✅ Predicted returns: mean={pred_stats['mean']:.2f}%, std={pred_stats['std']:.2f}%")
+            print(f"✅ Actual returns: mean={actual_stats['mean']:.2f}%, std={actual_stats['std']:.2f}%")
+
+        # R² analysis
+        print(f"\n📈 R² Analysis:")
+
+        # Training R² statistics
+        all_training_r2 = []
+        for date_dict in self.prediction_r2_training.values():
+            all_training_r2.extend([r2 for r2 in date_dict.values() if not np.isnan(r2)])
+
+        if all_training_r2:
+            validation_results['average_training_r2'] = np.mean(all_training_r2)
+            print(f"✅ Average training R²: {validation_results['average_training_r2']:.4f}")
+            print(f"✅ Training R² range: {np.min(all_training_r2):.3f} to {np.max(all_training_r2):.3f}")
+
+        # Testing R² by stock
+        if self.stock_r2_timeseries:
+            print(f"\n🎯 Stock-specific R² Analysis:")
+            stock_avg_testing_r2 = {}
+
+            for stock, data in self.stock_r2_timeseries.items():
+                testing_values = [r2 for r2 in data['testing'] if not np.isnan(r2)]
+                if testing_values:
+                    avg_testing_r2 = np.mean(testing_values)
+                    stock_avg_testing_r2[stock] = avg_testing_r2
+
+            if stock_avg_testing_r2:
+                # Show top 5 and bottom 5 performers
+                sorted_stocks = sorted(stock_avg_testing_r2.items(), key=lambda x: x[1], reverse=True)
+
+                print("Top 5 stocks by testing R²:")
+                for stock, r2 in sorted_stocks[:5]:
+                    print(f"  ✅ {stock}: {r2:.4f}")
+
+                print("Bottom 5 stocks by testing R²:")
+                for stock, r2 in sorted_stocks[-5:]:
+                    print(f"  ⚠️  {stock}: {r2:.4f}")
+
+                validation_results['r2_statistics'] = {
+                    'best_stock': sorted_stocks[0],
+                    'worst_stock': sorted_stocks[-1],
+                    'average_across_stocks': np.mean(list(stock_avg_testing_r2.values()))
+                }
+
+        # Check for concerning patterns
+        if validation_results['overall_testing_r2'] < -0.1:
+            validation_results['issues'].append(f"Very poor overall R²: {validation_results['overall_testing_r2']:.4f}")
+            print(f"⚠️  Very poor overall predictive performance")
+
+        if validation_results['average_training_r2'] > 0.8:
+            validation_results['issues'].append("Very high training R² suggests overfitting")
+            print(f"⚠️  High training R² may indicate overfitting")
+
+        # Data quality checks
+        if len(self.scatter_plot_data) < 1000:
+            validation_results['issues'].append("Limited prediction data for analysis")
+            print(f"⚠️  Limited data points for robust analysis")
+
+        # Overall validation result
+        if len(validation_results['issues']) == 0:
+            print(f"\n✅ STOCK PREDICTION VALIDATION PASSED")
+            print(f"Ready for visualization and analysis")
+        else:
+            validation_results['validation_passed'] = False
+            print(f"\n❌ STOCK PREDICTION VALIDATION ISSUES:")
+            for issue in validation_results['issues']:
+                print(f"   - {issue}")
+
+        return validation_results
+
+
+# Updated Main Class
+class StrategyValidator:
+    def __init__(self):
+        print("Initializing Strategy Validator...")
+        self.data_manager = DataManager()
+        self.returns_calculator = ReturnsCalculator()
+        self.pca_analyzer = PCAAnalyzer()
+        self.factor_regressor = FactorRegressor()
+        self.stock_predictor = StockPredictor()
+
+    def run_validation_step1(self):
+        """Run Step 1: Data Download and Validation"""
+        print("=" * 50)
+        print("STEP 1: DATA DOWNLOAD AND VALIDATION")
+        print("=" * 50)
+
+        self.data_manager.download_data()
+        validation_results = self.data_manager.validate_data_integrity()
+        return validation_results
+
+    def run_validation_step2(self):
+        """Run Step 2: Returns Calculation and Validation"""
+        print("=" * 50)
+        print("STEP 2: RETURNS CALCULATION AND VALIDATION")
+        print("=" * 50)
+
+        self.returns_calculator.calculate_weekly_returns(self.data_manager.raw_data)
+        validation_results = self.returns_calculator.validate_returns_calculation()
+        return validation_results
+
+    def run_validation_step3(self):
+        """Run Step 3: PCA Analysis and Validation"""
+        print("=" * 50)
+        print("STEP 3: PCA ANALYSIS AND VALIDATION")
+        print("=" * 50)
+
+        self.pca_analyzer.perform_rolling_pca(self.returns_calculator.stock_returns)
+        validation_results = self.pca_analyzer.validate_pca_results()
+        return validation_results
+
+    def run_validation_step4(self):
+        """Run Step 4: Factor Regression and Validation"""
+        print("=" * 50)
+        print("STEP 4: FACTOR REGRESSION AND VALIDATION")
+        print("=" * 50)
+
+        self.factor_regressor.build_regression_models(
+            self.returns_calculator.all_factor_returns,
+            self.pca_analyzer
+        )
+        self.factor_regressor.predict_pc_movements()
+        validation_results = self.factor_regressor.validate_regression_models()
+        return validation_results
+
+    def run_validation_step5(self):
+        """Run Step 5: Stock Prediction and Validation"""
+        print("=" * 50)
+        print("STEP 5: STOCK PREDICTION AND VALIDATION")
+        print("=" * 50)
+
+        self.stock_predictor.generate_stock_predictions(
+            self.returns_calculator.stock_returns,
+            self.pca_analyzer,
+            self.factor_regressor
+        )
+        validation_results = self.stock_predictor.validate_predictions()
+        return validation_results
+
+    def run_all_validation_steps(self):
+        """Run all validation steps"""
+        results = []
+
+        # Step 1
+        step1_results = self.run_validation_step1()
+        results.append(step1_results)
+        if not step1_results['validation_passed']:
+            print("❌ Step 1 validation failed. Stopping.")
+            return results
+
+        # Step 2
+        step2_results = self.run_validation_step2()
+        results.append(step2_results)
+        if not step2_results['validation_passed']:
+            print("❌ Step 2 validation failed. Stopping.")
+            return results
+
+        # Step 3
+        step3_results = self.run_validation_step3()
+        results.append(step3_results)
+        if not step3_results['validation_passed']:
+            print("❌ Step 3 validation failed. Stopping.")
+            return results
+
+        # Step 4
+        step4_results = self.run_validation_step4()
+        results.append(step4_results)
+        if not step4_results['validation_passed']:
+            print("⚠️  Step 4 has validation warnings but continuing...")
+
+        # Step 5
+        step5_results = self.run_validation_step5()
+        results.append(step5_results)
+
+        return results
+
+    def create_all_plots(self):
+        """Create and display all plots"""
+        print("\n" + "=" * 50)
+        print("CREATING VISUALIZATION PLOTS")
+        print("=" * 50)
+
+        # Create scatter plot
+        print("Creating scatter plot...")
+        scatter_fig = self.stock_predictor.create_scatter_plot()
+        if scatter_fig:
+            scatter_fig.show()
+
+        # Create R² time series plots
+        print("Creating R² time series plots...")
+        r2_figures = self.stock_predictor.create_r2_timeseries_plots()
+
+        print(f"Created {len(r2_figures)} R² time series plots")
+
+        # Show first few plots (to avoid overwhelming display)
+        for i, fig in enumerate(r2_figures[:5]):  # Show first 5 stocks
+            fig.show()
+
+        if len(r2_figures) > 5:
+            print(f"Note: Only showing first 5 stock plots. {len(r2_figures) - 5} additional plots created.")
+
+        return scatter_fig, r2_figures
+
+    def debug_scaling_pipeline(self):
+        """Debug function to trace scaling through the entire pipeline."""
+        print("\n" + "=" * 60)
+        print("SCALING DEBUG ANALYSIS")
+        print("=" * 60)
+
+        if len(self.stock_predictor.scatter_plot_data) == 0:
+            print("No scatter plot data available for debugging")
+            return
+
+        # Get a sample date for detailed analysis
+        sample_date = list(self.factor_regressor.predicted_pc_returns.keys())[0]
+        print(f"Analyzing sample date: {sample_date}")
+
+        # 1. Check raw weekly returns scale
+        sample_stock_returns = self.returns_calculator.stock_returns.loc[sample_date]
+        print(f"\n1. WEEKLY STOCK RETURNS SCALE:")
+        print(f"   Sample values: {sample_stock_returns.head(3).values}")
+        print(f"   Range: {sample_stock_returns.min():.4f} to {sample_stock_returns.max():.4f}")
+        print(f"   Mean: {sample_stock_returns.mean():.4f}, Std: {sample_stock_returns.std():.4f}")
+
+        # 2. Check PC returns scale
+        if sample_date in self.pca_analyzer.pc_returns:
+            sample_pc_returns = self.pca_analyzer.pc_returns[sample_date]
+            sample_pc_data = sample_pc_returns.loc[sample_date] if sample_date in sample_pc_returns.index else \
+            sample_pc_returns.iloc[-1]
+            print(f"\n2. PC RETURNS SCALE:")
+            print(f"   Sample PC values: {sample_pc_data.head(3).values}")
+            print(f"   Range: {sample_pc_data.min():.4f} to {sample_pc_data.max():.4f}")
+            print(f"   Mean: {sample_pc_data.mean():.4f}, Std: {sample_pc_data.std():.4f}")
+
+        # 3. Check PC standard deviations
+        if sample_date in self.pca_analyzer.pc_standard_deviations:
+            pc_std_devs = self.pca_analyzer.pc_standard_deviations[sample_date]
+            print(f"\n3. PC STANDARD DEVIATIONS:")
+            print(f"   PC std devs: {pc_std_devs[:5]}")
+            print(f"   Range: {pc_std_devs.min():.4f} to {pc_std_devs.max():.4f}")
+
+        # 4. Check factor returns scale
+        sample_factor_returns = self.returns_calculator.all_factor_returns.loc[sample_date]
+        print(f"\n4. FACTOR RETURNS SCALE:")
+        print(f"   Sample factor values: {sample_factor_returns.head(3).values}")
+        print(f"   Range: {sample_factor_returns.min():.4f} to {sample_factor_returns.max():.4f}")
+        print(f"   Mean: {sample_factor_returns.mean():.4f}, Std: {sample_factor_returns.std():.4f}")
+
+        # 5. Check predicted PC movements
+        if sample_date in self.factor_regressor.predicted_pc_returns:
+            predicted_pcs = self.factor_regressor.predicted_pc_returns[sample_date]
+            print(f"\n5. PREDICTED PC MOVEMENTS:")
+            print(f"   Predicted PC values: {list(predicted_pcs.values())}")
+            print(f"   Range: {min(predicted_pcs.values()):.4f} to {max(predicted_pcs.values()):.4f}")
+
+        # 6. Check PCA loadings scale
+        if sample_date in self.pca_analyzer.pca_loadings:
+            loadings = self.pca_analyzer.pca_loadings[sample_date]
+            print(f"\n6. PCA LOADINGS SCALE:")
+            print(f"   Sample loadings (first stock, first 3 PCs): {loadings.iloc[0, :3].values}")
+            print(f"   Loadings range: {loadings.min().min():.4f} to {loadings.max().max():.4f}")
+            print(f"   Loadings mean: {loadings.mean().mean():.4f}, Std: {loadings.std().mean():.4f}")
+
+        # 7. Check predicted stock returns scale
+        if sample_date in self.stock_predictor.predicted_stock_returns:
+            predicted_stocks = self.stock_predictor.predicted_stock_returns[sample_date]
+            pred_values = list(predicted_stocks.values())
+            print(f"\n7. PREDICTED STOCK RETURNS:")
+            print(f"   Sample predicted values: {pred_values[:3]}")
+            print(f"   Range: {min(pred_values):.4f} to {max(pred_values):.4f}")
+            print(f"   Mean: {np.mean(pred_values):.4f}, Std: {np.std(pred_values):.4f}")
+
+        # 8. Check actual stock returns scale
+        if sample_date in self.stock_predictor.actual_stock_returns:
+            actual_stocks = self.stock_predictor.actual_stock_returns[sample_date]
+            actual_values = list(actual_stocks.values())
+            print(f"\n8. ACTUAL STOCK RETURNS (NEXT WEEK):")
+            print(f"   Sample actual values: {actual_values[:3]}")
+            print(f"   Range: {min(actual_values):.4f} to {max(actual_values):.4f}")
+            print(f"   Mean: {np.mean(actual_values):.4f}, Std: {np.std(actual_values):.4f}")
+
+        # 9. Overall scatter plot analysis
+        df = pd.DataFrame(self.stock_predictor.scatter_plot_data)
+        print(f"\n9. SCATTER PLOT DATA ANALYSIS:")
+        print(f"   Predicted range: {df['predicted'].min():.4f} to {df['predicted'].max():.4f}")
+        print(f"   Actual range: {df['actual'].min():.4f} to {df['actual'].max():.4f}")
+        print(f"   Predicted std: {df['predicted'].std():.4f}")
+        print(f"   Actual std: {df['actual'].std():.4f}")
+        print(f"   Std ratio (actual/predicted): {df['actual'].std() / df['predicted'].std():.2f}")
+
+        # 10. Check for any unit inconsistencies
+        print(f"\n10. UNIT CONSISTENCY CHECK:")
+
+        # Check if factor regression is doing any scaling
+        for date in list(self.factor_regressor.factor_scalers.keys())[:1]:
+            for pc in list(self.factor_regressor.factor_scalers[date].keys())[:1]:
+                factor_scaler = self.factor_regressor.factor_scalers[date][pc]
+                pc_scaler = self.factor_regressor.pc_scalers[date][pc]
+                print(f"   Factor scaler mean: {factor_scaler.mean_[:3]}")
+                print(f"   Factor scaler scale: {factor_scaler.scale_[:3]}")
+                print(f"   PC scaler mean: {pc_scaler.mean_[0]:.4f}")
+                print(f"   PC scaler scale: {pc_scaler.scale_[0]:.4f}")
+
+        print(f"\n" + "=" * 60)
+        print("END SCALING DEBUG")
+        print("=" * 60)
+
+# Add this to the end of your main execution after all validation steps
 if __name__ == "__main__":
-    strategy = PCAFactorStrategy(
-        start_date='2021-07-01',
-        end_date='2023-08-22',
-        rebalance_frequency='W-FRI',
-        lookback=252,
-        min_trading_days=100,
-        num_pcs=5,
-        centrality_std=0.13,
-        regression_lookback=52,
-        min_regression_weeks=42
-    )
-    strategy.main()
+    validator = StrategyValidator()
+
+    # Run all validation steps
+    all_results = validator.run_all_validation_steps()
+
+    # Run the debug analysis
+    validator.debug_scaling_pipeline()
+
+    # Create plots
+    scatter_plot, r2_plots = validator.create_all_plots()
