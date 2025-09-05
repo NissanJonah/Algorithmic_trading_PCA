@@ -484,6 +484,7 @@ class PCAFactorStrategy:
             actual_returns_array = np.array(actual_returns)[:num_stocks]
             next_pc_returns = np.dot(actual_returns_array, pca_matrix[:num_stocks, :num_pcs])
         return pc_returns, next_pc_returns
+
     def train_regression_models(self, rebalance_date):
         """Train Lasso to select factors, then Linear Regression for predictions."""
         pc_returns, next_pc_returns = self.compute_weekly_pc_returns(rebalance_date)

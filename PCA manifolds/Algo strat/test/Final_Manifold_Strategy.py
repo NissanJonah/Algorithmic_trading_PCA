@@ -9,6 +9,20 @@ from sklearn.linear_model import LassoCV, LinearRegression
 from sklearn.preprocessing import StandardScaler
 import numpy as np
 import pandas as pd
+from sklearn.linear_model import LassoCV, LinearRegression
+from sklearn.preprocessing import StandardScaler
+import numpy as np
+import pandas as pd
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score, mean_squared_error
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.linear_model import LassoCV
+from sklearn.model_selection import GridSearchCV
+from sklearn.linear_model import Lasso
+
 
 warnings.filterwarnings('ignore')
 
@@ -354,13 +368,26 @@ class PCA_Manifold_Strategy:
 
         return factor_window
 
-    from sklearn.linear_model import LassoCV, LinearRegression
-    from sklearn.preprocessing import StandardScaler
-    import numpy as np
-    import pandas as pd
+    def forecast_factor_returns(self, factor_window):
+        """
+        Forecast the next week's factor returns using the most recent week's returns (lagged approach).
+
+        Parameters:
+        - factor_window: pd.DataFrame of factor returns over the 52-week lookback window
+
+        Returns:
+        - forecasted_factors: np.array of forecasted factor returns for the next week
+        """
+        # Use the last week's factor returns as the forecast for the next week
+        forecasted_factors = factor_window.iloc[-1].values
+        return forecasted_factors
+
+    from sklearn.model_selection import GridSearchCV
+    from sklearn.linear_model import Lasso
+
     def run_lasso_and_linear_regression(self, pc_series, factor_window, pc_number):
         """
-        Predict the next week's PC returns using Lasso + OLS regression (except for PC1, which uses XLF directly).
+        Predict the next week's PC returns using Lasso for feature selection and Linear Regression.
 
         Parameters:
         - pc_series: pd.Series of current PC returns (length = lookback_weeks)
@@ -368,15 +395,14 @@ class PCA_Manifold_Strategy:
         - pc_number: int, 1 through 5
 
         Returns:
-        - predicted_pc: np.array of predicted PC returns for the next week
-        - selected_factors: list of factors selected by Lasso (empty for PC1)
-        - coefficients: regression coefficients (empty for PC1)
-        - r_squared: R² of OLS fit (1.0 for PC1)
+        - predicted_pc: np.array, predicted standardized PC returns for the 52-week window
+        - predicted_pc_next: float, predicted PC return for the next week (out-of-sample)
+        - selected_factors: list of factors selected by Lasso
+        - coefficients: regression coefficients
+        - r_squared: R² of OLS fit
+        - scaler_X: StandardScaler for factors
+        - scaler_y: StandardScaler for PC returns
         """
-
-        # --- SPECIAL CASE: PC1 uses XLF as sector proxy ---
-
-        # --- STANDARD CASE: PCs 2-5 ---
         # Align PC returns with factor dates
         merged_data = factor_window.copy()
         merged_data['PC'] = pc_series.values
@@ -384,11 +410,6 @@ class PCA_Manifold_Strategy:
         # Standardize factors and PC returns for regression
         X = merged_data.drop(columns='PC').values
         y = merged_data['PC'].values.reshape(-1, 1)
-
-        from sklearn.preprocessing import StandardScaler
-        from sklearn.model_selection import TimeSeriesSplit
-        from sklearn.linear_model import LassoCV, LinearRegression
-        from sklearn.metrics import r2_score, mean_squared_error
 
         factor_scaler = StandardScaler()
         pc_scaler = StandardScaler()
@@ -401,12 +422,19 @@ class PCA_Manifold_Strategy:
         n_splits = max(n_splits, 2)
         tscv = TimeSeriesSplit(n_splits=n_splits)
 
-        # LassoCV with dynamic alpha for PC number
-        alpha_range = np.logspace(-3, -1, 20) if pc_number == 2 else np.logspace(-4, -2, 20)
-        lasso = LassoCV(alphas=alpha_range, cv=tscv, max_iter=5000, random_state=42, selection='random')
+        # Lasso with GridSearchCV for feature selection
+        param_grid = {'alpha': np.logspace(-4, -1, 20)}
+        lasso = GridSearchCV(
+            estimator=Lasso(fit_intercept=True, max_iter=5000, tol=1e-5),
+            param_grid=param_grid,
+            cv=tscv,
+            scoring='neg_mean_squared_error',
+            n_jobs=1
+        )
         lasso.fit(X_scaled, y_scaled)
 
-        selected_mask = lasso.coef_ != 0
+        # Get selected features
+        selected_mask = lasso.best_estimator_.coef_ != 0
         selected_factors = merged_data.drop(columns='PC').columns[selected_mask].tolist()
         selected_indices = np.where(selected_mask)[0]
 
@@ -419,81 +447,29 @@ class PCA_Manifold_Strategy:
 
         # Linear regression on selected factors
         X_selected = X_scaled[:, selected_indices]
-        ols = LinearRegression()
+        ols = LinearRegression(fit_intercept=True)
         ols.fit(X_selected, y_scaled)
         y_pred = ols.predict(X_selected)
         r_squared = r2_score(y_scaled, y_pred)
 
         coefficients = ols.coef_
 
-        # Predict PC for the same window (can extend to next week separately)
-        predicted_pc = ols.predict(X_selected)
+        # Forecast next week's factor returns
+        forecasted_factors = self.forecast_factor_returns(factor_window)
+        forecasted_factors_scaled = factor_scaler.transform(forecasted_factors.reshape(1, -1))[:, selected_indices]
+
+        # Predict next week's PC return (out-of-sample)
+        predicted_pc_next_scaled = ols.predict(forecasted_factors_scaled)[0]
+        predicted_pc_next = pc_scaler.inverse_transform([[predicted_pc_next_scaled]])[0][0]
 
         print(f"Running regression for pc{pc_number}...")
-        print(f"  Lasso selected {len(selected_factors)} factors.")
+        print(f"  Lasso selected {len(selected_factors)} factors: {selected_factors}")
         print(f"  OLS R²: {r_squared:.4f} | MSE: {mean_squared_error(y_scaled, y_pred):.4f}")
         print(f"  pc{pc_number} Coefficients: {np.round(coefficients, 4)}")
+        print(f"  Predicted PC{pc_number} for next week: {predicted_pc_next:.4f}")
 
-        return predicted_pc, selected_factors, coefficients, r_squared
+        return y_pred, predicted_pc_next, selected_factors, coefficients, r_squared, factor_scaler, pc_scaler
 
-    def compute_expected_stock_returns(self, pca_result, predicted_pc, pc_name, pc_series):
-        """
-        Compute expected stock returns (r_hat) for a specific PC using the predicted PC movement.
-
-        Parameters:
-        - pca_result: dict, PCA results containing 'top_5_eigenvalues', 'correlation_matrix', and 'pc_df'
-        - predicted_pc: np.array, predicted standardized PC returns for the 52-week window
-        - pc_name: str, name of the PC (e.g., 'pc1', 'pc2', ..., 'pc5')
-        - pc_series: pd.Series, PC returns over the 52-week window
-
-        Returns:
-        - r_hat: np.array, expected stock returns for the specific PC (length = n_stocks)
-        - predicted_percent_movement: float, predicted percent movement for the PC
-        - pc_std: float, standard deviation of the PC's time series
-        """
-        # Get the last predicted standardized PC movement (proxy for next week)
-        predicted_std_movement = predicted_pc[-1]
-
-        # Compute the PC's standard deviation (scalar)
-        pc_std = pc_series.std()
-
-        # Calculate predicted percent movement (unstandardized)
-        predicted_percent_movement = predicted_std_movement * pc_std
-
-        # Get the PCA loadings (eigenvector) for this PC
-        pc_number = int(pc_name.replace("pc", "")) - 1  # 0-based index (pc1 -> 0, pc2 -> 1, etc.)
-        correlation_matrix = pca_result["correlation_matrix"]
-        eigenvalues, eigenvectors = np.linalg.eigh(correlation_matrix)
-        idx = np.argsort(eigenvalues)[::-1]
-        eigenvectors = eigenvectors[:, idx]
-        pc_loadings = eigenvectors[:, pc_number]  # Loadings for this PC (length = n_stocks)
-
-        # Compute r_hat: dot product of loadings and predicted percent movement
-        r_hat = pc_loadings * predicted_percent_movement
-
-        return r_hat, predicted_percent_movement, pc_std
-
-    def compute_actual_stock_returns(self):
-        """
-        Compute actual stock returns for the week following each rebalance date.
-
-        Returns:
-        - actual_returns: dict, maps rebalance_date to a np.array of actual stock returns
-                         (length = n_stocks) for the week starting at rebalance_date.
-        """
-        actual_returns = {}
-        rebalance_dates = self._get_rebalance_dates()
-
-        for rebalance_date in rebalance_dates:
-            # Check if rebalance_date exists in stock_matrix
-            if rebalance_date not in self.stock_matrix.index:
-                print(f"Warning: No stock returns available for {rebalance_date.strftime('%Y-%m-%d')}. Skipping.")
-                continue
-
-            # Get actual returns for the week starting at rebalance_date
-            actual_returns[rebalance_date] = self.stock_matrix.loc[rebalance_date].values
-
-        return actual_returns
     def main(self):
         """
         Main execution flow:
@@ -506,6 +482,8 @@ class PCA_Manifold_Strategy:
              - Compute expected stock returns (r_hat)
           4. Compute actual stock returns and generate scatter plot
         """
+        import numpy as np
+
         # Initialize storage for regression and r_hat results
         self.predicted_pc_returns = {}
         self.selected_factors = {}
@@ -515,6 +493,7 @@ class PCA_Manifold_Strategy:
         self.pca_results = {}
         self.r_squared = {}
         self.total_r_hat = {}
+        self.scalers = {}  # Store scalers for each PC and rebalance date
 
         # ---------- STEP 1: Download and prep data ----------
         self.download_data()
@@ -553,11 +532,13 @@ class PCA_Manifold_Strategy:
 
             # ---- 3C. Run Lasso + Linear Regression for each PC ----
             self.r_squared[rebalance_date] = {}
+            self.scalers[rebalance_date] = {}
             for pc_name in pc_df.columns:
                 pc_number = int(pc_name.replace("pc", ""))  # Extract 1–5
                 pc_series = pc_df[pc_name]
 
-                predicted_pc, selected_factors, coefficients, r2 = self.run_lasso_and_linear_regression(
+                # Updated call to handle seven return values
+                predicted_pc, predicted_pc_next, selected_factors, coefficients, r2, scaler_X, scaler_y = self.run_lasso_and_linear_regression(
                     pc_series, factor_window, pc_number
                 )
 
@@ -565,6 +546,7 @@ class PCA_Manifold_Strategy:
                 self.predicted_pc_returns[rebalance_date] = self.predicted_pc_returns.get(rebalance_date, {})
                 self.selected_factors[rebalance_date] = self.selected_factors.get(rebalance_date, {})
                 self.regression_coefficients[rebalance_date] = self.regression_coefficients.get(rebalance_date, {})
+                self.scalers[rebalance_date][pc_name] = {'scaler_X': scaler_X, 'scaler_y': scaler_y}
 
                 self.predicted_pc_returns[rebalance_date][pc_name] = predicted_pc
                 self.selected_factors[rebalance_date][pc_name] = selected_factors
@@ -576,95 +558,6 @@ class PCA_Manifold_Strategy:
                 print(f"  Coefficients: {np.round(coefficients, 4)}")
                 print(f"  R²: {r2:.4f}")
 
-                # ---- 3D. Compute expected stock returns (r_hat) for this PC ----
-                r_hat, predicted_percent_movement, pc_std = self.compute_expected_stock_returns(
-                    pca_result, predicted_pc, pc_name, pc_series
-                )
-
-                # Store r_hat results
-                self.r_hat_results[rebalance_date] = self.r_hat_results.get(rebalance_date, {})
-                self.r_hat_results[rebalance_date][pc_name] = {
-                    'r_hat': r_hat,
-                    'predicted_percent_movement': predicted_percent_movement,
-                    'pc_std': pc_std
-                }
-
-                # Store r_hat only
-                self.r_hat[rebalance_date] = self.r_hat.get(rebalance_date, {})
-                self.r_hat[rebalance_date][pc_name] = r_hat
-
-                print(f"  Predicted Percent Movement for {pc_name}: {predicted_percent_movement:.4f}")
-                print(f"  PC Standard Deviation: {pc_std:.4f}")
-                print(f"  Expected Stock Returns (r_hat): {np.round(r_hat, 4)}")
-
-            # ---- 3E. Compute weighted total r_hat and print details ----
-            weights = {}
-            sum_weight = 0.0
-            for pc_name in pc_df.columns:
-                pc_idx = int(pc_name.replace('pc', '')) - 1
-                evr = self.pca_results[rebalance_date]['top_5_explained_variance_ratio'][pc_idx]
-                r2 = self.r_squared[rebalance_date][pc_name]
-                weight = evr * max(r2, 0)  # Clamp r2 to avoid negative weights
-                weights[pc_name] = weight
-                sum_weight += weight
-
-            # Print PC weights as percentages
-            print("\nPC Weights for this date:")
-            for pc_name, weight in weights.items():
-                percent = (weight / sum_weight * 100) if sum_weight > 0 else 0
-                print(f"  {pc_name} Weight: {percent:.2f}%")
-
-            # Compute weighted total r_hat
-            total_r_hat = np.zeros(len(self.stocks))
-            for pc_name, weight in weights.items():
-                normalized_weight = weight / sum_weight if sum_weight > 0 else 0
-                total_r_hat += normalized_weight * self.r_hat[rebalance_date][pc_name]
-            self.total_r_hat[rebalance_date] = total_r_hat
-
-            # Print total expected returns
-            print("\nTotal Expected Stock Returns:")
-            for stock, exp_ret in zip(self.stocks, np.round(total_r_hat, 4)):
-                print(f"  {stock}: {exp_ret}")
-
-            # Print actual stock returns
-            actual = self.stock_matrix.loc[rebalance_date].values
-            print("\nActual Stock Returns:")
-            for stock, act_ret in zip(self.stocks, np.round(actual, 4)):
-                print(f"  {stock}: {act_ret}")
-
-        print("\n=== All rebalance dates processed successfully ===")
-
-        # ---------- STEP 4: Compute actual returns and generate scatter plot ----------
-        import matplotlib.pyplot as plt
-
-        # Compute actual stock returns
-        actual_returns = self.compute_actual_stock_returns()
-        print("\nComputed actual stock returns for each rebalance date.")
-
-        # Collect predicted and actual returns for plotting
-        predicted_returns = []
-        actual_returns_plot = []
-        for rebalance_date in rebalance_dates:
-            if rebalance_date not in self.total_r_hat or rebalance_date not in actual_returns:
-                continue
-            predicted_returns.extend(self.total_r_hat[rebalance_date])
-            actual_returns_plot.extend(actual_returns[rebalance_date])
-
-        # Create scatter plot
-        plt.figure(figsize=(10, 6))
-        plt.scatter(predicted_returns, actual_returns_plot, alpha=0.5, s=50)
-        plt.xlabel('Predicted Returns (%)')
-        plt.ylabel('Actual Returns (%)')
-        plt.title('Predicted vs Actual Stock Returns for Each Stock and Rebalance Date')
-        plt.grid(True)
-        # Add a diagonal line (y=x) for reference
-        min_val = min(min(predicted_returns), min(actual_returns_plot))
-        max_val = max(max(predicted_returns), max(actual_returns_plot))
-        plt.plot([min_val, max_val], [min_val, max_val], 'r--', label='y=x')
-        plt.legend()
-        plt.savefig('predicted_vs_actual_returns.png')
-        plt.close()
-        print("Scatter plot saved as 'predicted_vs_actual_returns.png'.")
 if __name__ == "__main__":
     stocks = ['JPM', 'BAC', 'WFC', 'C', 'GS', 'MS', 'V', 'MA', 'AXP', 'PNC', 'TFC', 'USB', 'ALL', 'MET', 'PRU']
     start_date = '2025-01-01'

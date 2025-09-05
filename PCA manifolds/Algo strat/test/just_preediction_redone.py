@@ -102,6 +102,14 @@ class PCAFactorStrategy:
         self.sector_proxy = 'XLF'  # Sector proxy for beta calculation
         self.stock_variance_r2_history = {}
 
+        self.initial_capital = 10000  # Starting capital
+        self.current_capital = self.initial_capital
+        self.portfolio_history = {}  # Track portfolio composition over time
+        self.portfolio_values = {}  # Track portfolio value over time
+        self.daily_returns = {}  # Track daily returns
+        self.optimization_success = {}  # Track optimization success/failure
+        self.stock_betas = {}  # Store calculated betas for each rebalance date
+
     def download_data(self):
         """Download stock and factor data, compute weekly factor returns, and set rebalance dates."""
         nominal_start = pd.to_datetime(self.start_date)
@@ -744,6 +752,8 @@ class PCAFactorStrategy:
 
         return r_hat
 
+
+
     def plot_pred_vs_actual_scatter(self):
         """Scatter plot: predicted vs actual weekly returns for each stock and rebalance date."""
         predicted_data = {}
@@ -1181,11 +1191,405 @@ class PCAFactorStrategy:
                     mae = mean_absolute_error(actuals, preds)
                     print(f"   {stock}: Correlation={corr:.3f}, MAE={mae:.6f}, N={len(stock_correlations[stock])}")
 
+    def calculate_stock_betas(self, rebalance_date):
+        """Calculate beta for each stock relative to sector proxy (XLF) using 52-week lookback."""
+        # Get weekly prices for the lookback period
+        weekly_prices = self.stock_data.resample(self.rebalance_frequency).last()
+        weekly_dates = weekly_prices.index[weekly_prices.index <= rebalance_date]
+        start_idx = max(0, len(weekly_dates) - self.regression_lookback)
+
+        if len(weekly_dates[start_idx:]) < self.min_regression_weeks:
+            print(f"Warning: Insufficient weekly data for beta calculation at {rebalance_date.date()}")
+            return None
+
+        # Get stock returns for the period
+        stock_prices_period = weekly_prices.iloc[start_idx:]
+        stock_returns = self.compute_returns(stock_prices_period)
+
+        # Get sector proxy returns
+        sector_prices = self.factor_data_daily[self.sector_proxy].resample(self.rebalance_frequency).last()
+        sector_prices_period = sector_prices.loc[stock_prices_period.index]
+        sector_returns = self.compute_returns(sector_prices_period)
+
+        # Calculate betas
+        betas = {}
+        for stock in self.stocks:
+            if stock in stock_returns.columns:
+                common_dates = stock_returns.index.intersection(sector_returns.index)
+                if len(common_dates) >= self.min_regression_weeks:
+                    stock_ret = stock_returns[stock].loc[common_dates]
+                    sector_ret = sector_returns.loc[common_dates]
+
+                    covariance = np.cov(stock_ret, sector_ret)[0, 1]
+                    sector_variance = np.var(sector_ret, ddof=1)
+
+                    beta = covariance / sector_variance if sector_variance > 0 else 1.0
+                    betas[stock] = beta
+                else:
+                    betas[stock] = 1.0  # Default beta
+            else:
+                betas[stock] = 1.0  # Default beta
+
+        return betas
+
+    def optimize_portfolio(self, rebalance_date):
+        """Optimize portfolio weights based on predicted returns and constraints."""
+        from scipy.optimize import linprog
+
+        # Get predicted returns
+        r_hat = self.compute_predicted_stock_returns(rebalance_date)
+        if r_hat is None:
+            return None, False
+
+        # Get betas
+        betas = self.calculate_stock_betas(rebalance_date)
+        if betas is None:
+            return None, False
+
+        # Store betas for this rebalance date
+        self.stock_betas[rebalance_date] = betas
+
+        # Ensure we have the right number of stocks and betas
+        n_stocks = min(len(self.stocks), len(r_hat))
+        r_hat = r_hat[:n_stocks]
+        beta_array = np.array([betas.get(self.stocks[i], 1.0) for i in range(n_stocks)])
+
+        # Set up optimization problem: maximize r_hat^T * w
+        # Convert to minimization: minimize -r_hat^T * w
+        c = -r_hat  # Coefficients for minimization
+
+        # Constraints:
+        # 1. Dollar neutral: sum(w) = 0
+        # 2. Beta neutral: sum(beta * w) = 0
+        # 3. Exposure constraint: sum(|w|) <= current_capital
+
+        A_eq = np.array([
+            np.ones(n_stocks),  # Dollar neutral
+            beta_array  # Beta neutral
+        ])
+        b_eq = np.array([0, 0])
+
+        # Bounds: allow both long and short positions
+        # Use exposure constraint through bounds
+        max_position = self.current_capital / n_stocks  # Simple position sizing
+        bounds = [(-max_position, max_position) for _ in range(n_stocks)]
+
+        # Solve optimization
+        try:
+            result = linprog(c, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method='highs')
+
+            if result.success:
+                weights = result.x
+
+                # Apply exposure constraint post-optimization
+                total_exposure = np.sum(np.abs(weights))
+                if total_exposure > self.current_capital:
+                    # Scale down to meet exposure constraint
+                    weights = weights * (self.current_capital / total_exposure)
+
+                return weights, True
+            else:
+                print(f"Optimization failed at {rebalance_date.date()}: {result.message}")
+                return None, False
+
+        except Exception as e:
+            print(f"Optimization error at {rebalance_date.date()}: {e}")
+            return None, False
+
+    def rebalance_portfolio(self, rebalance_date):
+        """Execute portfolio rebalancing for a given date."""
+        # Get optimal weights
+        weights, success = self.optimize_portfolio(rebalance_date)
+
+        if not success or weights is None:
+            # Keep previous portfolio if optimization fails
+            prev_idx = self.rebalance_dates.get_loc(rebalance_date)
+            if prev_idx > 0:
+                prev_date = self.rebalance_dates[prev_idx - 1]
+                if prev_date in self.portfolio_history:
+                    weights = self.portfolio_history[prev_date].copy()
+                    print(f"Using previous portfolio weights due to optimization failure")
+                else:
+                    weights = np.zeros(len(self.stocks))
+            else:
+                weights = np.zeros(len(self.stocks))
+            success = False
+
+        # Store portfolio composition
+        n_stocks = min(len(self.stocks), len(weights))
+        portfolio_dict = {self.stocks[i]: weights[i] for i in range(n_stocks)}
+        self.portfolio_history[rebalance_date] = portfolio_dict
+        self.optimization_success[rebalance_date] = success
+
+        # Calculate and store portfolio value and P&L
+        if rebalance_date in self.rebalance_dates[:-1]:  # Not the last date
+            # Get actual returns for P&L calculation
+            actual_returns = self.rebalance_data.get(rebalance_date, {}).get('actual_returns')
+
+            if actual_returns is not None:
+                # Calculate portfolio return
+                portfolio_return = 0
+                for i in range(min(len(weights), len(actual_returns))):
+                    portfolio_return += weights[i] * actual_returns[i]
+
+                # Update capital
+                pnl = portfolio_return
+                self.current_capital += pnl
+
+                # Store results
+                self.portfolio_values[rebalance_date] = self.current_capital
+                self.daily_returns[rebalance_date] = portfolio_return
+            else:
+                self.portfolio_values[rebalance_date] = self.current_capital
+                self.daily_returns[rebalance_date] = 0
+        else:
+            # For the last date, just record current capital
+            self.portfolio_values[rebalance_date] = self.current_capital
+
+        return weights, success
+
+    def plot_portfolio_value(self):
+        """Plot portfolio value over time starting from initial capital."""
+        if not self.portfolio_values:
+            print("No portfolio value data available for plotting")
+            return
+
+        dates = sorted(self.portfolio_values.keys())
+        values = [self.portfolio_values[date] for date in dates]
+
+        plt.figure(figsize=(12, 6))
+        plt.plot(dates, values, linewidth=2, color='blue', marker='o', markersize=3)
+        plt.axhline(y=self.initial_capital, color='red', linestyle='--', alpha=0.7, label='Initial Capital')
+
+        plt.title('Portfolio Value Over Time')
+        plt.xlabel('Date')
+        plt.ylabel('Portfolio Value ($)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.xticks(rotation=45)
+
+        # Add some statistics to the plot
+        final_value = values[-1] if values else self.initial_capital
+        total_return = (final_value - self.initial_capital) / self.initial_capital
+        plt.text(0.02, 0.98, f'Total Return: {total_return:.2%}', transform=plt.gca().transAxes,
+                 verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+        plt.tight_layout()
+        plt.show()
+
+        print(f"Initial Capital: ${self.initial_capital:,.2f}")
+        print(f"Final Capital: ${final_value:,.2f}")
+        print(f"Total P&L: ${final_value - self.initial_capital:,.2f}")
+        print(f"Total Return: {total_return:.2%}")
+
+    def plot_portfolio_composition(self):
+        """Plot portfolio composition over time with longs above zero and shorts below."""
+        if not self.portfolio_history:
+            print("No portfolio composition data available for plotting")
+            return
+
+        dates = sorted(self.portfolio_history.keys())
+
+        # Prepare data
+        composition_data = {stock: [] for stock in self.stocks}
+
+        for date in dates:
+            portfolio = self.portfolio_history[date]
+            for stock in self.stocks:
+                composition_data[stock].append(portfolio.get(stock, 0))
+
+        # Create stacked area plot
+        fig, ax = plt.subplots(figsize=(15, 8))
+
+        # Separate longs and shorts
+        longs_data = {stock: [max(0, val) for val in values] for stock, values in composition_data.items()}
+        shorts_data = {stock: [min(0, val) for val in values] for stock, values in composition_data.items()}
+
+        # Colors for each stock
+        colors = plt.cm.tab20(np.linspace(0, 1, len(self.stocks)))
+
+        # Plot longs (positive values)
+        bottom_long = np.zeros(len(dates))
+        for i, stock in enumerate(self.stocks):
+            values = longs_data[stock]
+            if any(v > 0 for v in values):
+                ax.fill_between(dates, bottom_long, bottom_long + values,
+                                label=f'{stock} (Long)', alpha=0.7, color=colors[i])
+                bottom_long += values
+
+        # Plot shorts (negative values)
+        bottom_short = np.zeros(len(dates))
+        for i, stock in enumerate(self.stocks):
+            values = shorts_data[stock]
+            if any(v < 0 for v in values):
+                ax.fill_between(dates, bottom_short, bottom_short + values,
+                                label=f'{stock} (Short)', alpha=0.7,
+                                color=colors[i], hatch='///')
+                bottom_short += values
+
+        # Add zero line
+        ax.axhline(y=0, color='black', linewidth=1)
+
+        ax.set_title('Portfolio Composition Over Time\n(Longs Above Zero, Shorts Below Zero)')
+        ax.set_xlabel('Date')
+        ax.set_ylabel('Position Size ($)')
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        ax.grid(True, alpha=0.3)
+        ax.tick_params(axis='x', rotation=45)
+
+        plt.tight_layout()
+        plt.show()
+
+    def print_portfolio_metrics(self):
+        """Print comprehensive portfolio performance metrics."""
+        print("\n" + "=" * 80)
+        print("PORTFOLIO PERFORMANCE METRICS")
+        print("=" * 80)
+
+        if not self.portfolio_values or not self.daily_returns:
+            print("No portfolio data available for metrics calculation")
+            return
+
+        # Basic metrics
+        dates = sorted(self.portfolio_values.keys())
+        returns = [self.daily_returns.get(date, 0) for date in dates if date in self.daily_returns]
+
+        if not returns:
+            print("No return data available")
+            return
+
+        returns = np.array(returns)
+
+        # 1. Basic Performance
+        print(f"\n1. BASIC PERFORMANCE:")
+        initial_value = self.initial_capital
+        final_value = list(self.portfolio_values.values())[-1]
+        total_return = (final_value - initial_value) / initial_value
+        total_pnl = final_value - initial_value
+
+        print(f" Initial Capital: ${initial_value:,.2f}")
+        print(f" Final Capital: ${final_value:,.2f}")
+        print(f" Total P&L: ${total_pnl:,.2f}")
+        print(f" Total Return: {total_return:.2%}")
+
+        # 2. Risk-Adjusted Returns
+        print(f"\n2. RISK-ADJUSTED RETURNS:")
+        avg_return = np.mean(returns)
+        return_std = np.std(returns, ddof=1)
+
+        # Sharpe Ratio (assuming weekly data, annualize appropriately)
+        periods_per_year = 52  # Weekly data
+        annualized_return = avg_return * periods_per_year
+        annualized_vol = return_std * np.sqrt(periods_per_year)
+        sharpe_ratio = annualized_return / annualized_vol if annualized_vol > 0 else 0
+
+        print(f" Average Weekly Return: {avg_return:.6f} ({avg_return:.4%})")
+        print(f" Weekly Volatility: {return_std:.6f} ({return_std:.4%})")
+        print(f" Annualized Return: {annualized_return:.4%}")
+        print(f" Annualized Volatility: {annualized_vol:.4%}")
+        print(f" Sharpe Ratio: {sharpe_ratio:.4f}")
+
+        # 3. Optimization Success Rate
+        print(f"\n3. OPTIMIZATION STATISTICS:")
+        successful_optimizations = sum(self.optimization_success.values())
+        total_optimizations = len(self.optimization_success)
+        success_rate = successful_optimizations / total_optimizations if total_optimizations > 0 else 0
+
+        print(f" Successful Optimizations: {successful_optimizations}/{total_optimizations}")
+        print(f" Success Rate: {success_rate:.1%}")
+
+        # 4. Return Distribution
+        print(f"\n4. RETURN DISTRIBUTION:")
+        profitable_periods = np.sum(returns > 0)
+        total_periods = len(returns)
+        win_rate = profitable_periods / total_periods if total_periods > 0 else 0
+
+        positive_returns = returns[returns > 0]
+        negative_returns = returns[returns < 0]
+
+        avg_win = np.mean(positive_returns) if len(positive_returns) > 0 else 0
+        avg_loss = np.mean(negative_returns) if len(negative_returns) > 0 else 0
+
+        print(f" Profitable Periods: {profitable_periods}/{total_periods}")
+        print(f" Win Rate: {win_rate:.1%}")
+        print(f" Average Winning Return: {avg_win:.4%}")
+        print(f" Average Losing Return: {avg_loss:.4%}")
+        if avg_loss != 0:
+            print(f" Win/Loss Ratio: {abs(avg_win / avg_loss):.2f}")
+
+        # 5. Long vs Short Performance
+        print(f"\n5. LONG VS SHORT PERFORMANCE:")
+        long_returns_by_date = []
+        short_returns_by_date = []
+
+        for date in dates[:-1]:  # Skip last date
+            if date in self.portfolio_history and date in self.daily_returns:
+                portfolio = self.portfolio_history[date]
+                actual_returns = self.rebalance_data.get(date, {}).get('actual_returns', [])
+
+                if actual_returns is not None and len(actual_returns) > 0:
+                    long_return = 0
+                    short_return = 0
+                    long_weight = 0
+                    short_weight = 0
+
+                    for i, stock in enumerate(self.stocks):
+                        if i < len(actual_returns) and stock in portfolio:
+                            weight = portfolio[stock]
+                            ret = actual_returns[i]
+
+                            if weight > 0:  # Long position
+                                long_return += weight * ret
+                                long_weight += abs(weight)
+                            elif weight < 0:  # Short position
+                                short_return += weight * ret
+                                short_weight += abs(weight)
+
+                    if long_weight > 0:
+                        long_returns_by_date.append(long_return / long_weight)
+                    if short_weight > 0:
+                        short_returns_by_date.append(short_return / short_weight)
+
+        if long_returns_by_date:
+            avg_long_return = np.mean(long_returns_by_date)
+            print(f" Average Long-side Return per Period: {avg_long_return:.4%}")
+            print(f" Long-side Win Rate: {np.sum(np.array(long_returns_by_date) > 0) / len(long_returns_by_date):.1%}")
+
+        if short_returns_by_date:
+            avg_short_return = np.mean(short_returns_by_date)
+            print(f" Average Short-side Return per Period: {avg_short_return:.4%}")
+            print(
+                f" Short-side Win Rate: {np.sum(np.array(short_returns_by_date) > 0) / len(short_returns_by_date):.1%}")
+
+        # 6. Additional Risk Metrics
+        print(f"\n6. ADDITIONAL RISK METRICS:")
+        if len(returns) > 1:
+            # Maximum drawdown
+            cumulative_returns = np.cumprod(1 + returns) - 1
+            running_max = np.maximum.accumulate(cumulative_returns)
+            drawdown = (cumulative_returns - running_max)
+            max_drawdown = np.min(drawdown)
+
+            print(f" Maximum Drawdown: {max_drawdown:.4%}")
+
+            # Sortino Ratio (downside deviation)
+            downside_returns = returns[returns < 0]
+            downside_deviation = np.std(downside_returns, ddof=1) if len(downside_returns) > 1 else 0
+            annualized_downside_dev = downside_deviation * np.sqrt(periods_per_year)
+            sortino_ratio = annualized_return / annualized_downside_dev if annualized_downside_dev > 0 else 0
+
+            print(f" Downside Deviation (Annualized): {annualized_downside_dev:.4%}")
+            print(f" Sortino Ratio: {sortino_ratio:.4f}")
+
     def main(self):
-        """Main function to run the PCA factor strategy."""
+        """Main function to run the PCA factor strategy with portfolio rebalancing."""
         # Download data
         print("Downloading data...")
         self.download_data()
+
+        # Initialize portfolio tracking
+        self.current_capital = self.initial_capital
+        self.portfolio_values[self.rebalance_dates[0]] = self.initial_capital
 
         # Process each rebalance date
         for i, rebalance_date in enumerate(self.rebalance_dates):
@@ -1269,6 +1673,27 @@ class PCAFactorStrategy:
             else:
                 print(" No actual returns available")
 
+            # Execute portfolio rebalancing
+            weights, optimization_success = self.rebalance_portfolio(rebalance_date)
+
+            print(f"\nPortfolio Rebalancing for {rebalance_date.date()}:")
+            print(f"Optimization Success: {'Yes' if optimization_success else 'No'}")
+            print("Portfolio Weights:")
+            if weights is not None:
+                for i, stock in enumerate(self.stocks):
+                    if i < len(weights):
+                        position_type = "Long" if weights[i] > 0 else "Short" if weights[i] < 0 else "None"
+                        print(f" {stock:4}: {weights[i]:10.2f} ({position_type})")
+            else:
+                print(" No weights available")
+
+            # Print current portfolio value and P&L
+            if rebalance_date in self.portfolio_values:
+                current_value = self.portfolio_values[rebalance_date]
+                daily_return = self.daily_returns.get(rebalance_date, 0)
+                print(f"Portfolio Value: ${current_value:,.2f}")
+                print(f"Period P&L: ${daily_return:,.2f}")
+
         # Compute actual future PC returns
         self.compute_actuals_future()
 
@@ -1285,6 +1710,11 @@ class PCAFactorStrategy:
         self.print_avg_sector_r2()
         self.plot_stock_variance_r2_over_time()
         self.print_avg_stock_variance_r2()
+
+        # Portfolio-specific visualizations and metrics
+        self.plot_portfolio_value()
+        self.plot_portfolio_composition()
+        self.print_portfolio_metrics()
 
         # Print enhanced comprehensive summary
         self._print_enhanced_summary_statistics()
@@ -1413,6 +1843,7 @@ class PCAFactorStrategy:
                 print(f" PC{pc_idx + 1}: {avg_r2:.2f}% ± {std_r2:.2f}% variance explained")
         else:
             print(" No stock variance data available")
+
 if __name__ == "__main__":
     strategy = PCAFactorStrategy(
         start_date='2019-01-01',
