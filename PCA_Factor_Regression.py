@@ -576,7 +576,7 @@ class PCAFactorStrategy:
                 }
             }
             #create json
-        with open('rebalance_data.json', 'w') as f:
+        with open('rebalance_data_final.json', 'w') as f:
             json.dump(serializable_data, f, indent=2)
         print("Saved rebalance data to rebalance_data.json")
 
